@@ -2925,6 +2925,7 @@ pub(crate) fn back_lanes(
                 clear: LANE_CLEAR + label / 2.0,
                 label_half: label / 2.0,
                 spans: [port_span(sa, a), port_span(sb, b)],
+                ends: (e.from, e.to),
             }
         })
         .collect();
@@ -2932,7 +2933,7 @@ pub(crate) fn back_lanes(
         let e = &g.edges[backs[i]];
         let (a, b) = (&at[e.from], &at[e.to]);
         let path = crate::lanes::judged_path(x, wants[i].spans, a.l, b.l, a.l - 0.5, b.l + 0.5);
-        crate::lanes::crossings(&path, (e.from, e.to), &skeletons)
+        crate::lanes::crossings(&path, (e.from, e.to), wants[i].spans, &skeletons)
     });
     backs
         .iter()

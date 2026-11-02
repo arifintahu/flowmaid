@@ -123,16 +123,29 @@ Minor, not patch: several class structs gain public fields (see
   densely sampled `SceneEdge::waypoints` (router style, so a host's spline
   through them draws the same path; `bezier` is a cubic through the lane's
   corners). The lane keeps 24 px plus half its label from what it passes,
-  takes the side that crosses fewer edges (then the shorter way round),
-  never threads a gap between nodes, and nests with other lanes, the
-  inner lane's stubs the longer so the legs never cross. When another
-  edge fans out of (or into) an end toward the lane — a hub — the lane
-  meets that end on its side facing the lane instead. demo is 321 px wide
-  (was 383), back-edge 290 (351); the state `retry` and fanout's `no`
-  loops go round the outside. The same rule runs in `scene()`, in the
-  layout's own estimate of the drawing it centres (so it reserves exactly
-  the lane's room) and in `route()` / `route_partial()` (O(nodes + edges)
-  per back-edge, inside the drag budget).
+  takes the spot that crosses fewest edges (then the shorter way round),
+  never threads a gap between nodes, and nests with other lanes without
+  crossing their legs: lanes from ends stacked on one layer into one node
+  run side by side straight out of their ends and turn in one after the
+  other, and lanes nested round each other are dealt out so the end
+  nearest their side takes the outermost lane and the shortest stub.
+  Where it meets an end another edge also uses, the lane is judged by
+  where that edge heads, so it never turns across an edge arriving beside
+  it: the state `retry` loop runs straight up out of `Rejected` round the
+  outside, crossing nothing (it ran between the Validating frame and
+  `Rejected`, across `invalid`). A lane running straight into its
+  target's busy side counts the edges leaving beside it, and a leg out of
+  a member of a frame the lane leaves runs a stub past that frame's
+  border instead of along it. When another edge fans out of (or into) an
+  end toward the lane — a hub — the lane meets that end on its side
+  facing the lane, the lanes meeting one side one after the other. The
+  router takes the lanes first, so the forward edges route round them.
+  demo is 321 px wide (was 383), back-edge 290 (351), fanout's `no` loop
+  goes round the outside, and the flow corpus crosses fewer edges (524 ->
+  505 static, 519 -> 508 in `route()`). The same rule runs in `scene()`,
+  in the layout's own estimate of the drawing it centres (so it reserves
+  exactly the lane's room) and in `route()` / `route_partial()`
+  (O(nodes + edges) per back-edge, inside the drag budget).
 - **A back-edge with nothing between its ends crosses the gap** like a
   forward edge, a reversed S out of its source's flow-in side — a 2-cycle
   (`A --> B`, `B --> A`) draws its two edges side by side, uncrossed, in
@@ -140,15 +153,22 @@ Minor, not patch: several class structs gain public fields (see
   the return edge's label too). lr is 226 px tall (was 299, the return
   edge a V-shaped loop below the row); the twins' ports keep their drawn
   order at both ends, and the pair counts as one link when the layout
-  aligns the two nodes.
+  aligns the two nodes. In LR / RL a labelled 2-cycle's two curves bow
+  apart by a label's height, so each label rides its own line (wide-labels'
+  return label covered its twin near Client). A back-edge whose ends lie
+  more than 450 px apart across the flow takes a lane instead: a reversed S
+  would sweep along the gap through every edge there and meet its end at a
+  slant (bench-75's `svc2 -> db` entered `db` at 71° in `route()`).
 - **An LR / RL back-edge's label takes its height across the flow**, not
   its width: wide-labels is 160 px tall (was 413, the loop under the row
   sized by a 337 px label).
 - **An edge between two members of a subgraph stays inside it**: the
   frame grows over a back-edge's lane and its label (advanced's `fail`
-  edge bulged out of CI/CD), and the router prices any path that leaves
-  the innermost frame holding both its ends (a last tie-break, never a
-  reason to reroute).
+  edge bulged out of CI/CD) — in `route()` and `route_partial()` too, so
+  a labelled loop inside nested boxes no longer jumps out of both frames
+  on the first drag — and the router prices any path that leaves the
+  innermost frame holding both its ends (a last tie-break, never a reason
+  to reroute).
 - **Self-loops keep their room** (report P0 #13): the layout keeps a
   looped node's loop (and 12 px) clear of its high-side neighbour, so a
   long edge's channel beside it no longer runs through the loop's apex

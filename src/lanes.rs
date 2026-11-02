@@ -53,6 +53,14 @@ pub(crate) const LANE_REACH: f64 = LANE_STUB / 2.0;
 /// band (besides half its label), else it takes a lane
 /// ([`blocks_direct`]).
 pub(crate) const DIRECT_CLEAR: f64 = LANE_CLEAR / 2.0;
+/// Farthest (px) apart across the flow a back-edge's two ports may lie
+/// for it to be drawn across the gap ([`blocks_direct`]): a reversed S
+/// sweeps along the gap over that whole breadth, through every edge
+/// crossing the gap there, and once the ports stage moves its end it
+/// meets its side at a slant (bench-75's svc2 -> db, 592 px across a
+/// 60 px gap, entered db at 71 deg in `route()`). Past it, a lane, whose
+/// legs meet both sides square.
+pub(crate) const DIRECT_REACH: f64 = 450.0;
 /// How much (px) longer a lane's stub is for each lane nested round it
 /// from the same end layer: the nested legs run side by side, the
 /// outer lane's nearer its end, so they never cross.
@@ -138,7 +146,8 @@ pub(crate) fn legs(a: &Placed, b: &Placed, lane: &Lane) -> (f64, f64) {
     let bot = b.l + b.lsize / 2.0;
     let stub = |k: usize| {
         let want = LANE_STUB + lane.stagger[k] as f64 * LANE_STAGGER;
-        want.min((lane.room[k] - NODE_SEP).max(LANE_STUB))
+        want.max(lane.out[k])
+            .min((lane.room[k] - NODE_SEP).max(LANE_STUB))
             .min((top - bot) / 3.0)
             .max(0.0)
     };
@@ -172,8 +181,9 @@ pub(crate) fn room<'a>(end: &Placed, up: bool, others: impl Iterator<Item = &'a 
 /// across to the lane, along it. An end whose side reaches the lane
 /// runs straight along it, without a stub. An end flagged in `side`
 /// (source, target; see [`meets_side`]) is met instead on its side
-/// facing the lane, level with its centre: the lane runs on to there
-/// and turns straight in.
+/// facing the lane, level with its centre (one [`LANE_STAGGER`] toward
+/// the other end per lane nested round it there): the lane runs on to
+/// there and turns straight in.
 pub(crate) fn corners(
     a: (&Placed, Shape),
     b: (&Placed, Shape),
@@ -185,11 +195,21 @@ pub(crate) fn corners(
     let (s0, s3) = legs(pa, pb, &lane);
     let xa = clamp_to(x, port_span(sa, pa));
     let xb = clamp_to(x, port_span(sb, pb));
-    let flank = |p: &Placed| (p.b + (x - p.b).signum() * p.bsize / 2.0, p.l);
+    // Met on its side, an end is entered level with its centre, moved
+    // one LANE_STAGGER toward the other end per lane nested round it
+    // there (within the side's straight run): the lanes meeting one side
+    // turn in one after the other instead of on top of each other, the
+    // innermost nearest the other end, so none runs across another.
+    let level = |p: &Placed, k: usize, toward: f64| {
+        let room = (p.lsize / 2.0 - PORT_INSET).max(0.0);
+        p.l + toward.signum() * (lane.stagger[k] as f64 * LANE_STAGGER).min(room)
+    };
+    let (la, lb) = (level(pa, 0, pb.l - pa.l), level(pb, 1, pa.l - pb.l));
+    let flank = |p: &Placed, l: f64| (p.b + (x - p.b).signum() * p.bsize / 2.0, l);
     let mut c = Vec::with_capacity(6);
     if side[0] && (xa - x).abs() > LANE_EPS {
-        c.push(flank(pa));
-        c.push((x, pa.l));
+        c.push(flank(pa, la));
+        c.push((x, la));
     } else {
         c.push(port_at(sa, pa, xa, true));
         if (xa - x).abs() > LANE_EPS {
@@ -198,8 +218,8 @@ pub(crate) fn corners(
         }
     }
     if side[1] && (xb - x).abs() > LANE_EPS {
-        c.push((x, pb.l));
-        c.push(flank(pb));
+        c.push((x, lb));
+        c.push(flank(pb, lb));
     } else {
         if (xb - x).abs() > LANE_EPS {
             c.push((x, s3));
@@ -296,12 +316,19 @@ fn seg_cross(p: Pt, q: Pt, r: Pt, s: Pt) -> bool {
 
 /// Crossings of `path` (an edge between nodes `ends`, as
 /// [`judged_path`] lays it: a stub and a leg at each end, the lane
-/// between) with the `skeletons`. Near an end it shares with another
-/// edge, the two are spread apart by the ports stage rather than
-/// crossed, so that end's stub and leg are not judged against it (a
-/// twin, sharing both ends, not at all); past them, the lane can still
-/// cross it.
-pub(crate) fn crossings(path: &[Pt], ends: (usize, usize), skeletons: &[Skeleton]) -> usize {
+/// between; `spans` the two ends' [`port_span`]s) with the `skeletons`.
+/// Near an end it shares with another edge, the two are spread apart by
+/// the ports stage rather than crossed, so that end's stub and leg are
+/// not judged against it (a twin, sharing both ends, not at all); past
+/// them, the lane can still cross it. What decides there is where the
+/// other edge heads from the shared end ([`crosses_at_end`]): its first
+/// segment is judged by that alone.
+pub(crate) fn crossings(
+    path: &[Pt],
+    ends: (usize, usize),
+    spans: [(f64, f64); 2],
+    skeletons: &[Skeleton],
+) -> usize {
     let mut bb = (
         f64::INFINITY,
         f64::INFINITY,
@@ -312,20 +339,59 @@ pub(crate) fn crossings(path: &[Pt], ends: (usize, usize), skeletons: &[Skeleton
         bb = (bb.0.min(b), bb.1.min(l), bb.2.max(b), bb.3.max(l));
     }
     let segs = path.len().saturating_sub(1);
+    let (Some(&first), Some(&last)) = (path.first(), path.last()) else {
+        return 0;
+    };
+    // The lane's breadth: its first corner past the source's leg.
+    let x = path.get(2).map_or(first.0, |p| p.0);
     let mut n = 0;
     for s in skeletons {
+        let has = |v: usize| s.ends.0 == v || s.ends.1 == v;
+        let (at_a, at_b) = (has(ends.0), has(ends.1));
+        // Its first segment at each end it shares, judged by where it
+        // heads ([`crosses_at_end`]) rather than by the straight line.
+        let k = s.pts.len();
+        let mut skip = (0, k.saturating_sub(1));
+        for (shared, v, port, upstream, span) in [
+            (at_a, ends.0, first, true, spans[0]),
+            (at_b, ends.1, last, false, spans[1]),
+        ] {
+            if !shared || k < 2 {
+                continue;
+            }
+            let (from_v, next) = if s.ends.0 == v {
+                (true, s.pts[1])
+            } else {
+                (false, s.pts[k - 2])
+            };
+            if from_v {
+                skip.0 = skip.0.max(1);
+            } else {
+                skip.1 = skip.1.min(k - 2);
+            }
+            // Only an edge on the flow side the lane leaves (enters) by.
+            let same_side = if upstream {
+                next.1 < port.1
+            } else {
+                next.1 > port.1
+            };
+            // A lane running straight into its target's downstream side
+            // arrives against the edges leaving that side: its head among
+            // their tails, it runs alongside each until it turns away (the
+            // router then redraws the crowd round it). Each counts.
+            let along = !upstream && (x - port.0).abs() <= LANE_EPS;
+            if same_side {
+                n += usize::from(along || crosses_at_end(port.0, x, span, next.0));
+            }
+        }
         if s.bbox.0 > bb.2 || s.bbox.2 < bb.0 || s.bbox.1 > bb.3 || s.bbox.3 < bb.1 {
             continue;
         }
-        let has = |v: usize| s.ends.0 == v || s.ends.1 == v;
-        let from = if has(ends.0) { 2 } else { 0 };
-        let to = if has(ends.1) {
-            segs.saturating_sub(2)
-        } else {
-            segs
-        };
+        let from = if at_a { 2 } else { 0 };
+        let to = if at_b { segs.saturating_sub(2) } else { segs };
+        let rest = s.pts.get(skip.0..=skip.1).unwrap_or(&[]);
         for w in path.windows(2).take(to).skip(from) {
-            for v in s.pts.windows(2) {
+            for v in rest.windows(2) {
                 if seg_cross(w[0], w[1], v[0], v[1]) {
                     n += 1;
                 }
@@ -335,18 +401,42 @@ pub(crate) fn crossings(path: &[Pt], ends: (usize, usize), skeletons: &[Skeleton
     n
 }
 
+/// Whether a lane meeting an end at port breadth `xa` (within the end's
+/// port `span`) and running at breadth `x` crosses another edge leaving
+/// that end on the same flow side toward breadth `f`. The ports stage
+/// puts the other edge's port on the side it heads to, so the two part
+/// — unless the lane turns toward that side and the other edge heads on
+/// past the lane (its leg, or the side entry [`meets_side`] gives it,
+/// lies across the other's way), or the lane runs straight out at the
+/// span's end on that side, leaving it no room there. (Judging the
+/// straight line from the end's centre instead let a lane turn across
+/// an edge arriving beside it: state `retry` across `invalid`.)
+pub(crate) fn crosses_at_end(xa: f64, x: f64, span: (f64, f64), f: f64) -> bool {
+    let d = x - xa;
+    if d.abs() > LANE_EPS {
+        (f - x) * d > 0.0
+    } else {
+        (f < xa - LANE_EPS && xa <= span.0 + LANE_EPS)
+            || (f > xa + LANE_EPS && xa >= span.1 - LANE_EPS)
+    }
+}
+
 /// The breadth a back-edge's lane runs at: past all the `obstacles`
 /// (breadth spans of what reaches into its band) by `clear`, on the low
-/// or the high side, whichever costs fewer [`LANE_CROSS_COST`]-priced
-/// crossings (`cross` counts them for a breadth) plus way round — the
-/// legs from each end's nearest port (`spans`, source then target) to
-/// the lane; ties go to the high side. On each side the lane takes the
-/// shortest spot, the one nearest the obstacles among equals: within an
-/// end's own span when that reaches past them, so the lane leaves or
-/// enters it straight. Never between two obstacles: a gap there is a
-/// channel the forward edges use, and a lane threading it crosses them
-/// near their ends where no skeleton tells (mermaid loops round the
-/// outside too).
+/// or the high side, at the spot that costs the fewest
+/// [`LANE_CROSS_COST`]-priced crossings (`cross` counts them for a
+/// breadth) plus way round — the legs from each end's nearest port
+/// (`spans`, source then target) to the lane. The spots on a side are
+/// its bound by the obstacles and the ends of the two spans past it; of
+/// equal cost, the one nearest the obstacles, and of the two sides' best
+/// the high one on a tie. So the lane takes the shortest way, within an
+/// end's own span when that reaches past the obstacles (it leaves or
+/// enters that end straight) — unless that way crosses more: then a spot
+/// further out within an end's span, which runs straight out of the end
+/// past an edge arriving beside it, or the other side. Never between two
+/// obstacles: a gap there is a channel the forward edges use, and a lane
+/// threading it crosses them near their ends where no skeleton tells
+/// (mermaid loops round the outside too).
 pub(crate) fn lane_at(
     obstacles: &[(f64, f64)],
     clear: f64,
@@ -362,42 +452,54 @@ pub(crate) fn lane_at(
     }
     let off = |x: f64, s: (f64, f64)| (s.0 - x).max(x - s.1).max(0.0);
     let detour = |x: f64| off(x, spans[0]) + off(x, spans[1]);
-    // The shortest spot in `[f0, f1]`, nearest the obstacles' side
-    // (`near`) among equals: a bound or an end of a span.
-    let spot = |f0: f64, f1: f64, near: f64| -> Option<(f64, f64)> {
-        let mut best: Option<(f64, f64, f64)> = None;
-        for x in [f0, f1, spans[0].0, spans[0].1, spans[1].0, spans[1].1] {
-            if !x.is_finite() || x < f0 || x > f1 {
+    // The best spot in `[f0, f1]` — a bound or an end of a span — by
+    // cost (`priced`: with its crossings), nearest `near` among equals:
+    // `(cost, x, crossings, way round)`. Spots are tried shortest
+    // first, so one longer than the best cost so far is never priced.
+    let mut spot = |f0: f64, f1: f64, near: f64, priced: bool| -> Option<(f64, f64, usize, f64)> {
+        let mut xs: Vec<(f64, f64, f64)> = [f0, f1, spans[0].0, spans[0].1, spans[1].0, spans[1].1]
+            .into_iter()
+            .filter(|&x| x.is_finite() && x >= f0 && x <= f1)
+            .map(|x| (detour(x), (x - near).abs(), x))
+            .collect();
+        xs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        let mut best: Option<(f64, f64, f64, usize, f64)> = None;
+        for (d, dist, x) in xs {
+            if best.is_some_and(|b| d > b.0 + LANE_EPS || (b.2 - x).abs() <= LANE_EPS) {
                 continue;
             }
-            let k = (detour(x), (x - near).abs(), x);
+            let n = if priced { cross(x) } else { 0 };
+            let cost = n as f64 * LANE_CROSS_COST + d;
             let better = best.map_or(true, |b| {
-                k.0 < b.0 - LANE_EPS || (k.0 <= b.0 + LANE_EPS && k.1 < b.1)
+                cost < b.0 - LANE_EPS || (cost <= b.0 + LANE_EPS && dist < b.1)
             });
             if better {
-                best = Some(k);
+                best = Some((cost, dist, x, n, d));
             }
         }
-        best.map(|(d, _, x)| (d, x))
+        best.map(|(c, _, x, n, d)| (c, x, n, d))
     };
     if lo > hi {
         // Nothing in the way: the shortest spot anywhere.
-        return spot(f64::NEG_INFINITY, f64::INFINITY, 0.0).map_or(0.0, |s| s.1);
+        return spot(f64::NEG_INFINITY, f64::INFINITY, 0.0, false).map_or(0.0, |s| s.1);
     }
-    let sides = [spot(f64::NEG_INFINITY, lo, lo), spot(hi, f64::INFINITY, hi)];
-    let mut best: Option<(f64, f64)> = None; // (cost, x)
-    for (d, x) in sides.into_iter().flatten() {
-        let cost = cross(x) as f64 * LANE_CROSS_COST + d;
-        if best.map_or(true, |(bc, _)| cost <= bc + LANE_EPS) {
-            best = Some((cost, x));
-        }
+    let (low, high) = (
+        spot(f64::NEG_INFINITY, lo, lo, true),
+        spot(hi, f64::INFINITY, hi, true),
+    );
+    // Of the two sides' best, the cheaper; the high side on a tie.
+    match (low, high) {
+        (Some(l), Some(h)) if l.0 < h.0 - LANE_EPS => l.1,
+        (_, Some(h)) => h.1,
+        (Some(l), None) => l.1,
+        (None, None) => hi,
     }
-    best.map_or(hi, |b| b.1)
 }
 
-/// Whether a node in a back-edge's band stands in the way of the direct
-/// curve across the gap (the forward curve run the other way, leaving
-/// and entering along the flow): `between` holds the breadth spans of
+/// Whether the direct curve across the gap (the forward curve run the
+/// other way, leaving and entering along the flow) will not do for a
+/// back-edge: its ends lie more than [`DIRECT_REACH`] apart across the
+/// flow, or a node in its band stands in its way. `between` holds the breadth spans of
 /// what lies on the layers strictly between the ends, which the curve
 /// sweeps across from the source's port breadth `ports.0` to the
 /// target's `ports.1`; `beside` those of the nodes on an end's own layer
@@ -413,9 +515,10 @@ pub(crate) fn blocks_direct(
 ) -> bool {
     let near = |s: (f64, f64), lo: f64, hi: f64, c: f64| s.0 < hi + c && lo - c < s.1;
     let (lo, hi) = (ports.0.min(ports.1), ports.0.max(ports.1));
-    between
-        .iter()
-        .any(|&s| near(s, lo, hi, DIRECT_CLEAR + label))
+    hi - lo > DIRECT_REACH
+        || between
+            .iter()
+            .any(|&s| near(s, lo, hi, DIRECT_CLEAR + label))
         || beside.iter().any(|&(s, src)| {
             let p = if src { ports.0 } else { ports.1 };
             near(s, p, p, DIRECT_CLEAR)
@@ -438,6 +541,12 @@ pub(crate) struct Lane {
     /// which caps the stub; set by the caller that draws the lane
     /// (infinite from [`plan`]).
     pub room: [f64; 2],
+    /// Per end: the least stub that takes the leg [`LANE_STUB`] past the
+    /// border of a frame the lane leaves the end's box through, when
+    /// that border lies just beyond the end's side (a leg there would
+    /// run along the border); set by the caller that draws the lane (0
+    /// from [`plan`]).
+    pub out: [f64; 2],
 }
 
 impl Lane {
@@ -448,6 +557,7 @@ impl Lane {
             local: true,
             stagger: [0, 0],
             room: [f64::INFINITY; 2],
+            out: [0.0; 2],
         }
     }
 }
@@ -476,6 +586,8 @@ pub(crate) struct Want {
     pub label_half: f64,
     /// The two ends' [`port_span`]s, source then target.
     pub spans: [(f64, f64); 2],
+    /// The two end nodes, source then target.
+    pub ends: (usize, usize),
 }
 
 /// Plan the lanes of `wants`: each one's [`Lane`], or `None` for one
@@ -529,11 +641,40 @@ pub(crate) fn plan(
         if !w.blocked {
             continue;
         }
+        // Each planned lane sharing its band is in its way — but one
+        // running straight out of its own end (no leg there) beside this
+        // one's end, into the end they share, runs alongside it rather
+        // than round it: lanes from ends stacked on one layer into one
+        // node run side by side out of their ends (they turn into the
+        // shared end one after the other), so this lane may too, when
+        // it also runs straight out of its own end.
+        let legless = |j: usize, x: f64, k: usize| {
+            let s = wants[j].spans[k];
+            x >= s.0 - LANE_EPS && x <= s.1 + LANE_EPS
+        };
+        let beside = |j: usize, x: f64| -> Option<usize> {
+            let o = &wants[j];
+            if o.band != w.band {
+                return None;
+            }
+            if o.ends.1 == w.ends.1 && o.ends.0 != w.ends.0 && legless(j, x, 0) {
+                Some(0)
+            } else if o.ends.0 == w.ends.0 && o.ends.1 != w.ends.1 && legless(j, x, 1) {
+                Some(1)
+            } else {
+                None
+            }
+        };
         let mut obs = w.obstacles.clone();
+        let mut alongside: Vec<((f64, f64), usize)> = Vec::new();
         for &(j, x) in &placed {
             let o = &wants[j];
             if o.band.0 < w.band.1 && w.band.0 < o.band.1 {
-                obs.push((x - o.label_half, x + o.label_half));
+                let span = (x - o.label_half, x + o.label_half);
+                match beside(j, x) {
+                    Some(k) => alongside.push((span, k)),
+                    None => obs.push(span),
+                }
             }
         }
         let mut x = lane_at(&obs, w.clear, w.spans, |x| cross(i, x));
@@ -543,27 +684,103 @@ pub(crate) fn plan(
             obs.extend_from_slice(&w.foreign);
             x = lane_at(&obs, w.clear, w.spans, |x| cross(i, x));
         }
+        // Not straight out of its own end: round those lanes too.
+        if alongside.iter().any(|&(_, k)| !legless(i, x, k)) {
+            obs.extend(alongside.iter().map(|&(s, _)| s));
+            x = lane_at(&obs, w.clear, w.spans, |x| cross(i, x));
+        }
         out[i] = Some(Lane {
             x,
             local,
             stagger: [0, 0],
             room: [f64::INFINITY; 2],
+            out: [0.0; 2],
         });
         placed.push((i, x));
     }
-    // Stagger: per lane end, the lanes planned after it (round it) on its
-    // side of what it passes that share that end's layer.
-    for (k, &(i, xi)) in placed.iter().enumerate() {
+    // Lanes of one band on one side, leaving one layer from different
+    // ends, nest only one way round: the end nearest the side they run
+    // to takes the lane farthest out (and, below, the shortest stub), so
+    // every other leg turns before it and no lane runs across another's
+    // leg. Planned one by one, the lanes came out in any order (the
+    // first within its end's own span, the others round it across its
+    // run), so their breadths are dealt out again in that order.
+    let side = |i: usize, x: f64| {
         let (lo, hi) = block(&wants[i]);
-        let mid = (lo + hi) / 2.0;
-        let mut stagger = [0usize; 2];
-        for &(j, xj) in &placed[k + 1..] {
-            if (xi - mid) * (xj - mid) <= 0.0 {
-                continue;
+        (x - (lo + hi) / 2.0).signum()
+    };
+    let centre = |s: (f64, f64)| (s.0 + s.1) / 2.0;
+    let mut dealt = vec![false; wants.len()];
+    for &(i, xi) in &placed {
+        if dealt[i] {
+            continue;
+        }
+        let w = &wants[i];
+        let group: Vec<usize> = placed
+            .iter()
+            .filter(|&&(j, xj)| {
+                let o = &wants[j];
+                !dealt[j]
+                    && o.band == w.band
+                    && o.label_half == w.label_half
+                    && side(j, xj) == side(i, xi)
+                    && out[j].map(|l| l.local) == out[i].map(|l| l.local)
+            })
+            .map(|&(j, _)| j)
+            .collect();
+        for &j in &group {
+            dealt[j] = true;
+        }
+        if group.len() < 2 {
+            continue;
+        }
+        let xs: Vec<f64> = group.iter().filter_map(|&j| out[j].map(|l| l.x)).collect();
+        let sum_b: f64 = group.iter().map(|&j| centre(wants[j].spans[0])).sum();
+        let dir = (xs.iter().sum::<f64>() - sum_b).signum();
+        let mut ends = group.clone();
+        ends.sort_by(|&a, &b| {
+            let (ba, bb) = (centre(wants[a].spans[0]), centre(wants[b].spans[0]));
+            (bb * dir).total_cmp(&(ba * dir)).then(a.cmp(&b))
+        });
+        let mut lanes = xs;
+        lanes.sort_by(|a, b| (b * dir).total_cmp(&(a * dir)));
+        for (&j, &x) in ends.iter().zip(&lanes) {
+            if let Some(l) = out[j].as_mut() {
+                l.x = x;
             }
-            let (bi, bj) = (wants[i].band, wants[j].band);
-            stagger[0] += usize::from(bi.1 == bj.1);
-            stagger[1] += usize::from(bi.0 == bj.0);
+        }
+    }
+    // Stagger: per lane end, the lanes on its side sharing that end's
+    // layer that run farther out from their ends — its stub is that many
+    // LANE_STAGGERs longer, so the lane farthest out turns first and the
+    // nested legs never cross (at a shared end as at ends side by side).
+    let laid: Vec<(usize, f64)> = placed
+        .iter()
+        .filter_map(|&(i, _)| out[i].map(|l| (i, l.x)))
+        .collect();
+    for &(i, xi) in &laid {
+        let mut stagger = [0usize; 2];
+        for (k, layer) in [(0, wants[i].band.1), (1, wants[i].band.0)] {
+            let out_dir = |j: usize, x: f64| {
+                let d = x - centre(wants[j].spans[k]);
+                if d.abs() > LANE_EPS {
+                    d.signum()
+                } else {
+                    side(j, x)
+                }
+            };
+            let di = out_dir(i, xi);
+            for &(j, xj) in &laid {
+                let lj = if k == 0 {
+                    wants[j].band.1
+                } else {
+                    wants[j].band.0
+                };
+                if j == i || lj != layer || side(j, xj) != side(i, xi) || out_dir(j, xj) != di {
+                    continue;
+                }
+                stagger[k] += usize::from((xj - xi) * di > LANE_EPS);
+            }
         }
         if let Some(l) = out[i].as_mut() {
             l.stagger = stagger;
@@ -655,6 +872,109 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_counts_the_edge_it_turns_across_at_a_shared_end() {
+        // The lane leaves its end at port 100 (span 80..120) and turns
+        // left to run at 40: an edge from that end heading to 20 lies
+        // past the lane (crossed), one heading to 60 between (the side
+        // entry or the ports part them), one heading right never.
+        let span = (80.0, 120.0);
+        assert!(crosses_at_end(80.0, 40.0, span, 20.0));
+        assert!(!crosses_at_end(80.0, 40.0, span, 60.0));
+        assert!(!crosses_at_end(80.0, 40.0, span, 200.0));
+        // Straight out at the span's left end: no room left of it for an
+        // edge heading left; at its right end, none heading right.
+        assert!(crosses_at_end(80.0, 80.0, span, 20.0));
+        assert!(!crosses_at_end(120.0, 120.0, span, 20.0));
+        assert!(crosses_at_end(120.0, 120.0, span, 200.0));
+        // Judged on a path: state `retry` from Rejected (node 0) to Idle
+        // (node 1) with `invalid` (2 -> 0) arriving from upper left: the
+        // short way left of Rejected crosses it, straight up does not.
+        let spans = [(318.5, 381.7), (158.3, 265.3)];
+        let invalid = Skeleton::new((2, 0), vec![(211.8, 5.0), (350.1, 6.0)]);
+        let short = judged_path(294.0, spans, 6.0, 1.0, 5.5, 1.5);
+        assert_eq!(
+            crossings(&short, (0, 1), spans, std::slice::from_ref(&invalid)),
+            1
+        );
+        let out = judged_path(381.7, spans, 6.0, 1.0, 5.5, 1.5);
+        assert_eq!(
+            crossings(&out, (0, 1), spans, std::slice::from_ref(&invalid)),
+            0
+        );
+        let x = lane_at(&[(150.0, 274.0)], LANE_CLEAR, spans, |x| {
+            let p = judged_path(x, spans, 6.0, 1.0, 5.5, 1.5);
+            crossings(&p, (0, 1), spans, std::slice::from_ref(&invalid))
+        });
+        assert_eq!(x, 381.7);
+    }
+
+    #[test]
+    fn a_lane_straight_into_its_target_counts_the_edges_leaving_beside_it() {
+        // bench-75's job1 -> svc1 in route(): straight into svc1's
+        // downstream side, the lane arrives against an edge leaving that
+        // side (target node 1, the edge to node 5 downstream of it): it
+        // counts. With a leg there instead, an edge heading away from
+        // the lane's side does not.
+        let spans = [(1731.0, 1745.0), (451.0, 465.0)];
+        let out = Skeleton::new((1, 5), vec![(458.0, 1.0), (900.0, 3.0)]);
+        let one = std::slice::from_ref(&out);
+        let straight = judged_path(451.0, spans, 6.0, 1.0, 5.5, 1.5);
+        assert_eq!(crossings(&straight, (0, 1), spans, one), 1);
+        let leg = judged_path(1800.0, spans, 6.0, 1.0, 5.5, 1.5);
+        assert_eq!(crossings(&leg, (0, 1), spans, one), 0);
+    }
+
+    #[test]
+    fn lanes_from_stacked_ends_into_one_node_run_side_by_side() {
+        // bench-75's jobs: three ends stacked across the flow on one
+        // layer, each with a back-edge into one node, what they pass all
+        // on one side. A spot within an end's own span is the cheaper one
+        // (a leg there would cross the edges into the ends): each lane
+        // runs straight out of its own end beside the others — the
+        // planned ones no obstacle to it — and they turn into the shared
+        // end one after the other, the one nearest it first (its stub
+        // the longest), so no lane crosses another's leg.
+        let want = |src: usize, b: f64| Want {
+            key: 2.0,
+            band: (0.0, 2.0),
+            obstacles: vec![(0.0, 100.0)],
+            foreign: Vec::new(),
+            blocked: true,
+            clear: LANE_CLEAR,
+            label_half: 0.0,
+            spans: [(b - 7.0, b + 7.0), (40.0, 54.0)],
+            ends: (src, 9),
+        };
+        let wants = [want(1, 200.0), want(2, 290.0), want(3, 380.0)];
+        let lanes = plan(&wants, |i, x| {
+            let s = wants[i].spans[0];
+            usize::from(x < s.0 - 1e-9 || x > s.1 + 1e-9)
+        });
+        for (w, l) in wants.iter().zip(&lanes) {
+            let x = l.unwrap().x;
+            assert!(x >= w.spans[0].0 && x <= w.spans[0].1, "{x}: {lanes:?}");
+        }
+        let st: Vec<usize> = lanes.iter().map(|l| l.unwrap().stagger[1]).collect();
+        assert_eq!(st, vec![2, 1, 0], "{lanes:?}");
+        // Planned round each other instead (no cheaper spot of their
+        // own), they are dealt out so the end nearest their side takes
+        // the lane farthest out, with the shortest stub.
+        let lanes = plan(&wants, |_, _| 0);
+        let xs: Vec<f64> = lanes.iter().map(|l| l.unwrap().x).collect();
+        assert!(xs[0] < xs[1] && xs[1] < xs[2], "{xs:?}");
+        let st: Vec<usize> = lanes.iter().map(|l| l.unwrap().stagger[0]).collect();
+        assert_eq!(st, vec![0, 1, 2], "{lanes:?}");
+    }
+
+    #[test]
+    fn a_far_reaching_back_edge_takes_a_lane() {
+        // Nothing between its ends, but its ports lie DIRECT_REACH apart
+        // across the flow: no reversed S sweeping along the gap.
+        assert!(!blocks_direct(&[], &[], (0.0, DIRECT_REACH), 0.0));
+        assert!(blocks_direct(&[], &[], (0.0, DIRECT_REACH + 1.0), 0.0));
+    }
+
+    #[test]
     fn nested_lanes_keep_apart_innermost_first() {
         let want = |key: f64, band: (f64, f64)| Want {
             key,
@@ -665,6 +985,7 @@ mod tests {
             clear: LANE_CLEAR,
             label_half: 0.0,
             spans: [(110.0, 130.0), (110.0, 130.0)],
+            ends: (0, 1),
         };
         let lanes = plan(&[want(3.0, (0.0, 3.0)), want(1.0, (1.0, 2.0))], |_, _| 0);
         let (outer, inner) = (lanes[0].unwrap().x, lanes[1].unwrap().x);

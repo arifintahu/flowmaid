@@ -42,6 +42,9 @@ pub(crate) use crate::labels::{covered, ObstacleGrid, Rect};
 pub(crate) const MARGIN: f64 = 28.0;
 /// Gap between parallel edges (connecting the same node pair).
 const PARALLEL_GAP: f64 = 16.0;
+/// How far (px) the controls of a labelled 2-cycle's two curves across
+/// one gap bow apart across the flow in LR / RL ([`twin_bows`]).
+const TWIN_LABEL_BOW: f64 = LABEL_BOX_H + 2.0 * crate::labels::STROKE_PAD;
 /// How far (px) a self-loop's controls reach past its node's side.
 const LOOP_EXT: f64 = 48.0;
 /// Room (px) a parallel edge's label keeps from the neighbouring line of
@@ -2924,6 +2927,19 @@ fn scene_from_layout(
     } else {
         Vec::new()
     };
+    // The frames' extents along the flow, for a lane's legs out of them.
+    let frames = if g.subgraphs.is_empty() || lanes.iter().all(Option::is_none) {
+        Vec::new()
+    } else {
+        flow_frame_spans(g, &lo.nodes, g.direction)
+    };
+    let bows = twin_bows(g, &offs, |ei| {
+        let e = &g.edges[ei];
+        ei < real
+            && lo.edge_paths[ei].is_empty()
+            && lanes[ei].is_none()
+            && lo.nodes[e.from].layer != lo.nodes[e.to].layer
+    });
     let mut abs_edges: Vec<AbsEdge> = Vec::with_capacity(g.edges.len());
     for (ei, (e, off)) in g.edges.iter().zip(offs).enumerate() {
         let a = &lo.nodes[e.from];
@@ -2969,14 +2985,14 @@ fn scene_from_layout(
                 near.map_or(lo.nodes[far].b, |p| p.0)
             };
             let side = lane_sides(g, &lo.nodes, e, lane.x, heads);
-            let lane = lane_room(lane, a, b, &lo.nodes);
+            let lane = lane_room(g, e, lane, &lo.nodes, &frames);
             let (pts, wps, mid) = lane_geometry(ends.0, ends.1, lane, side);
             let label = e.label.as_ref().map(|l| (mid, text_width(l) + 14.0));
             abs_edges.push((pts, wps, label));
             continue;
         }
         let pts = elbow.unwrap_or_else(|| {
-            edge_points(
+            let pts = edge_points(
                 a,
                 b,
                 g.nodes[e.from].shape,
@@ -2985,7 +3001,8 @@ fn scene_from_layout(
                 lo.total_b,
                 off,
                 lone,
-            )
+            );
+            bowed(pts, bows[ei])
         });
         // A long edge threads through its virtual-node channel: its
         // node-boundary start, the per-layer channel points, then its
@@ -3265,12 +3282,7 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
                     && node_cluster[ge.from].contains(&si)
                     && node_cluster[ge.to].contains(&si);
                 if home {
-                    if let Some((text, (mx, my), w)) = &se.label {
-                        let (mb, half) = if horizontal {
-                            (*my, crate::lanes::label_breadth(Some(text), true) / 2.0)
-                        } else {
-                            (*mx, w / 2.0)
-                        };
+                    if let Some((mb, half)) = lane_label_reach(se, horizontal) {
                         b0 = b0.min(mb - half - LANE_PAD);
                         b1 = b1.max(mb + half + LANE_PAD);
                     }
@@ -3295,75 +3307,15 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
                     }
                 }
             }
-            // A lane may not widen a frame into a sibling's (G2): it
-            // stops FRAME_GAP short, and the router takes over the lane
-            // waypoint left outside. The side is judged on the member-only
-            // boxes; the stop is the sibling's frame as it stands, which
-            // is already widened when that sibling came first, so two
-            // siblings widening towards each other cannot meet.
-            let (ob0, ob1) = if horizontal { (y, y + h) } else { (x, x + w) };
-            let span = |r: (f64, f64, f64, f64)| {
-                let (ox, oy, ow, oh) = r;
-                if horizontal {
-                    (oy, oy + oh, ox, ox + ow)
-                } else {
-                    (ox, ox + ow, oy, oy + oh)
-                }
-            };
-            for (sj, other) in raw.iter().enumerate() {
-                let (Some(other), Some(now)) = (*other, boxes[sj]) else {
-                    continue;
-                };
-                if sj == si || g.subgraphs[sj].parent != g.subgraphs[si].parent {
-                    continue;
-                }
-                let (sb0, sb1, sl0, sl1) = span(other);
-                let (nb0, nb1, _, _) = span(now);
-                if sl1 <= l0 || sl0 >= l1 {
-                    continue; // not beside it along the flow
-                }
-                if sb0 >= ob1 {
-                    b1 = b1.min(nb0 - FRAME_GAP).max(ob1);
-                } else if sb1 <= ob0 {
-                    b0 = b0.max(nb1 + FRAME_GAP).min(ob0);
-                }
-            }
+            let (b0, b1) = stop_at_siblings(g, si, &raw, &boxes, horizontal, (b0, b1, l0, l1));
             boxes[si] = Some(if horizontal {
                 (x, b0, w, b1 - b0)
             } else {
                 (b0, y, b1 - b0, h)
             });
         }
-        // Re-enforce nesting: a parent must still enclose its
-        // (possibly widened) children. Deepest-first, one level up.
-        let mut order: Vec<usize> = (0..g.subgraphs.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(depth[i]));
-        for &c in &order {
-            let (Some(p), Some((cx, cy, cw, ch))) = (g.subgraphs[c].parent, boxes[c]) else {
-                continue;
-            };
-            if let Some((px, py, pw, ph)) = boxes[p] {
-                let nx0 = px.min(cx - SUB_PAD);
-                let ny0 = py.min(cy - SUB_PAD);
-                let nx1 = (px + pw).max(cx + cw + SUB_PAD);
-                let ny1 = (py + ph).max(cy + ch + SUB_PAD);
-                boxes[p] = Some((nx0, ny0, nx1 - nx0, ny1 - ny0));
-            }
-        }
-        let mut out: Vec<SceneCluster> = (0..g.subgraphs.len())
-            .filter_map(|i| {
-                boxes[i].map(|(x, y, w, h)| SceneCluster {
-                    id: g.subgraphs[i].id.clone(),
-                    x,
-                    y,
-                    w,
-                    h,
-                    title: g.subgraphs[i].title.clone(),
-                    depth: depth[i],
-                })
-            })
-            .collect();
-        out.sort_by_key(|c| c.depth);
+        renest_boxes(g, &depth, &mut boxes);
+        let out = clusters_of(g, &boxes, &depth);
         frames = boxes;
         out
     };
@@ -4236,6 +4188,21 @@ fn route_built(
     // between their ends, by the static layout's rule ([`route_backs`]).
     let flow_at: Vec<Placed> = placed.iter().map(|p| flow_placed(g.direction, p)).collect();
     let backs = route_backs(g, &flow_at);
+    let frames = if g.subgraphs.is_empty() || !backs.iter().any(|b| matches!(b, Back::Lane(_))) {
+        Vec::new()
+    } else {
+        flow_frame_spans(g, &flow_at, g.direction)
+    };
+    // A labelled 2-cycle across one gap bows apart as in the static
+    // layout ([`twin_bows`]).
+    let bows = twin_bows(g, &offs, |ei| {
+        let e = &g.edges[ei];
+        match backs[ei] {
+            Back::Direct => true,
+            Back::No => e.from != e.to && top_of(e.from) == top_of(e.to),
+            Back::Lane(_) => false,
+        }
+    });
     for (ei, (e, off)) in g.edges.iter().zip(offs).enumerate() {
         let a = &placed[e.from];
         let b = &placed[e.to];
@@ -4265,7 +4232,7 @@ fn route_built(
                 flow_at[if f.from == v { f.to } else { f.from }].b
             };
             let side = lane_sides(g, &flow_at, e, lane.x, heads);
-            let lane = lane_room(lane, fa, fb, &flow_at);
+            let lane = lane_room(g, e, lane, &flow_at, &frames);
             let (pts, wps, mid) = lane_geometry((fa, sa), (fb, sb), lane, side);
             let tf = |p: (f64, f64)| from_flow(g.direction, p);
             edges.push(SceneEdge {
@@ -4286,18 +4253,29 @@ fn route_built(
         }
         let pts = match (elbow, back) {
             (Some(pts), _) => pts,
-            (None, Back::Direct) => direct_back(fa, fb, sa, sb, off, lone_ends(g, &bars, e))
-                .map(|p| from_flow(g.direction, p)),
-            _ => free_edge(
-                a,
-                b,
-                sa,
-                sb,
-                e.from == e.to,
-                off,
-                Some(g.direction),
-                lone_ends(g, &bars, e),
-            ),
+            (None, Back::Direct) => bowed(
+                direct_back(fa, fb, sa, sb, off, lone_ends(g, &bars, e)),
+                bows[ei],
+            )
+            .map(|p| from_flow(g.direction, p)),
+            _ => {
+                let pts = free_edge(
+                    a,
+                    b,
+                    sa,
+                    sb,
+                    e.from == e.to,
+                    off,
+                    Some(g.direction),
+                    lone_ends(g, &bars, e),
+                );
+                if bows[ei] == 0.0 {
+                    pts
+                } else {
+                    bowed(pts.map(|p| to_flow(g.direction, p)), bows[ei])
+                        .map(|p| from_flow(g.direction, p))
+                }
+            }
         };
         let wps = if e.from != e.to && back == Back::No && top_of(e.from) != top_of(e.to) {
             // Parallel edges between one pair get the same channel: each
@@ -4338,7 +4316,17 @@ fn route_built(
         });
     }
 
-    let clusters = route_clusters(g, &nodes);
+    // A lane kept beside its box's members grows that frame over it, as
+    // in the static layout.
+    let home: Vec<bool> = backs
+        .iter()
+        .map(|b| matches!(b, Back::Lane(l) if l.local))
+        .collect();
+    let clusters = if home.iter().any(|&h| h) {
+        route_lane_clusters(g, &nodes, &edges, &home)
+    } else {
+        route_clusters(g, &nodes)
+    };
 
     // Subgraph-touching edges: route against the current cluster
     // boxes so they follow drags too. `route_clusters` returns
@@ -4808,6 +4796,155 @@ fn route_clusters(g: &Graph, nodes: &[SceneNode]) -> Vec<SceneCluster> {
         return Vec::new();
     }
     let (boxes, depth) = cluster_raw_boxes(g, nodes);
+    clusters_of(g, &boxes, &depth)
+}
+
+/// [`route_clusters`] with each frame grown over the back-edge lanes kept
+/// beside the members of the innermost box holding both their ends
+/// (`home`, index-parallel with `g.edges`; `edges` the scene's edges
+/// with those lanes drawn) and their labels, as `scene_clustered` grows
+/// its frames: [`route`] draws such a lane inside its own frame too,
+/// so it never leaves the box its two ends sit in (report §2.2), and a
+/// drag does not move the frame off it.
+fn route_lane_clusters(
+    g: &Graph,
+    nodes: &[SceneNode],
+    edges: &[SceneEdge],
+    home: &[bool],
+) -> Vec<SceneCluster> {
+    if g.subgraphs.is_empty() {
+        return Vec::new();
+    }
+    let (mut boxes, depth) = cluster_raw_boxes(g, nodes);
+    let raw = boxes.clone();
+    let paths = node_cluster_paths(g);
+    let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
+    for si in 0..g.subgraphs.len() {
+        let Some((x, y, w, h)) = boxes[si] else {
+            continue;
+        };
+        let (mut b0, mut b1, l0, l1) = if horizontal {
+            (y, y + h, x, x + w)
+        } else {
+            (x, x + w, y, y + h)
+        };
+        let mut grew = false;
+        for (ei, (ge, se)) in g.edges.iter().zip(edges).enumerate() {
+            if !home.get(ei).copied().unwrap_or(false)
+                || !paths[ge.from].contains(&si)
+                || !paths[ge.to].contains(&si)
+            {
+                continue;
+            }
+            grew = true;
+            if let Some((mb, half)) = lane_label_reach(se, horizontal) {
+                b0 = b0.min(mb - half - LANE_PAD);
+                b1 = b1.max(mb + half + LANE_PAD);
+            }
+            for &(wx, wy) in &se.waypoints {
+                let (wb, wl) = if horizontal { (wy, wx) } else { (wx, wy) };
+                if wl >= l0 && wl <= l1 {
+                    b0 = b0.min(wb - LANE_PAD);
+                    b1 = b1.max(wb + LANE_PAD);
+                }
+            }
+        }
+        if !grew {
+            continue;
+        }
+        let (b0, b1) = stop_at_siblings(g, si, &raw, &boxes, horizontal, (b0, b1, l0, l1));
+        boxes[si] = Some(if horizontal {
+            (x, b0, w, b1 - b0)
+        } else {
+            (b0, y, b1 - b0, h)
+        });
+    }
+    renest_boxes(g, &depth, &mut boxes);
+    clusters_of(g, &boxes, &depth)
+}
+
+/// Where a back-edge lane's label lies across the flow, `(centre, half
+/// breadth)`: its box's height in LR / RL ([`crate::lanes::label_breadth`]),
+/// its chip's width in TD / BT.
+fn lane_label_reach(se: &SceneEdge, horizontal: bool) -> Option<(f64, f64)> {
+    let (text, (mx, my), w) = se.label.as_ref()?;
+    Some(if horizontal {
+        (*my, crate::lanes::label_breadth(Some(text), true) / 2.0)
+    } else {
+        (*mx, w / 2.0)
+    })
+}
+
+/// A frame `si` widened across the flow to `(b0, b1)` (its extent along
+/// the flow `l0..l1`), stopped short of its siblings. A lane may not
+/// widen a frame into a sibling's (G2): it stops FRAME_GAP short, and
+/// the router takes over the lane waypoint left outside. The side is
+/// judged on the member-only boxes (`raw`); the stop is the sibling's
+/// frame as it stands (`boxes`), which is already widened when that
+/// sibling came first, so two siblings widening towards each other
+/// cannot meet.
+fn stop_at_siblings(
+    g: &Graph,
+    si: usize,
+    raw: &[RawBox],
+    boxes: &[RawBox],
+    horizontal: bool,
+    (mut b0, mut b1, l0, l1): (f64, f64, f64, f64),
+) -> (f64, f64) {
+    let Some((x, y, w, h)) = raw[si] else {
+        return (b0, b1);
+    };
+    let (ob0, ob1) = if horizontal { (y, y + h) } else { (x, x + w) };
+    let span = |r: (f64, f64, f64, f64)| {
+        let (ox, oy, ow, oh) = r;
+        if horizontal {
+            (oy, oy + oh, ox, ox + ow)
+        } else {
+            (ox, ox + ow, oy, oy + oh)
+        }
+    };
+    for (sj, other) in raw.iter().enumerate() {
+        let (Some(other), Some(now)) = (*other, boxes[sj]) else {
+            continue;
+        };
+        if sj == si || g.subgraphs[sj].parent != g.subgraphs[si].parent {
+            continue;
+        }
+        let (sb0, sb1, sl0, sl1) = span(other);
+        let (nb0, nb1, _, _) = span(now);
+        if sl1 <= l0 || sl0 >= l1 {
+            continue; // not beside it along the flow
+        }
+        if sb0 >= ob1 {
+            b1 = b1.min(nb0 - FRAME_GAP).max(ob1);
+        } else if sb1 <= ob0 {
+            b0 = b0.max(nb1 + FRAME_GAP).min(ob0);
+        }
+    }
+    (b0, b1)
+}
+
+/// Re-enforce nesting after frames were widened: a parent must still
+/// enclose its children. Deepest-first, one level up.
+fn renest_boxes(g: &Graph, depth: &[usize], boxes: &mut [RawBox]) {
+    let mut order: Vec<usize> = (0..g.subgraphs.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(depth[i]));
+    for &c in &order {
+        let (Some(p), Some((cx, cy, cw, ch))) = (g.subgraphs[c].parent, boxes[c]) else {
+            continue;
+        };
+        if let Some((px, py, pw, ph)) = boxes[p] {
+            let nx0 = px.min(cx - SUB_PAD);
+            let ny0 = py.min(cy - SUB_PAD);
+            let nx1 = (px + pw).max(cx + cw + SUB_PAD);
+            let ny1 = (py + ph).max(cy + ch + SUB_PAD);
+            boxes[p] = Some((nx0, ny0, nx1 - nx0, ny1 - ny0));
+        }
+    }
+}
+
+/// Per-subgraph boxes as paintable [`SceneCluster`]s, outermost-first.
+fn clusters_of(g: &Graph, boxes: &[RawBox], depth: &[usize]) -> Vec<SceneCluster> {
     let mut out: Vec<SceneCluster> = (0..g.subgraphs.len())
         .filter_map(|i| {
             boxes[i].map(|(x, y, w, h)| SceneCluster {
@@ -6133,6 +6270,67 @@ pub(crate) fn parallel_offsets(g: &Graph) -> Vec<f64> {
         .collect()
 }
 
+/// Per edge of `g`: how far (flow coordinates, across the flow) its
+/// curve's two controls bow out — the two edges of a 2-cycle drawn as
+/// single curves across one gap (`curve(ei)`) in LR / RL, one of them
+/// labelled, each away from its twin by [`TWIN_LABEL_BOW`] on the side
+/// its parallel offset `offs` puts it (0 for every other edge). The
+/// labels lie along the flow there, each centred on its own line: from
+/// two ports a 38 px side apart the twins ran too close for a label
+/// between them, and the return edge's label covered its twin near its
+/// end (wide-labels). Bowed apart, each label rides its own line clear
+/// of the other's, and the curves still leave and enter their sides
+/// within a few degrees of the normal.
+fn twin_bows(g: &Graph, offs: &[f64], curve: impl Fn(usize) -> bool) -> Vec<f64> {
+    let mut out = vec![0.0; g.edges.len()];
+    if !matches!(g.direction, Direction::LR | Direction::RL) {
+        return out;
+    }
+    for (i, e) in g.edges.iter().enumerate() {
+        if e.from == e.to || !curve(i) || matches!(e.kind, EdgeKind::Invisible) {
+            continue;
+        }
+        let twins = g.edges.iter().enumerate().filter(|&(j, f)| {
+            j != i
+                && f.from == e.to
+                && f.to == e.from
+                && curve(j)
+                && !matches!(f.kind, EdgeKind::Invisible)
+        });
+        let mut any = false;
+        let mut labelled = e.label.is_some();
+        for (_, f) in twins {
+            any = true;
+            labelled |= f.label.is_some();
+        }
+        if any && labelled {
+            out[i] = offs.get(i).map_or(0.0, |o| o.signum()) * TWIN_LABEL_BOW;
+        }
+    }
+    out
+}
+
+/// `pts` (flow coordinates) bowed `bow` across the flow ([`twin_bows`]):
+/// the control at the end lying less far out moves out first, as far
+/// as the other end lies further out (the curve then swings out early
+/// and runs on level into the other end, never past it and back); what
+/// is left of the bow moves both controls.
+fn bowed(mut pts: [(f64, f64); 4], bow: f64) -> [(f64, f64); 4] {
+    if bow == 0.0 {
+        return pts;
+    }
+    let s = bow.signum();
+    let room = (pts[3].0 - pts[0].0) * s;
+    let first = bow.abs().min(room.abs());
+    // The source lies less far out: its control swings out.
+    let near = if room > 0.0 { 1 } else { 2 };
+    pts[near].0 += s * first;
+    let rest = bow.abs() - first;
+    pts[1].0 += s * rest;
+    pts[2].0 += s * rest;
+    pts
+}
+
 /// [`parallel_offsets`] for `g.sub_edges`: several edges between one
 /// node / frame pair (either way round) fan out [`PARALLEL_GAP`] apart.
 fn sub_parallel_offsets(g: &Graph) -> Vec<f64> {
@@ -6598,21 +6796,100 @@ fn lane_geometry(
     ([p0, c1, c2, p3], wps, (x, (s0 + s3) / 2.0))
 }
 
-/// `lane` with the free gap beyond each end's side ([`crate::lanes::room`])
-/// among the nodes `at` (flow coordinates), which caps its stubs.
+/// `lane` of back-edge `e` with the free gap beyond each end's side
+/// ([`crate::lanes::room`]) among the nodes `at` (flow coordinates,
+/// index-parallel with `g.nodes`), which caps its stubs, and the least
+/// stub that takes a leg out past a frame the lane leaves its end's box
+/// through (`frames`: per subgraph, its extent along the flow,
+/// [`flow_frame_spans`]) when that frame's border lies within
+/// [`crate::lanes::LANE_STUB`] + [`crate::clearance::CLEAR_GAP`] of the end's side: a leg
+/// there would run along the border (G4).
 fn lane_room(
+    g: &Graph,
+    e: &Edge,
     lane: crate::lanes::Lane,
-    a: &Placed,
-    b: &Placed,
     at: &[Placed],
+    frames: &[Option<(f64, f64)>],
 ) -> crate::lanes::Lane {
+    use crate::lanes::LANE_STUB;
+    let (a, b) = (&at[e.from], &at[e.to]);
+    let mut out = [0.0f64; 2];
+    if !frames.is_empty() {
+        let paths = node_cluster_paths(g);
+        let (pa, pb) = (&paths[e.from], &paths[e.to]);
+        // Per end: its frames the other end is not in, and how far along
+        // the flow beyond the end's side such a frame's border lies.
+        let ends = [
+            (pa, pb, a.l - a.lsize / 2.0, true),
+            (pb, pa, b.l + b.lsize / 2.0, false),
+        ];
+        for (k, (mine, other, side, up)) in ends.into_iter().enumerate() {
+            for &si in mine.iter().filter(|si| !other.contains(si)) {
+                let Some((l0, l1)) = frames.get(si).copied().flatten() else {
+                    continue;
+                };
+                let d = if up { side - l0 } else { l1 - side };
+                if (0.0..LANE_STUB + crate::clearance::CLEAR_GAP).contains(&d) {
+                    out[k] = out[k].max(d + LANE_STUB);
+                }
+            }
+        }
+    }
     crate::lanes::Lane {
         room: [
             crate::lanes::room(a, true, at.iter()),
             crate::lanes::room(b, false, at.iter()),
         ],
+        out,
         ..lane
     }
+}
+
+/// Per subgraph of `g`, the extent `(l0, l1)` along the flow of its
+/// frame as it is wrapped round the boxes `at` (flow coordinates of
+/// direction `dir`, index-parallel with `g.nodes`), as
+/// [`cluster_raw_boxes`] wraps it: its members and child frames padded
+/// by `SUB_PAD`, its title band on the side that is the screen's top.
+/// `None` for an empty subgraph.
+fn flow_frame_spans(g: &Graph, at: &[Placed], dir: Direction) -> Vec<Option<(f64, f64)>> {
+    let n = g.subgraphs.len();
+    let mut depth = vec![0usize; n];
+    for (i, d) in depth.iter_mut().enumerate() {
+        let mut p = g.subgraphs[i].parent;
+        while let Some(pi) = p {
+            *d += 1;
+            p = g.subgraphs[pi].parent;
+        }
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(depth[i]));
+    let mut spans: Vec<Option<(f64, f64)>> = vec![None; n];
+    for &i in &order {
+        let (mut l0, mut l1) = (f64::INFINITY, f64::NEG_INFINITY);
+        for p in g.subgraphs[i].nodes.iter().filter_map(|&v| at.get(v)) {
+            l0 = l0.min(p.l - p.lsize / 2.0);
+            l1 = l1.max(p.l + p.lsize / 2.0);
+        }
+        for (j, s) in g.subgraphs.iter().enumerate() {
+            if s.parent == Some(i) {
+                if let Some((c0, c1)) = spans[j] {
+                    l0 = l0.min(c0);
+                    l1 = l1.max(c1);
+                }
+            }
+        }
+        if l0 > l1 {
+            continue;
+        }
+        let head = SUB_HEADER + title_extra(&g.subgraphs[i].title);
+        let (h0, h1) = match dir {
+            Direction::TD => (head, 0.0),
+            Direction::BT => (0.0, head),
+            Direction::LR | Direction::RL => (0.0, 0.0),
+        };
+        spans[i] = Some((l0 - SUB_PAD - h0, l1 + SUB_PAD + h1));
+    }
+    spans
 }
 
 /// Which ends of back-edge `e` its lane at breadth `x` meets on the side
@@ -6795,6 +7072,7 @@ fn route_backs(g: &Graph, flow: &[Placed]) -> Vec<Back> {
                 clear: LANE_CLEAR + label / 2.0,
                 label_half: label / 2.0,
                 spans: [port_span(sa, a), port_span(sb, b)],
+                ends: (e.from, e.to),
             }
         })
         .collect();
@@ -6803,7 +7081,7 @@ fn route_backs(g: &Graph, flow: &[Placed]) -> Vec<Back> {
         let (a, b) = (&flow[e.from], &flow[e.to]);
         let (s0, s3) = legs(a, b, &Lane::plain(0.0));
         let path = judged_path(x, wants[i].spans, a.l, b.l, s0, s3);
-        crossings(&path, (e.from, e.to), &skeletons)
+        crossings(&path, (e.from, e.to), wants[i].spans, &skeletons)
     });
     for (&ei, lane) in backs.iter().zip(lanes) {
         out[ei] = lane.map_or(Back::Direct, Back::Lane);
@@ -12455,6 +12733,47 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_never_turns_across_an_edge_arriving_beside_its_end() {
+        // state.mmd: `retry` (Rejected -> waiting for input) took the
+        // shorter way between the Validating frame and Rejected, judged
+        // crossing-free because the straight line of `invalid` reached
+        // Rejected's centre past the lane's turn; drawn, it left
+        // Rejected's side across `invalid`. Now it runs straight up out
+        // of Rejected round the outside, as mermaid draws it, crossing
+        // nothing — in the static scene and in route() alike.
+        let g = match crate::parser::parse_document(include_str!("../examples/state.mmd")).unwrap()
+        {
+            crate::model::Document::State(g) => g,
+            other => panic!("not a state diagram: {other:?}"),
+        };
+        let s = scene(&g);
+        let c: Vec<(f64, f64)> = s.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let r = route(&g, &c);
+        for sc in [&s, &r] {
+            let e = the_edge(sc, "Rejected", "Idle");
+            assert!(
+                end_skew(e, true) < 10.0 && end_skew(e, false) < 10.0,
+                "{e:?}"
+            );
+            let (rx, ry, rw, _) = node_box(sc, "Rejected");
+            let first = e.waypoints[0];
+            assert!(
+                (first.1 - ry).abs() < 0.5 && first.0 > rx + rw / 2.0,
+                "leaves Rejected's top, right of its centre: {e:?}"
+            );
+            let lane = edge_polyline(e);
+            for o in sc.edges.iter().filter(|o| !std::ptr::eq(*o, e)) {
+                let p = edge_polyline(o);
+                let crosses = lane.windows(2).any(|w| {
+                    p.windows(2)
+                        .any(|v| crate::lanes::tests_seg_cross(w[0], w[1], v[0], v[1]))
+                });
+                assert!(!crosses, "retry crosses {} -> {}", o.from, o.to);
+            }
+        }
+    }
+
+    #[test]
     fn a_wide_lr_label_takes_its_height_across_the_flow() {
         // wide-labels: the back-edge's breadth room is its label's 20 px
         // height in LR, not its 337 px width (413 -> at most 201 tall).
@@ -12464,6 +12783,78 @@ mod tests {
         assert_eq!(
             crate::lanes::label_breadth(Some("a wide label"), true),
             LABEL_BOX_H
+        );
+    }
+
+    #[test]
+    fn a_labelled_lr_two_cycle_bows_apart_so_each_label_rides_its_own_line() {
+        // wide-labels: Client <-> Gateway left their 38 px sides 14 px
+        // apart, and the return edge's 337 px label, centred on its own
+        // line, covered the request edge near Client. The twins now bow
+        // apart (TWIN_LABEL_BOW): no label sits on another edge, in either
+        // mode, and both still meet their sides near square.
+        let src = include_str!("../tests/fixtures/quality/wide-labels.mmd");
+        let r = crate::quality::measure_source(src, false).unwrap();
+        assert_eq!((r.statik.lbl_edge, r.routed.lbl_edge), (0, 0));
+        for sc in static_and_routed(src) {
+            for (a, b) in [("A", "B"), ("B", "A")] {
+                let e = the_edge(&sc, a, b);
+                assert!(
+                    end_skew(e, true) < 10.0 && end_skew(e, false) < 10.0,
+                    "{e:?}"
+                );
+            }
+        }
+        // Only a labelled LR / RL 2-cycle across one gap bows.
+        let g = parse("flowchart TD\nA -->|go| B\nB -->|back| A").unwrap();
+        assert!(twin_bows(&g, &parallel_offsets(&g), |_| true)
+            .iter()
+            .all(|&b| b == 0.0));
+        let g = parse("flowchart LR\nA --> B\nB --> A").unwrap();
+        assert!(twin_bows(&g, &parallel_offsets(&g), |_| true)
+            .iter()
+            .all(|&b| b == 0.0));
+        let g = parse("flowchart LR\nA -->|go| B\nB --> A").unwrap();
+        let bows = twin_bows(&g, &parallel_offsets(&g), |_| true);
+        assert_eq!(bows, vec![-TWIN_LABEL_BOW, TWIN_LABEL_BOW]);
+    }
+
+    #[test]
+    fn far_apart_back_edges_and_frame_legs_square_up_alike_in_route() {
+        // bench-75: `svc2 -> db` (reversed by the layout, 592 px across a
+        // 60 px gap) swept along the gap as a reversed S and entered db at
+        // 71 deg in route(); past DIRECT_REACH it runs in a lane, square
+        // at both ends. `job1 -> svc1`'s leg out of the jobs frame ran
+        // 6 px past its border; it now runs a stub past it, and route()
+        // puts the lane where the static layout does (it took the other
+        // side, 1 400 px away, on the first drag).
+        let src = include_str!("../tests/fixtures/quality/bench-75.mmd");
+        let [s, r] = static_and_routed(src);
+        for sc in [&s, &r] {
+            let e = the_edge(sc, "svc2", "db");
+            assert!(!e.waypoints.is_empty(), "{e:?}");
+            assert!(
+                end_skew(e, true) < 10.0 && end_skew(e, false) < 10.0,
+                "{e:?}"
+            );
+            let jobs = sc.clusters.iter().find(|c| c.id == "jobs").unwrap();
+            let lane = the_edge(sc, "job1", "svc1");
+            let leg = lane.waypoints[2].0;
+            assert!(
+                jobs.x - leg >= crate::lanes::LANE_STUB - 0.5,
+                "leg at {leg}, frame at {}",
+                jobs.x
+            );
+        }
+        let lane_y = |sc: &Scene| {
+            let w = &the_edge(sc, "job1", "svc1").waypoints;
+            w[w.len() / 2].1
+        };
+        assert!(
+            (lane_y(&s) - lane_y(&r)).abs() < 1.0,
+            "{} vs {}",
+            lane_y(&s),
+            lane_y(&r)
         );
     }
 
@@ -12510,6 +12901,54 @@ mod tests {
         }
         let (_, (lx, _), lw) = e.label.clone().expect("fail label");
         assert!(lx - lw / 2.0 >= ci.x && lx + lw / 2.0 <= ci.x + ci.w);
+    }
+
+    #[test]
+    fn a_lane_stays_in_its_frames_in_route_and_on_a_drag_too() {
+        // A labelled loop inside a nested box: route() drew the lane
+        // and its label outside both frames (it grew them only in the
+        // static layout), so the edge jumped out of its box on the first
+        // drag frame. Every frame holding both ends holds the lane and
+        // its label, in scene(), route() and route_partial() alike.
+        let src = "flowchart TD\n  subgraph Outer[Outer system]\n    subgraph Inner[Inner loop]\n      I1[Fetch] --> I2[Decode]\n      I2 --> I3{More?}\n      I3 -->|more data please| I1\n    end\n    O1[Collect] --> Inner\n    I3 -->|done| O2[Report]\n    O2 -.->|again| O1\n  end\n  X[External] --> O1\n  O2 --> Y[(Archive)]\n  Y -->|replay| X\n";
+        let g = parse(src).unwrap();
+        let s = scene(&g);
+        let c: Vec<(f64, f64)> = s.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let r = route(&g, &c);
+        // Drag the External box a little: Inner and Outer stay put.
+        let mut moved = c.clone();
+        let x = g.node_index("X").unwrap();
+        moved[x].1 += 6.0;
+        let p = route_partial(&g, &moved, &s, &c);
+        for (name, sc) in [("scene", &s), ("route", &r), ("route_partial", &p)] {
+            let e = the_edge(sc, "I3", "I1");
+            assert!(!e.waypoints.is_empty(), "{name}: no lane {e:?}");
+            let (_, (lx, ly), lw) = e.label.clone().expect("loop label");
+            for id in ["Inner", "Outer"] {
+                let f = sc.clusters.iter().find(|c| c.id == id).unwrap();
+                let inside = |(x, y): (f64, f64)| {
+                    x >= f.x - 1e-6
+                        && x <= f.x + f.w + 1e-6
+                        && y >= f.y - 1e-6
+                        && y <= f.y + f.h + 1e-6
+                };
+                for q in edge_polyline(e) {
+                    assert!(inside(q), "{name}: {q:?} outside {id} {f:?}");
+                }
+                assert!(
+                    inside((lx - lw / 2.0, ly)) && inside((lx + lw / 2.0, ly)),
+                    "{name}: label at ({lx}, {ly}) outside {id}"
+                );
+            }
+        }
+        // route() draws the frames the static layout drew.
+        for (a, b) in s.clusters.iter().zip(&r.clusters) {
+            assert_eq!(a.id, b.id);
+            assert!(
+                (a.x - b.x).abs() < 0.5 && (a.w - b.w).abs() < 0.5,
+                "{a:?} vs {b:?}"
+            );
+        }
     }
 
     #[test]
@@ -13211,8 +13650,7 @@ mod tests {
         // another course on a composite diagram's first drag. Both now
         // judge it against the same lines from the same centres.
         let mut elbows = 0;
-        for (dbg_k, src) in composite_note_sources().into_iter().enumerate() {
-            let dbg_before = elbows;
+        for src in composite_note_sources() {
             let g = match crate::parser::parse_document(&src).unwrap() {
                 crate::model::Document::State(g) => g,
                 other => panic!("not a state diagram: {other:?}"),
@@ -13236,7 +13674,6 @@ mod tests {
                 );
                 if elbow_of(a) {
                     elbows += 1;
-                    let _ = dbg_before;
                     for (p, q) in a.bezier.iter().zip(&b.bezier) {
                         assert!(
                             (p.0 - q.0).abs() < 1e-6 && (p.1 - q.1).abs() < 1e-6,
@@ -13249,7 +13686,6 @@ mod tests {
                     }
                 }
             }
-            eprintln!("DBG {dbg_k} {}", elbows - dbg_before);
         }
         // 67 elbows; 56 while a sub-edge's course ran on past its box's
         // frame to the members' centre. 63 since B3: a 2-cycle's return

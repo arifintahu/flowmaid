@@ -4223,12 +4223,19 @@ pub(crate) fn repair(g: &Graph, sc: &mut Scene, cx: &Ctx, mode: Mode, moved: &mu
     let mut order: Vec<usize> = (0..ne).filter(|&i| infos[i].is_some()).collect();
     // Builder channel edges first; a path drawn orthogonally (a reroute
     // of an earlier pass) keeps its place, so a second pass sees the
-    // edges in the order the first did.
+    // edges in the order the first did. Before them, the back-edges in
+    // their lanes (orthogonal by construction, report §2.2): planned
+    // round every node in their band and round each other, they have
+    // the least room to move, so the forward edges are the ones priced
+    // and searched round them (taken after the channels, bench-75's
+    // static drawing crossed 17 more edges).
     let channel = |i: usize| {
         let e = &sc.edges[i];
         !e.waypoints.is_empty() && ortho_corners(e).is_none()
     };
-    order.sort_by_key(|&i| (!channel(i), i));
+    let lane =
+        |i: usize| infos[i].as_ref().is_some_and(|f| f.back) && !sc.edges[i].waypoints.is_empty();
+    order.sort_by_key(|&i| (!lane(i), !channel(i), i));
     let mut bad: Vec<(usize, usize)> = Vec::new(); // (class, edge): 0 hard, 1 soft
                                                    // Per edge: its score against the scene alone.
     let mut alone: Vec<Score> = vec![Score::default(); ne];
