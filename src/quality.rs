@@ -124,8 +124,11 @@ pub enum Agg {
 }
 
 /// Quality numbers for one laid-out scene. Counts are "lower is
-/// better" unless noted.
+/// better" unless noted. Not exhaustive: the yardstick gains columns as
+/// it learns to see more defects; read the fields, or start from
+/// [`Metrics::default`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Metrics {
     /// Nodes / drawn non-loop edges / frames measured.
     pub nodes: usize,
@@ -310,10 +313,11 @@ pub struct Metrics {
     /// crossings a reader sees on it (report §2.13).
     pub x_drawn: usize,
     /// End glyphs whose stroke meets the glyph's base — a head's length
-    /// ([`ARROW_LEN`]) back from the tip, as painted — more than [`END_TILT_TOL`] off square to the side, as
-    /// `end_tilt` judges it: a curve still turning under the head kinks
-    /// at its base however square the head itself (report §2.3, M1: the
-    /// last head length runs straight).
+    /// ([`ARROW_LEN`]) back from the tip, as painted — more than
+    /// [`END_TILT_TOL`] off square to the side, as `end_tilt` judges it: a
+    /// curve still turning under the head kinks at its base however
+    /// square the head itself (report §2.3, M1: the last head length runs
+    /// straight).
     pub end_kink: usize,
     /// One line per node/frame crossing, parallel overlap, close edge
     /// pair, label on a node or arrowhead, wiggle, wrong frame side and

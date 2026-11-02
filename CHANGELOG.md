@@ -150,8 +150,13 @@ Minor, not patch: several class structs gain public fields (see
   (`arrow-u`, `arrow-u__<colour>`) are gone — a coloured end is
   `<base id>_<colour>` (`arrow__ff3`), a stroke wider than 5.5 px gets
   `<base id>-t<width>` (`arrow-t8`, the same head set further ahead), and
-  an unstyled one keeps its base id. The advance painter draws the same
-  head and cut. A crossing gap is no longer cut within a head and a gap's
+  an unstyled one keeps its base id. Arrowheads standing side by side
+  closer than a head and 1.5 px apart (an over-full side's ports, about
+  10 px apart) are drawn narrower, `<base id>-w<width>` (`arrow-w8_5`,
+  never under 6 px nor too narrow to cover the stroke's end), so they
+  keep a gap instead of running together into one saw-tooth band. The
+  advance painter draws the same head and cut, its last stretch along
+  the route's last leg however short that leg. A crossing gap is no longer cut within a head and a gap's
   radius of an edge end, where it could bite the arrowhead.
 - **Stroke and canvas tokens** (report Q10): edges are 2 px (thick 3.5 px,
   from 1.7 / 3.4), node outlines 1.8 px (from 1.6, the cylinder's lid, the
@@ -320,6 +325,12 @@ Minor, not patch: several class structs gain public fields (see
     `class::rel_tail` too. A lollipop interface is a class
     (`Class::lollipop`, `ClassBox::lollipop`) whose box is not drawn, only
     its name; a host that paints every `ClassBox` as a box should skip it.
+  - **`quality::Metrics` gains columns and becomes `#[non_exhaustive]`:**
+    the phase-B yardsticks (`end_tilt` … `x_drawn`) and `end_kink` are new
+    fields, so a struct literal of it no longer compiles outside the crate
+    (it already broke with the first new field). It is what
+    `quality::measure` returns: read its fields, or start from
+    `Metrics::default()` and assign them. New columns no longer break it.
 
 ### Fixed
 

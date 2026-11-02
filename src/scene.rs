@@ -595,6 +595,111 @@ pub(crate) struct PaintedEdge {
     cuts: Cuts,
 }
 
+impl PaintedEdge {
+    /// One end of the stroke as `(tip, heading into it)`: the end point
+    /// and the way its glyph faces (squared ends face their own tangent).
+    fn end(&self, at_start: bool) -> Option<((f64, f64), (f64, f64))> {
+        if at_start {
+            let (from, back) = reverse_segs(self.start, self.segs.get(..1)?);
+            Some((self.start, end_heading(from, *back.first()?)?))
+        } else {
+            let n = self.segs.len();
+            let from = if n >= 2 {
+                self.segs[n - 2].end()
+            } else {
+                self.start
+            };
+            let last = *self.segs.last()?;
+            Some((last.end(), end_heading(from, last)?))
+        }
+    }
+}
+
+/// Least gap (px) the painter keeps between two arrowheads standing
+/// side by side ([`crowded_heads`]).
+const HEAD_GAP: f64 = 1.5;
+/// Narrowest (px across its base) an arrowhead is drawn where heads
+/// crowd ([`crowded_heads`]): still plainly a head.
+const HEAD_MIN_WIDTH: f64 = 6.0;
+
+/// The width (px across its base) each drawn edge's arrowhead is painted
+/// at, as (source, target): [`ARROW_MARKER_PX`], or — where parallel
+/// heads stand side by side closer than a head and [`HEAD_GAP`] (an
+/// over-full side's ports, about 10 px apart) — that pitch less the gap,
+/// to the half px, so neighbouring heads keep apart instead of running
+/// together into one saw-tooth band. Never narrower than
+/// [`HEAD_MIN_WIDTH`], nor than covering the stroke's butt end where the
+/// painter cuts it (a wide `linkStyle` stroke keeps its whole head).
+/// Painter-only, like the head itself; heads sharing a port are left
+/// as they are.
+fn crowded_heads(sc: &Scene, painted: &[Option<PaintedEdge>]) -> Vec<[f64; 2]> {
+    let mut out = vec![[ARROW_MARKER_PX; 2]; sc.edges.len()];
+    // (edge, end: 0 source / 1 target, tip, heading)
+    let mut heads = Vec::new();
+    for (i, (e, p)) in sc.edges.iter().zip(painted).enumerate() {
+        let Some(p) = p.as_ref().filter(|_| e.paint_width.is_none()) else {
+            continue;
+        };
+        for k in 0..2 {
+            let m = if k == 0 {
+                e.ends.start_marker(e.kind)
+            } else {
+                e.ends.end_marker(e.kind)
+            };
+            if m == Some(Marker::Arrow) {
+                if let Some((tip, d)) = p.end(k == 0) {
+                    heads.push((i, k, tip, d));
+                }
+            }
+        }
+    }
+    if heads.len() < 2 {
+        return out;
+    }
+    // Neighbours are found in a grid of cells larger than any pitch
+    // that crowds.
+    const CELL: f64 = 16.0;
+    let cell = |q: (f64, f64)| ((q.0 / CELL).floor() as i64, (q.1 / CELL).floor() as i64);
+    let mut grid: std::collections::BTreeMap<(i64, i64), Vec<usize>> = Default::default();
+    for (h, &(_, _, tip, _)) in heads.iter().enumerate() {
+        grid.entry(cell(tip)).or_default().push(h);
+    }
+    let parallel = 10f64.to_radians().cos();
+    for (h, &(i, k, tip, d)) in heads.iter().enumerate() {
+        let (cx, cy) = cell(tip);
+        let mut pitch = f64::INFINITY;
+        for o in (cx - 1..=cx + 1)
+            .flat_map(|gx| (cy - 1..=cy + 1).map(move |gy| (gx, gy)))
+            .filter_map(|c| grid.get(&c))
+            .flatten()
+        {
+            let (_, _, t, d2) = heads[*o];
+            if *o == h || d.0 * d2.0 + d.1 * d2.1 < parallel {
+                continue;
+            }
+            // Side by side: tips level along the heading, apart across it.
+            let (dx, dy) = (t.0 - tip.0, t.1 - tip.1);
+            let lat = (dx * d.1 - dy * d.0).abs();
+            if (dx * d.0 + dy * d.1).abs() <= 2.0 && lat >= 1.0 {
+                pitch = pitch.min(lat);
+            }
+        }
+        if pitch >= ARROW_MARKER_PX + HEAD_GAP {
+            continue;
+        }
+        let e = &sc.edges[i];
+        let trims = arrow_trims(e);
+        let trim = if k == 0 { trims.0 } else { trims.1 };
+        // `trim` back from the tip, where the stroke stops, a head `w`
+        // wide is `w * trim / ARROW_MARKER_PX` across: it must cover the
+        // stroke's width there.
+        let least = HEAD_MIN_WIDTH.max(edge_stroke_width(e) * ARROW_MARKER_PX / trim.max(1e-9));
+        let w = ((pitch - HEAD_GAP) * 2.0).floor() / 2.0;
+        out[i][k] = w.max(least).min(ARROW_MARKER_PX);
+    }
+    out
+}
+
 /// [`PaintedEdge`] of `e`.
 pub(crate) fn painted_edge(e: &SceneEdge) -> PaintedEdge {
     let (start, segs) = plain_segs(e, |p| p);
@@ -1778,11 +1883,38 @@ pub(crate) fn arrow_marker_def(id: &str, color: &str, trim: f64) -> String {
 /// advance painter draws its routes) cut `trim_end` short of its last
 /// point by arc length — [`ARROW_TRIM`] under an [`arrow_marker_def`]
 /// head, 0 for a bare end; whole when shorter than the cut and a pixel.
+/// The head faces along the last leg: a last leg shorter than the cut
+/// and a [`SQUARE_END_ENTRY`] run would end the stroke on the leg
+/// before it, and `orient="auto"` would tilt the head that way, so the
+/// route is kept up to that far back and runs straight from there to a
+/// point that far up the last leg's line, and on along it (the corner
+/// under the head, as [`square_end`] squares a flowchart end).
 pub(crate) fn polyline_d_painted(pts: &[(f64, f64)], trim_end: f64) -> String {
     if pts.len() < 2 {
         return String::new();
     }
     let segs: Vec<Seg> = pts[1..].iter().map(|&p| Seg::L(p)).collect();
+    let tip = pts[pts.len() - 1];
+    let run = trim_end + SQUARE_END_ENTRY;
+    let leg_from = pts[..pts.len() - 1]
+        .iter()
+        .rev()
+        .find(|q| (tip.0 - q.0).hypot(tip.1 - q.1) > 1e-9);
+    if let Some(&q) = leg_from.filter(|_| trim_end > 0.0) {
+        let leg = (tip.0 - q.0).hypot(tip.1 - q.1);
+        if leg < run {
+            let d = ((tip.0 - q.0) / leg, (tip.1 - q.1) / leg);
+            // (Left whole, a route too short to lose that much is stroked
+            // whole as before.)
+            let (start, mut kept) = trim_segs(pts[0], segs.clone(), 0.0, run);
+            if kept.last().map(|g| g.end()) != Some(tip) {
+                kept.push(Seg::L((tip.0 - d.0 * run, tip.1 - d.1 * run)));
+                kept.push(Seg::L(tip));
+                let (start, kept) = trim_segs(start, kept, 0.0, trim_end);
+                return curve_d(start, &kept, |p| p);
+            }
+        }
+    }
     let (start, segs) = trim_segs(pts[0], segs, 0.0, trim_end);
     curve_d(start, &segs, |p| p)
 }
@@ -4272,6 +4404,9 @@ struct MarkerVariant {
     color: Option<String>,
     /// How far (px) the stroke stops short of an arrow tip.
     trim: f64,
+    /// An arrowhead's width (px) across its base: [`ARROW_MARKER_PX`],
+    /// or less where heads crowd one side ([`crowded_heads`]).
+    width: f64,
 }
 
 /// The marker ids every drawn edge end uses, plus the defs of the
@@ -4287,10 +4422,10 @@ struct EdgeMarkers {
     defs: String,
 }
 
-fn edge_markers(edges: &[SceneEdge]) -> EdgeMarkers {
+fn edge_markers(edges: &[SceneEdge], widths: &[[f64; 2]]) -> EdgeMarkers {
     let mut made: Vec<(MarkerVariant, String)> = Vec::new();
     let mut defs = String::new();
-    let mut id_for = |e: &SceneEdge, start: bool| -> Option<String> {
+    let mut id_for = |i: usize, e: &SceneEdge, start: bool| -> Option<String> {
         if !edge_drawn(e) {
             return None;
         }
@@ -4311,8 +4446,15 @@ fn edge_markers(edges: &[SceneEdge]) -> EdgeMarkers {
             } else {
                 t3
             },
+            width: if m == Marker::Arrow {
+                widths
+                    .get(i)
+                    .map_or(ARROW_MARKER_PX, |w| w[usize::from(!start)])
+            } else {
+                ARROW_MARKER_PX
+            },
         };
-        if v.color.is_none() && v.trim == ARROW_TRIM {
+        if v.color.is_none() && v.trim == ARROW_TRIM && v.width == ARROW_MARKER_PX {
             return Some(marker_base_id(start, m).to_string());
         }
         if let Some((_, id)) = made.iter().find(|(w, _)| *w == v) {
@@ -4322,6 +4464,10 @@ fn edge_markers(edges: &[SceneEdge]) -> EdgeMarkers {
         if v.trim != ARROW_TRIM {
             id.push_str("-t");
             id.push_str(&format!("{}", v.trim).replace('.', "_"));
+        }
+        if v.width != ARROW_MARKER_PX {
+            id.push_str("-w");
+            id.push_str(&format!("{}", v.width).replace('.', "_"));
         }
         if let Some(c) = &v.color {
             id.push('_');
@@ -4337,13 +4483,14 @@ fn edge_markers(edges: &[SceneEdge]) -> EdgeMarkers {
             id = format!("{base}_{n}");
         }
         let color = style_attr(v.color.as_deref(), EDGE_COLOR);
-        defs.push_str(&marker_def(&id, m, start, &color, v.trim));
+        defs.push_str(&marker_def_sized(&id, m, start, &color, v.trim, v.width));
         made.push((v, id.clone()));
         Some(id)
     };
     let ids = edges
         .iter()
-        .map(|e| (id_for(e, true), id_for(e, false)))
+        .enumerate()
+        .map(|(i, e)| (id_for(i, e, true), id_for(i, e, false)))
         .collect();
     EdgeMarkers { ids, defs }
 }
@@ -4355,15 +4502,48 @@ fn edge_markers(edges: &[SceneEdge]) -> EdgeMarkers {
 /// [`painted_path_d`]); a cross or circle sits just outside the
 /// node, the stroke still running to the border beneath it.
 fn marker_def(id: &str, m: Marker, start: bool, color: &str, trim: f64) -> String {
+    marker_def_sized(id, m, start, color, trim, ARROW_MARKER_PX)
+}
+
+/// [`marker_def`] of an arrowhead `width` px across its base (as long
+/// as ever): narrower where heads crowd one side ([`crowded_heads`]).
+fn marker_def_sized(
+    id: &str,
+    m: Marker,
+    start: bool,
+    color: &str,
+    trim: f64,
+    width: f64,
+) -> String {
     let px = ARROW_MARKER_PX;
     match m {
         Marker::Arrow => {
             // View-box units per px, and the tip's own x in the box.
             let units = 10.0 / px;
+            // A narrower head's base corners, inset from the box's edges.
+            let inset = format!("{:.3}", 5.0 - 5.0 * width / px)
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string();
+            let far = format!("{:.3}", 5.0 + 5.0 * width / px)
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string();
+            let narrow = width < px;
             let (refx, d) = if start {
-                (trim * units, ARROW_GLYPH_START)
+                let d = if narrow {
+                    format!("M 10 {inset} L 0 5 L 10 {far} z")
+                } else {
+                    ARROW_GLYPH_START.to_string()
+                };
+                (trim * units, d)
             } else {
-                (10.0 - trim * units, ARROW_GLYPH_END)
+                let d = if narrow {
+                    format!("M 0 {inset} L 10 5 L 0 {far} z")
+                } else {
+                    ARROW_GLYPH_END.to_string()
+                };
+                (10.0 - trim * units, d)
             };
             // To a thousandth of a unit, no trailing zeros (`5`, `2.727`).
             let refx = format!("{refx:.3}")
@@ -4618,14 +4798,14 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
     let dom_id = dom_id.as_deref();
     let mut s = String::new();
     svg_open_root(&mut s, width, height, 14, title, desc, dom_id, opts);
-    let markers = edge_markers(&sc.edges);
-    // Each drawn edge's stroke, worked out once for the casing and the
-    // paths both.
+    // Each drawn edge's stroke, worked out once for the casing, the
+    // heads and the paths.
     let painted: Vec<Option<PaintedEdge>> = sc
         .edges
         .iter()
         .map(|e| edge_drawn(e).then(|| painted_edge(e)))
         .collect();
+    let markers = edge_markers(&sc.edges, &crowded_heads(sc, &painted));
     let line_of = |i: usize| match &painted[i] {
         Some(p) => painted_polyline(&sc.edges[i], p),
         None => edge_polyline(&sc.edges[i]),
@@ -9602,6 +9782,121 @@ mod tests {
             );
             let stray = pts.iter().map(|&q| off(q)).fold(0.0, f64::max);
             assert!(stray <= SQUARE_END_MAX_STRAY + 0.5, "{stray}");
+        }
+    }
+
+    /// B1 review r3 (#5): the advance painter's routes are polylines
+    /// cut by arc length under the head. A last leg shorter than the cut
+    /// ended the stroke on the leg before it, and `orient="auto"` tilted
+    /// the head that way; now the stroke's last stretch lies on the last
+    /// leg's line, ending a cut short of the tip, so the head faces along
+    /// the last leg with its tip on the route's end.
+    #[test]
+    fn an_advance_route_with_a_short_last_leg_keeps_its_head_on_that_leg() {
+        let last_two = |d: &str| -> [(f64, f64); 2] {
+            let v: Vec<f64> = d.split([' ', ',']).filter_map(|t| t.parse().ok()).collect();
+            let n = v.len();
+            [(v[n - 4], v[n - 3]), (v[n - 2], v[n - 1])]
+        };
+        for (pts, trim) in [
+            (vec![(0.0, 0.0), (0.0, 50.0), (3.0, 50.0)], ARROW_TRIM),
+            (vec![(0.0, 0.0), (0.0, 50.0), (6.0, 50.0)], ARROW_TRIM),
+            (vec![(0.0, 0.0), (40.0, 0.0), (40.0, -4.0)], 8.0),
+        ] {
+            let d = polyline_d_painted(&pts, trim);
+            let n = pts.len();
+            let (a, tip) = (pts[n - 2], pts[n - 1]);
+            let l = (tip.0 - a.0).hypot(tip.1 - a.1);
+            let dir = ((tip.0 - a.0) / l, (tip.1 - a.1) / l);
+            let [p, end] = last_two(&d);
+            // Ends a cut short of the tip, on the last leg's line …
+            let want = (tip.0 - dir.0 * trim, tip.1 - dir.1 * trim);
+            assert!(
+                (end.0 - want.0).abs() < 0.06 && (end.1 - want.1).abs() < 0.06,
+                "{d}"
+            );
+            // … and its last stretch heads along that leg.
+            let (hx, hy) = (end.0 - p.0, end.1 - p.1);
+            let cos = (hx * dir.0 + hy * dir.1) / hx.hypot(hy);
+            assert!(cos > 0.9995, "{d}: {cos}");
+        }
+        // A long last leg is simply cut; a bare end is not cut.
+        let pts = [(0.0, 0.0), (0.0, 50.0), (30.0, 50.0)];
+        assert_eq!(
+            polyline_d_painted(&pts, ARROW_TRIM),
+            "M 0.0 0.0 L 0.0 50.0 L 24.5 50.0"
+        );
+        assert_eq!(
+            polyline_d_painted(&pts, 0.0),
+            "M 0.0 0.0 L 0.0 50.0 L 30.0 50.0"
+        );
+    }
+
+    /// B1 review r3 (#4): an over-full side takes its ports about 10 px
+    /// apart, and 11 px heads there ran together into one saw-tooth band
+    /// (x2_fan's Sink: six heads 10.3 px apart). Heads standing side by
+    /// side closer than a head and HEAD_GAP are drawn narrower, so a gap
+    /// stays between them; a head with room keeps its full width, and a
+    /// wide stroke keeps the head that covers its end.
+    #[test]
+    fn crowded_heads_narrow_so_neighbours_keep_apart() {
+        let g = parse(
+            "flowchart TD\nH --> A1 & A2 & A3 & A4 & A5 & A6 & A7 & A8\n\
+             A1 & A2 & A3 & A4 & A5 & A6 & A7 & A8 --> S\nS --> T\n",
+        )
+        .unwrap();
+        let sc = scene(&g);
+        let painted: Vec<Option<PaintedEdge>> = sc
+            .edges
+            .iter()
+            .map(|e| edge_drawn(e).then(|| painted_edge(e)))
+            .collect();
+        let widths = crowded_heads(&sc, &painted);
+        let tips: Vec<((f64, f64), f64)> = sc
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.to == "S")
+            .map(|(i, _)| {
+                (
+                    painted[i].as_ref().unwrap().end(false).unwrap().0,
+                    widths[i][1],
+                )
+            })
+            .collect();
+        let mut narrowed = 0;
+        for (a, wa) in &tips {
+            for (b, wb) in &tips {
+                let pitch = (a.0 - b.0).abs();
+                if (a.1 - b.1).abs() < 0.5 && pitch > 1.0 && pitch < ARROW_MARKER_PX + HEAD_GAP {
+                    // Half of each head, and the gap, fit in the pitch.
+                    assert!(
+                        (wa + wb) / 2.0 + HEAD_GAP <= pitch + 1e-9,
+                        "{pitch}: {wa} {wb}"
+                    );
+                    narrowed += 1;
+                }
+            }
+        }
+        assert!(narrowed >= 4, "{tips:?}");
+        // S -> T has room: a whole head, the base #arrow.
+        let st = sc.edges.iter().position(|e| e.from == "S").unwrap();
+        assert_eq!(widths[st][1], ARROW_MARKER_PX);
+        let svg = to_svg(&sc);
+        assert!(
+            svg.contains("marker-end=\"url(#arrow-w"),
+            "narrow marker used"
+        );
+        assert!(
+            svg.contains("marker-end=\"url(#arrow)\""),
+            "full marker kept"
+        );
+        // Never narrower than a head can be and still cover the stroke
+        // where it stops.
+        for (i, e) in sc.edges.iter().enumerate() {
+            let least =
+                HEAD_MIN_WIDTH.max(edge_stroke_width(e) * ARROW_MARKER_PX / arrow_trims(e).1);
+            assert!(widths[i][1] >= least.min(ARROW_MARKER_PX) - 1e-9);
         }
     }
 
