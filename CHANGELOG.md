@@ -189,7 +189,13 @@ Minor, not patch: several class structs gain public fields (see
   P0 #13): in TD / BT, parallel edges next to a labelled one leave
   half the label's width plus 15 px between their lines (a 16 px gap put
   stress's `parallel` label on the unlabelled edge), and a label both
-  lines touch counts as the one whose line runs nearer its centre.
+  lines touch counts as the one whose line runs nearer its centre — an
+  unlabelled line only: a labelled one carries its own label, so a
+  `<<choice>>`'s middle twin label keeps its spot beside its line
+  instead of moving onto it between both neighbours (state `twins3`).
+  In LR / RL a gap holding a label on an edge of a node a lane leaves
+  or enters by a leg across that gap widens to keep the legs clear
+  (x6-rl-loops: `forward` and `parallel` lay over two lanes' legs).
 
 - **One arrowhead size for every flowchart edge, sharper and square onto
   the node** (report §2.3, Q1 + M1). Every end glyph — the arrowhead at

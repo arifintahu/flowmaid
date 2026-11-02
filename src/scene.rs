@@ -13029,6 +13029,90 @@ mod tests {
         assert!(end_skew(back, false) < 10.0, "{back:?}");
     }
 
+    /// Whether `pts` (a polyline) passes through the label box of `e`.
+    fn crosses_label(e: &SceneEdge, pts: &[(f64, f64)]) -> bool {
+        let Some((_, c, w)) = &e.label else {
+            return false;
+        };
+        let (hw, hh) = (w / 2.0, crate::layout::LABEL_BOX_H / 2.0);
+        pts.windows(2).any(|s| {
+            let n = ((s[1].0 - s[0].0).hypot(s[1].1 - s[0].1) / 2.0)
+                .ceil()
+                .max(1.0) as usize;
+            (0..=n).any(|k| {
+                let t = k as f64 / n as f64;
+                let p = (
+                    s[0].0 + t * (s[1].0 - s[0].0),
+                    s[0].1 + t * (s[1].1 - s[0].1),
+                );
+                (p.0 - c.0).abs() < hw && (p.1 - c.1).abs() < hh
+            })
+        })
+    }
+
+    #[test]
+    fn an_lr_label_beside_a_lanes_legs_gets_its_gap_widened() {
+        // x6-rl-loops: the two `Gamma -> Alpha` lanes enter Alpha's
+        // downstream side by legs across the Beta-Alpha gap, where the
+        // `forward` and `parallel` labels sat centred over them. The
+        // layout keeps the legs' depth clear at both ends of a gap whose
+        // label reaches across the span edge the legs leave from.
+        let src =
+            "flowchart RL\n  A[Alpha] -->|forward| B[Beta]\n  A -->|parallel| B\n  A --> B\n  \
+                   B --> C[Gamma]\n  C --> A\n  B --> B\n  C -.->|long back label here| A\n  \
+                   C --> D[Delta] --> E[Epsilon]\n  E --> C";
+        for sc in static_and_routed(src) {
+            for lbl in sc
+                .edges
+                .iter()
+                .filter(|e| e.label.is_some() && e.from == "A")
+            {
+                for lane in sc.edges.iter().filter(|e| e.from == "C" && e.to == "A") {
+                    assert!(
+                        !crosses_label(lbl, &edge_polyline(lane)),
+                        "{:?} over a lane",
+                        lbl.label
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_choice_twins_middle_label_keeps_beside_its_line() {
+        // State twins3: three labelled transitions from a <<choice>> to
+        // one state. The middle label, beside its own line and clipping
+        // one neighbour's, read as the neighbour's once a tie was judged
+        // by the nearer line to its centre, and moved onto its own line
+        // between both neighbours, covering two strokes. A labelled line
+        // carries its own label and never takes this one over.
+        let src = "stateDiagram-v2\nstate c <<choice>>\n[*] --> P\nP --> c\nc --> B : one\n\
+                   c --> B : two\nc --> B : three";
+        let g = match crate::parser::parse_document(src).unwrap() {
+            crate::model::Document::State(g) => g,
+            _ => panic!("state"),
+        };
+        let s = scene(&g);
+        let c: Vec<(f64, f64)> = s.nodes.iter().map(|n| (n.x, n.y)).collect();
+        for sc in [s.clone(), route(&g, &c)] {
+            let twins: Vec<&SceneEdge> = sc
+                .edges
+                .iter()
+                .filter(|e| e.from == "c" && e.to == "B")
+                .collect();
+            let covered: usize = twins
+                .iter()
+                .map(|l| {
+                    twins
+                        .iter()
+                        .filter(|o| !std::ptr::eq(**o, *l) && crosses_label(l, &edge_polyline(o)))
+                        .count()
+                })
+                .sum();
+            assert!(covered <= 1, "{covered} twin strokes under labels");
+        }
+    }
+
     #[test]
     fn twin_lanes_leave_and_enter_in_their_nesting_order() {
         // x6-rl-loops: two back-edges Gamma -> Alpha in lanes on one side
