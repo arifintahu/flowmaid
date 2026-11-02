@@ -385,6 +385,19 @@ Minor, not patch: several class structs gain public fields (see
   meeting a box against the flow (`Rollback --> Platform` from below) now
   runs straight across the gap into the facing side instead of bending
   towards the box's entry member at its far side.
+- **An edge from a member to its own box leads to the box's entry
+  member.** `Dev --> CI` with `Dev` inside `CI` was ranked as an edge to
+  `Build` (CI's entry member) but drawn as a short arrow up to CI's top
+  border, beside the title and against the flow, leaving an empty band
+  where the ranked edge ran. It is now drawn — and routed, labelled and
+  picked — as that edge, from `Dev` onto `Build`, in `scene`, `route` and
+  drag frames (`route_partial`, which redraws it when the entry member
+  moves) alike; the scene edge keeps its ids (`Dev` → `CI`) and its index.
+  The entry member is the box's first member nothing inside the box leads
+  to, other than the node and anything it already links to; without one
+  (or for a box drawn to its own member) the stub to the frame stays. A
+  box drawn to its own member no longer ranks the member below the box's
+  exit members through a stand-in nobody saw.
 - **Nothing drawn is cut off at the canvas edge.** The canvas (`to_svg`'s
   view box, a laid-out scene's `width` / `height`, the quality yardstick's
   `width` / `height`) was the bounds of the nodes, frames, labels and each

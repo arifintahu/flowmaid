@@ -962,6 +962,28 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
             .map(|&i| End::Node(i))
             .or_else(|| frame_idx.get(id).map(|&i| End::Frame(i)))
     };
+    // A member's edge to its own box is drawn to the box's entry member
+    // (`scene::own_box_targets`), and ends there: (member id, box id,
+    // entry member) of each.
+    let own_box: Vec<(&str, &str, usize)> = g
+        .sub_edges
+        .iter()
+        .zip(scene::own_box_targets(g))
+        .filter_map(|(e, m)| match (e.from, e.to, m) {
+            (crate::model::End::Node(v), crate::model::End::Sub(s), Some(m)) => {
+                Some((g.nodes[v].id.as_str(), g.subgraphs[s].id.as_str(), m))
+            }
+            _ => None,
+        })
+        .collect();
+    let to_of = |e: &SceneEdge| {
+        own_box
+            .iter()
+            .find(|o| o.0 == e.from && o.1 == e.to)
+            .and_then(|o| node_idx.get(g.nodes[o.2].id.as_str()))
+            .map(|&i| End::Node(i))
+            .or_else(|| end_of(&e.to))
+    };
     let frames_of = |e: Option<End>| match e {
         Some(End::Node(n)) => node_frames[n].clone(),
         Some(End::Frame(f)) => frame_chain[f].clone(),
@@ -977,7 +999,7 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
             // The stroke as painted (a cubic's straight glyph stubs
             // included), as the casing cuts its gaps in it.
             let pts = edge_painted_polyline(e);
-            let (from, to) = (end_of(&e.from), end_of(&e.to));
+            let (from, to) = (end_of(&e.from), to_of(e));
             let mut allowed = frames_of(from);
             allowed.extend(frames_of(to));
             Measured {

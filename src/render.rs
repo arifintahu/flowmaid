@@ -316,6 +316,37 @@ mod tests {
         let (p0, p3) = ends("Rollback", "Platform");
         assert!((p3.1 - (pf.y + pf.h)).abs() < 0.5, "{p3:?}");
         assert!((p0.0 - p3.0).abs() < 0.5, "straight: {p0:?} -> {p3:?}");
+
+        // No edge ends on its own frame's border: `Dev --> CI`, Dev
+        // inside CI, leads down onto Build (CI's entry member), in the
+        // static scene and in route() alike — it was an arrow up to CI's
+        // top border beside the title, against the flow.
+        for sc in [&s0, &s1] {
+            let e = sc
+                .edges
+                .iter()
+                .find(|e| e.from == "Dev" && e.to == "CI")
+                .unwrap();
+            let pl = crate::scene::edge_polyline(e);
+            let (p0, p3) = (pl[0], pl[pl.len() - 1]);
+            let node = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+            let (dev, build) = (node("Dev"), node("Build"));
+            assert!(
+                (p0.1 - (dev.y + dev.h / 2.0)).abs() < 1.0,
+                "leaves Dev's bottom"
+            );
+            assert!(
+                (p3.1 - (build.y - build.h / 2.0)).abs() < 1.0,
+                "enters Build's top"
+            );
+            let f = sc.clusters.iter().find(|c| c.id == "CI").unwrap();
+            for q in [p0, p3] {
+                assert!(
+                    (q.1 - f.y).abs() > 1.0 && (q.1 - f.y - f.h).abs() > 1.0,
+                    "an end on CI's frame: {q:?}"
+                );
+            }
+        }
     }
 
     /// End-to-end showcase for stateDiagram-v2 riding the flowchart

@@ -3201,11 +3201,26 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
             end_room: (0.0, 0.0),
         });
     }
+    // A member's edge to its own box is drawn as its stand-in, whole:
+    // an edge to the box's entry member (see `own_box_targets`).
+    let own_drawn: Vec<bool> = g
+        .sub_edges
+        .iter()
+        .zip(&stand_in)
+        .map(|(e, si)| {
+            si.is_some()
+                && matches!((e.from, e.to), (End::Node(v), End::Sub(s))
+                    if node_cluster[v].contains(&s))
+        })
+        .collect();
     // The clusters a stand-in's ends cut back to (its box ends).
     let cut_at = |ei: usize| -> Vec<usize> {
         let Some(i) = stand_in.iter().position(|&x| x == Some(ei)) else {
             return Vec::new();
         };
+        if own_drawn[i] {
+            return Vec::new();
+        }
         let e = &g.sub_edges[i];
         [e.from, e.to]
             .into_iter()
@@ -3383,11 +3398,23 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
             }
         };
         for (i, (e, (from_m, to_m))) in g.sub_edges.iter().zip(&proxies).enumerate() {
+            // A member to its own enclosing box: its stand-in to the
+            // box's entry member, drawn whole (routed, labelled and
+            // ranked like any edge between the two).
+            if let (true, Some(ei)) = (own_drawn[i], stand_in[i]) {
+                sc.edges.push(SceneEdge {
+                    from: end_id(e.from),
+                    to: end_id(e.to),
+                    ..stand_edges[ei - ne].clone()
+                });
+                continue;
+            }
             // A routed stand-in, cut back to the frame(s), when it has a
             // channel; else a curve to the facing frame side; else (no
             // side faces the other end) the old box-to-box curve.
-            // A member drawn to (or from) its own enclosing box: a
-            // short stub to the nearer flow-axis side of the frame, its
+            // A box drawn to its own member (or a member to its own box
+            // with no other entry member to lead): a short stub between
+            // the member and the nearer flow-axis side of the frame, its
             // label just outside — no curve can reach the box from
             // outside without crossing the member itself.
             let own = match (e.from, e.to) {
@@ -3766,8 +3793,67 @@ fn sub_edge_proxies(g: &Graph, node_cluster: &[Vec<usize>], grid: &[RankGroup]) 
     };
     g.sub_edges
         .iter()
-        .map(|e| (ends(e.from, false), ends(e.to, true)))
+        .map(|e| match (e.from, e.to) {
+            // A member joined to its own enclosing box (`Dev --> CI`,
+            // Dev inside CI) is drawn to the box's entry member and ranks
+            // before it ([`own_box_targets`]). Neither the node itself nor
+            // a member it already has an edge to (one entering through a
+            // cycle's closing edge) is an entry it could lead: that line
+            // would lie on the edge drawn already.
+            (End::Node(v), End::Sub(s)) if node_cluster[v].contains(&s) => {
+                let linked = |m: usize| g.edges.iter().any(|e| e.from == v && e.to == m);
+                let to = members(s, true)
+                    .into_iter()
+                    .filter(|&m| m != v && !linked(m));
+                (vec![v], to.collect())
+            }
+            // A box to its own member is a stub from the frame; its exit
+            // members, inside around the member, give it no rank (one
+            // would only pull the member below them, through a stand-in
+            // nobody sees).
+            (End::Sub(s), End::Node(v)) if node_cluster[v].contains(&s) => (Vec::new(), Vec::new()),
+            _ => (ends(e.from, false), ends(e.to, true)),
+        })
         .collect()
+}
+
+/// Index-parallel with `g.sub_edges`: for a sub-edge from a member to
+/// its own enclosing box (`Dev --> CI` with `Dev` inside `CI`), the
+/// member it is drawn to — the box's first entry member other than the
+/// node itself ([`sub_edge_proxies`]), the stand-in `scene_clustered`
+/// lays out and ranks. The edge is drawn and routed as an edge between
+/// the two nodes, in the static scene, in [`route`] and in every edge
+/// stage (`edgepass::ctx`): no line can reach the box from inside it,
+/// and a stub out to the frame's border pointed at nothing (against the
+/// flow, beside the title, report P0 #3). `None` for every other
+/// sub-edge, and for a member with no other entry member to lead (a
+/// stub to the frame stands for it then).
+pub(crate) fn own_box_targets(g: &Graph) -> Vec<Option<usize>> {
+    let mut out = vec![None; g.sub_edges.len()];
+    // Cheap checks first: a drag frame pays for the proxies only when
+    // the graph has such an edge.
+    if !g
+        .sub_edges
+        .iter()
+        .any(|e| matches!((e.from, e.to), (End::Node(_), End::Sub(_))))
+    {
+        return out;
+    }
+    let node_cluster = node_cluster_paths(g);
+    let own = |e: &crate::model::SubEdge| matches!((e.from, e.to), (End::Node(v), End::Sub(s)) if node_cluster[v].contains(&s));
+    if !g.sub_edges.iter().any(own) {
+        return out;
+    }
+    let grid = grid_pairs(g, &node_cluster);
+    let proxies = sub_edge_proxies(g, &node_cluster, &grid);
+    for (i, (e, (_, to))) in g.sub_edges.iter().zip(&proxies).enumerate() {
+        if let (End::Node(v), End::Sub(s)) = (e.from, e.to) {
+            if node_cluster[v].contains(&s) {
+                out[i] = to.first().copied();
+            }
+        }
+    }
+    out
 }
 
 /// The members of box `s` that enter it (`entry`) or leave it once
@@ -4251,14 +4337,23 @@ fn route_built(
         };
         let node_cluster = node_cluster_paths(g);
         let sub_offs = sub_parallel_offsets(g);
-        for (e, &off) in g.sub_edges.iter().zip(&sub_offs) {
+        let targets = own_box_targets(g);
+        for ((e, &off), target) in g.sub_edges.iter().zip(&sub_offs).zip(targets) {
             let (Some((pa, sa)), Some((pb, sb))) = (end_placed(e.from), end_placed(e.to)) else {
                 continue;
             };
-            // A member drawn to (or from) its own enclosing box: the
-            // static layout's stub, its label just outside the frame
-            // (a label on the short inner run would sit on the member).
+            // A member to its own enclosing box: an edge to the box's
+            // entry member, as the static layout draws it.
+            let to_member = match (e.from, target) {
+                (End::Node(v), Some(m)) => Some((v, m)),
+                _ => None,
+            };
+            // A box drawn to its own member (or a member to its own box
+            // with no other entry member): the static layout's stub, its
+            // label just outside the frame (a label on the short inner
+            // run would sit on the member).
             let own = match (e.from, e.to) {
+                _ if to_member.is_some() => None,
                 (End::Node(v), End::Sub(si)) | (End::Sub(si), End::Node(v))
                     if node_cluster[v].contains(&si) =>
                 {
@@ -4270,9 +4365,15 @@ fn route_built(
                 }
                 _ => None,
             };
-            let (pts, own_mid) = match own {
-                Some((pts, mid)) => (pts, Some(mid)),
-                None => (
+            let (pts, own_mid) = match (to_member, own) {
+                (Some((v, m)), _) => {
+                    let (sv, sm) = (g.nodes[v].shape, g.nodes[m].shape);
+                    let dir = Some(g.direction);
+                    let pts = free_edge(&placed[v], &placed[m], sv, sm, false, off, dir, NO_LONE);
+                    (pts, None)
+                }
+                (None, Some((pts, mid))) => (pts, Some(mid)),
+                (None, None) => (
                     free_edge(&pa, &pb, sa, sb, false, off, Some(g.direction), NO_LONE),
                     None,
                 ),
@@ -4471,6 +4572,20 @@ pub fn route_partial(
     }
     let moved_end =
         |id: &str| grew.iter().any(|f| f == id) || g.node_index(id).is_some_and(|v| moved[v]);
+    // A member's edge to its own box ends on the box's entry member
+    // (`own_box_targets`), which may move inside a frame that keeps its
+    // box: (member id, box id) of each such edge whose entry member moved.
+    let own_moved: Vec<(&str, &str)> = g
+        .sub_edges
+        .iter()
+        .zip(own_box_targets(g))
+        .filter_map(|(e, m)| match (e.from, e.to, m) {
+            (End::Node(v), End::Sub(s), Some(m)) if moved[m] => {
+                Some((g.nodes[v].id.as_str(), g.subgraphs[s].id.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
     let near = |e: &SceneEdge| {
         let pts = edge_polyline(e);
         zones.iter().any(|&z| {
@@ -4492,7 +4607,8 @@ pub fn route_partial(
     let mut redrawn = 0;
     for (i, e) in sc.edges.iter_mut().enumerate() {
         let b = &base.edges[i];
-        if moved_end(&b.from) || moved_end(&b.to) || clash[i] {
+        let own = own_moved.contains(&(b.from.as_str(), b.to.as_str()));
+        if moved_end(&b.from) || moved_end(&b.to) || own || clash[i] {
             fixed[i] = false;
             redrawn += 1;
         } else {
@@ -6724,8 +6840,10 @@ type Chord = ((f64, f64), (f64, f64));
 /// first `real` edges the segment between its ends' centres, then for
 /// each sub-edge its drawn course — the segment between its ends cut
 /// off where it meets a box end's frame (aimed at the centre of the
-/// box's members, see [`frame_entry`]), or for a member drawn to its own
-/// box the stub along the flow to the members' nearer flow side (see
+/// box's members, see [`frame_entry`]); for a member's edge to its own
+/// box the segment to the entry member it is drawn to
+/// ([`own_box_targets`]), and for any other edge between a member and its
+/// own box the stub along the flow to the members' nearer flow side (see
 /// [`own_box_stub`]).
 /// Edges past `real` are `scene_clustered`'s stand-ins, never drawn as
 /// such: their sub-edges' courses stand for them, so the static layout
@@ -6769,7 +6887,19 @@ fn edge_chords(g: &Graph, at: &[Placed], real: usize) -> Vec<Chord> {
                 }))
             })
     };
-    for e in &g.sub_edges {
+    // The entry members are those of `g`'s own edges: a stand-in past
+    // `real` would count as an in-edge of the member it stands at.
+    let own_box = |e: &crate::model::SubEdge| matches!((e.from, e.to), (End::Node(v), End::Sub(s)) if node_cluster[v].contains(&s));
+    let targets = if !g.sub_edges.iter().any(own_box) {
+        vec![None; g.sub_edges.len()]
+    } else if real < g.edges.len() {
+        let mut own = g.clone();
+        own.edges.truncate(real);
+        own_box_targets(&own)
+    } else {
+        own_box_targets(g)
+    };
+    for (e, target) in g.sub_edges.iter().zip(targets) {
         let ends = [e.from, e.to];
         if matches!(e.kind, EdgeKind::Invisible)
             || ends
@@ -6779,6 +6909,9 @@ fn edge_chords(g: &Graph, at: &[Placed], real: usize) -> Vec<Chord> {
             continue;
         }
         let chord = match (e.from, e.to) {
+            (End::Node(v), End::Sub(_)) if target.is_some() => {
+                target.map(|m| (centre(v), centre(m)))
+            }
             (End::Node(v), End::Sub(si)) | (End::Sub(si), End::Node(v))
                 if node_cluster[v].contains(&si) =>
             {
@@ -12041,6 +12174,96 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_member_edge_to_its_own_box_leads_to_the_box_entry_member() {
+        // `D --> Sys` from inside Sys (the showcase's `Dev --> CI`) was
+        // ranked as D --> B (B enters Sys) but drawn as a stub up to the
+        // frame's top border beside the title, against the flow, with an
+        // empty rank gap where D --> B ran. It is now drawn as that edge:
+        // from D down onto B, in the static scene, in route() and in a
+        // drag frame alike; no end sits on Sys's frame.
+        for dir in ["TD", "LR", "BT", "RL"] {
+            let src =
+                format!("flowchart {dir}\nD --> S\nsubgraph S [Sys]\n  B --> C\n  C -.-> D\nend");
+            let g = parse(&src).unwrap();
+            assert_eq!(
+                own_box_targets(&g),
+                [g.node_index("B")],
+                "{dir}: D leads to B"
+            );
+            let s = scene(&g);
+            let pos: Vec<(f64, f64)> = s.nodes.iter().map(|n| (n.x, n.y)).collect();
+            let r = route(&g, &pos);
+            let mut moved = pos.clone();
+            let b = g.node_index("B").unwrap();
+            let along = if matches!(dir, "TD" | "BT") {
+                (24.0, 0.0)
+            } else {
+                (0.0, 24.0)
+            };
+            moved[b] = (pos[b].0 + along.0, pos[b].1 + along.1);
+            let p = route_partial(&g, &moved, &r, &pos);
+            for (what, sc) in [("scene", &s), ("route", &r), ("drag", &p)] {
+                let e = sc
+                    .edges
+                    .iter()
+                    .find(|e| e.from == "D" && e.to == "S")
+                    .unwrap();
+                let pl = edge_polyline(e);
+                let (p0, p3) = (pl[0], pl[pl.len() - 1]);
+                let node = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+                let on_border = |n: &SceneNode, q: (f64, f64)| {
+                    let (x0, y0, w, h) = node_rect(n);
+                    let (x1, y1) = (x0 + w, y0 + h);
+                    let inside =
+                        q.0 > x0 - 1.0 && q.0 < x1 + 1.0 && q.1 > y0 - 1.0 && q.1 < y1 + 1.0;
+                    let edge = (q.0 - x0).abs().min((q.0 - x1).abs()) < 1.0
+                        || (q.1 - y0).abs().min((q.1 - y1).abs()) < 1.0;
+                    inside && edge
+                };
+                assert!(
+                    on_border(node("D"), p0),
+                    "{dir} {what}: starts on D: {p0:?}"
+                );
+                assert!(on_border(node("B"), p3), "{dir} {what}: ends on B: {p3:?}");
+                let f = sc.clusters.iter().find(|c| c.id == "S").unwrap();
+                let on_frame = |q: (f64, f64)| {
+                    (q.0 - f.x).abs().min((q.0 - f.x - f.w).abs()) < 1.0
+                        || (q.1 - f.y).abs().min((q.1 - f.y - f.h).abs()) < 1.0
+                };
+                assert!(
+                    !on_frame(p0) && !on_frame(p3),
+                    "{dir} {what}: ends on the frame"
+                );
+                for n in sc.nodes.iter().filter(|n| n.id == "C") {
+                    assert!(!edge_hits(e, node_rect(n)), "{dir} {what}: crosses C");
+                }
+            }
+            // Ranked as drawn: D one layer before B. (A box's first
+            // layer still leaves the header slot after it, report §2.8 /
+            // M8, so that gap is the others' plus at most SUB_HEADER.)
+            let (d, bn, c) = (
+                s.nodes.iter().find(|n| n.id == "D").unwrap(),
+                s.nodes.iter().find(|n| n.id == "B").unwrap(),
+                s.nodes.iter().find(|n| n.id == "C").unwrap(),
+            );
+            let flow = |n: &SceneNode| to_flow(g.direction, (n.x, n.y)).1;
+            let gap = |a: &SceneNode, b: &SceneNode| (flow(b) - flow(a)).abs();
+            assert!(flow(d) < flow(bn), "{dir}: D before B");
+            assert!(
+                gap(d, bn) <= gap(bn, c) + SUB_HEADER + 1.0,
+                "{dir}: D..B {} vs B..C {}",
+                gap(d, bn),
+                gap(bn, c)
+            );
+        }
+        // A box to its own member, or a member whose only entry it
+        // already links to, keeps the stub: no line on top of another.
+        let g = parse("flowchart TD\nsubgraph G\n  A --> B --> C --> A\nend\nC --> G\nG --> A")
+            .unwrap();
+        assert_eq!(own_box_targets(&g), [None, None]);
     }
 
     #[test]

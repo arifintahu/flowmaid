@@ -33,8 +33,8 @@
 use crate::clearance::{CLEAR_GAP, CRAMP_NODE_GAP, EDGE_SPACING};
 use crate::model::{Direction, End, Graph};
 use crate::scene::{
-    basis_sample, edge_drawn, edge_polyline, grow_canvas, sample_cubic, shift_scene, Bbox, Scene,
-    ARROW_MARKER_PX, MARGIN,
+    basis_sample, edge_drawn, edge_polyline, grow_canvas, own_box_targets, sample_cubic,
+    shift_scene, Bbox, Scene, ARROW_MARKER_PX, MARGIN,
 };
 
 type Pt = (f64, f64);
@@ -94,7 +94,9 @@ pub(crate) struct Ctx {
 
 /// Build the shared context. `sc.edges` holds `g.edges` first, then the
 /// resolvable `g.sub_edges` in order; a sub-edge the builder dropped
-/// (its subgraph has no frame) is skipped by matching ids in order.
+/// (its subgraph has no frame) is skipped by matching ids in order. A
+/// member's edge to its own enclosing box ends on the member it is
+/// drawn to ([`own_box_targets`]), not on the frame.
 pub(crate) fn ctx(g: &Graph, sc: &Scene) -> Ctx {
     let ns = g.subgraphs.len();
     // Subgraph <-> cluster, matched by id (first match wins).
@@ -171,13 +173,20 @@ pub(crate) fn ctx(g: &Graph, sc: &Scene) -> Ctx {
             }
         }
     };
+    // A member's edge to its own box is drawn to the box's entry member
+    // (`own_box_targets`): its stages treat it as an edge between the two.
+    let targets = own_box_targets(g);
     let mut next = g.edges.len();
-    for e in &g.sub_edges {
+    for (e, target) in g.sub_edges.iter().zip(targets) {
         let Some(se) = sc.edges.get(next) else { break };
         let (Some((ra, ia)), Some((rb, ib))) = (end_of(e.from), end_of(e.to)) else {
             continue;
         };
         if se.from == ia && se.to == ib {
+            let rb = match target {
+                Some(m) if node_ok(m, &g.nodes[m].id) => EndRef::Node(m),
+                _ => rb,
+            };
             ends[next] = Some((ra, rb));
             next += 1;
         }
