@@ -1338,6 +1338,21 @@ fn square_end(
     head: Option<(f64, f64)>,
     share: f64,
 ) -> Squared {
+    // Commands without length at the end (a `step` curve's last corner
+    // landing on its end point: [`curve_geometry`] then ends in a
+    // zero-length `L`) have no heading: the end runs in along the last
+    // command that has one, so it is squared — and its cut capped to the
+    // straight run it ends in — as if they were not there. Left
+    // unchanged, the path keeps them (its bytes as before).
+    let live = live_len(start, &segs);
+    if live < segs.len() {
+        let (s, g, cut, run) = square_end(start, segs[..live].to_vec(), want, need, head, share);
+        return if cut.is_some() {
+            (s, g, cut, run)
+        } else {
+            (start, segs, None, run)
+        };
+    }
     #[cfg(test)]
     SQUARED.with(|c| c.set(c.get() + 1));
     // (A path with no end, or none with a direction, is left to be cut
@@ -1944,6 +1959,29 @@ fn stray_scan(
         return (worst <= limit).then_some(limit);
     }
     (worst <= limit).then_some(worst)
+}
+
+/// How many of the commands `segs` (from `start`) are left once those
+/// without length at the end are dropped (every control point on the
+/// point it starts from, as a `step` curve's last zero-length `L`).
+fn live_len(start: (f64, f64), segs: &[Seg]) -> usize {
+    let flat = |from: (f64, f64), s: Seg| {
+        let at = |q: (f64, f64)| (q.0 - from.0).hypot(q.1 - from.1) <= 1e-9;
+        match s {
+            Seg::L(p) => at(p),
+            Seg::Q(c, p) => at(c) && at(p),
+            Seg::C(c1, c2, p) => at(c1) && at(c2) && at(p),
+        }
+    };
+    let mut n = segs.len();
+    while n > 0 {
+        let from = if n >= 2 { segs[n - 2].end() } else { start };
+        if !flat(from, segs[n - 1]) {
+            break;
+        }
+        n -= 1;
+    }
+    n
 }
 
 /// The unit heading of `seg` (from `from`) INTO its end, read off the
@@ -11332,6 +11370,123 @@ mod tests {
         }
         assert!(heads > 500, "{heads} heads");
         assert!(turned > 0, "no head turned with its curve");
+    }
+
+    /// B1 review r6: an author step curve (`step`, `stepBefore`,
+    /// `stepAfter`, `linkStyle … interpolate step`) whose last leg is
+    /// axis-aligned ends in a zero-length `L` ([`curve_geometry`]); its end
+    /// went unsquared and its cut uncapped, so a wide stroke's cut (its
+    /// width) wrapped round the step's last corner and the head pointed
+    /// sideways beside the node, its tip up to 42 px off the border — in
+    /// the static scene, route() and every drag frame — and picking
+    /// missed that head's ink. A 2 px step whose last leg fell under the
+    /// usual cut mid-drag had its tip 6 px off. Every head keeps its tip
+    /// on the end point, and picking walks its axis.
+    #[test]
+    fn a_step_curves_head_keeps_its_tip_on_the_end_point() {
+        let inputs = [
+            // The r6 reproduction (min/m1): Alpha's step into Gamma.
+            "flowchart TD\n  a[Alpha] --> b[Beta]\n  b --> c[Gamma]\n  a e1@--> c\n  \
+             e1@{ curve: step }\n  linkStyle 2 stroke-width:{w}px\n",
+            "flowchart TD\n  a[Alpha] --> b[Beta]\n  b --> c[Gamma]\n  a e1@--> c\n  \
+             e1@{ curve: stepBefore }\n  linkStyle 2 stroke-width:{w}px\n",
+            "flowchart LR\n  a[Alpha] --> b[Beta]\n  b --> c[Gamma]\n  a e1@<--> c\n  \
+             e1@{ curve: stepAfter }\n  linkStyle 2 stroke-width:{w}px\n",
+            // `interpolate step` on the link, and as everyone's default
+            // (min/m3, min/m4).
+            "flowchart TD\n  a[Alpha] --> b[Beta]\n  b --> c[Gamma]\n  a --> c\n  \
+             linkStyle 2 stroke-width:{w}px,interpolate step\n",
+            "flowchart BT\n  a[Alpha] --> b[Beta]\n  b --> c[Gamma]\n  a --> c\n  \
+             c <--> d[Delta]\n  a --> d\n  linkStyle default interpolate step\n  \
+             linkStyle 2 stroke-width:{w}px\n",
+        ];
+        let mut heads = 0;
+        for src in inputs {
+            for w in [2, 16, 20, 30] {
+                let g = parse(&src.replace("{w}", &w.to_string())).unwrap();
+                let st = scene(&g);
+                let c: Vec<(f64, f64)> = st.nodes.iter().map(|n| (n.x, n.y)).collect();
+                let mut frames = vec![
+                    ("static".to_string(), st.clone()),
+                    ("routed".to_string(), route(&g, &c)),
+                ];
+                // The r6 drags: each node moved by a few offsets (Alpha by
+                // (-90, 60) and Beta by (40, 25) turned the head sideways).
+                for k in 0..c.len() {
+                    for (dx, dy) in [(-90.0, 60.0), (40.0, 25.0), (25.0, -40.0)] {
+                        let mut pos = c.clone();
+                        pos[k] = (c[k].0 + dx, c[k].1 + dy);
+                        frames.push((format!("drag {k} {dx},{dy}"), route(&g, &pos)));
+                        frames.push((
+                            format!("partial {k} {dx},{dy}"),
+                            route_partial(&g, &pos, &st, &c),
+                        ));
+                    }
+                }
+                for (what, sc) in &frames {
+                    let mut bb = Bbox::new();
+                    grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+                    let (minx, _, miny, _) = bb.finish();
+                    let back = |p: (f64, f64)| (p.0 - MARGIN + minx, p.1 - MARGIN + miny);
+                    for (i, at_start, tip, end, _, want) in painted_heads(sc) {
+                        let e = &sc.edges[i];
+                        let err = (tip.0 - want.0).hypot(tip.1 - want.1);
+                        assert!(
+                            err <= 0.5,
+                            "{w}px {what} e{i} {}->{} {}: tip {tip:?} vs end {want:?} \
+                             ({err:.2} px off)\n{src}",
+                            e.from,
+                            e.to,
+                            if at_start { "start" } else { "end" }
+                        );
+                        heads += 1;
+                        // Pick == render along the head's axis, cut to tip.
+                        let len = (tip.0 - end.0).hypot(tip.1 - end.1);
+                        let n = (len / 2.0).ceil().max(1.0) as usize;
+                        for s in 0..=n {
+                            let f = s as f64 / n as f64;
+                            let q =
+                                back((end.0 + (tip.0 - end.0) * f, end.1 + (tip.1 - end.1) * f));
+                            let dist = edge_distance(e, q, 2.0);
+                            assert!(dist <= 0.5, "{w}px {what} e{i}: {dist} at {q:?}\n{src}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(heads > 1000, "{heads} heads");
+
+        // The r6 normal-width case (genstep_w0/s02's e8 mid-drag): a 2 px
+        // step whose last, vertical leg (4.5 px) is shorter than its cut.
+        let g = parse("flowchart TD\n  a --> b\n  linkStyle 0 interpolate step\n").unwrap();
+        let mut sc = scene(&g);
+        sc.edges[0].waypoints = vec![
+            (164.8, 106.6375),
+            (93.15, 106.6375),
+            (80.4, 106.6375),
+            (80.4, 102.1375),
+        ];
+        let hs = painted_heads(&sc);
+        assert_eq!(hs.len(), 1);
+        let (_, _, tip, _, _, want) = hs[0];
+        let err = (tip.0 - want.0).hypot(tip.1 - want.1);
+        assert!(err <= 0.5, "tip {tip:?} vs end {want:?} ({err:.2} px off)");
+
+        // A trailing command without length changes nothing about how the
+        // end is squared or how deep it may be cut.
+        let segs = vec![
+            Seg::L((40.0, 0.0)),
+            Seg::L((40.0, 6.0)),
+            Seg::L((60.0, 6.0)),
+        ];
+        let mut tailed = segs.clone();
+        tailed.push(Seg::L((60.0, 6.0)));
+        assert_eq!(live_len((0.0, 0.0), &tailed), 3);
+        let head = Some((10.0, arrow_head_len(20.0)));
+        let a = square_end((0.0, 0.0), segs, 35.0, 20.0, head, 1.0);
+        let b = square_end((0.0, 0.0), tailed, 35.0, 20.0, head, 1.0);
+        assert_eq!((a.2, a.3), (b.2, b.3));
+        assert!(b.3.is_finite());
     }
 
     /// B1 review: on a curve too short to lose its cut (a drag frame's

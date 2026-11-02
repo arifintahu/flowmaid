@@ -140,7 +140,12 @@ Minor, not patch: several class structs gain public fields (see
   mid-drag), beside it instead of on it, with ink picking did not reach.
   A curve too short or too curled even for that (nodes all but touching
   mid-drag) is cut no deeper than the straight run it ends in, so its tip
-  still lands on the end. On a curve too short
+  still lands on the end. The same holds for mermaid's `step`,
+  `stepBefore` and `stepAfter` curves (`e1@{ curve: step }`, `linkStyle …
+  interpolate step`), whose last leg ends at a corner: a head faces along
+  that leg, or turns with the step where the leg is shorter than the head
+  needs, with its tip on the border in `scene()`, `route()` and every drag
+  frame, and picking reaches its ink. On a curve too short
   to lose its cut (nodes a few px apart mid-drag, stroked whole) a head
   is cut nowhere, its tip on the curve's end, and shrinks onto its share
   of the curve (left out under 1 px), instead of reaching its usual cut
