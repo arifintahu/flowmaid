@@ -32,7 +32,7 @@ pub(crate) use crate::labels::{
 #[cfg(test)]
 pub(crate) use crate::labels::{covered, ObstacleGrid, Rect};
 
-/// Gutter (px) round the drawing — everything [`grow_scene`] covers,
+/// Gutter (px) round the drawing — everything [`grow_canvas`] covers,
 /// every stroke and end glyph included — in a laid-out scene's own
 /// coordinates and canvas (`Scene::width` / `height`), and the padding
 /// [`to_svg`] gives the SVG, so a host drawing the scene sees the SVG's
@@ -3042,10 +3042,12 @@ fn scene_from_layout(
         abs_edges.push((pts, wps, label));
     }
 
-    // Canvas from the bounding box of nodes + curves + labels. A
-    // bezier curve always stays inside the convex hull of its
-    // control points, so the control-point bbox guarantees nothing
-    // gets clipped.
+    // Canvas from the bounding box of nodes + curves + labels: each
+    // curve to its exact extremes, not its control points — a back-edge
+    // bow's handles reach far past its apex (report Q2). The edge stages
+    // refit the canvas to everything painted at the end (strokes, end
+    // glyphs, rerouted paths; `edgepass::refit`).
+    let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
     let mut bb = Bbox::new();
     for p in &lo.nodes {
         bb.add(p.b - p.bsize / 2.0, p.l - p.lsize / 2.0);
@@ -3060,17 +3062,26 @@ fn scene_from_layout(
         // Routed edges are drawn through their waypoints, not the
         // fallback curve — bound the canvas by whichever is drawn.
         if wps.is_empty() {
-            for &(bp, lp) in pts {
-                bb.add(bp, lp);
-            }
+            let (b0, b1, l0, l1) = cubic_bounds(pts);
+            bb.add(b0, l0);
+            bb.add(b1, l1);
         } else {
             for &(bp, lp) in wps {
                 bb.add(bp, lp);
             }
         }
+        // A label's width runs along screen x: across the flow in TB /
+        // BT, along it in LR / RL (it used to be laid across the flow in
+        // every direction, so a wide LR label made `scene()` far taller
+        // than its drawing, every node shifted down by the excess).
         if let Some((m, w)) = label {
-            bb.add(m.0 - w / 2.0, m.1 - 10.0);
-            bb.add(m.0 + w / 2.0, m.1 + 10.0);
+            let (hb, hl) = if horizontal {
+                (LABEL_BOX_H / 2.0, w / 2.0)
+            } else {
+                (w / 2.0, LABEL_BOX_H / 2.0)
+            };
+            bb.add(m.0 - hb, m.1 - hl);
+            bb.add(m.0 + hb, m.1 + hl);
         }
     }
     // Use finish() (guarded against the empty bbox) — the raw
@@ -3095,7 +3106,6 @@ fn scene_from_layout(
             Direction::RL => (total_l - l, b),
         }
     };
-    let horizontal = matches!(dir, Direction::LR | Direction::RL);
     let (width, height) = if horizontal {
         (total_l, total_b)
     } else {
@@ -4405,8 +4415,14 @@ fn route_built(
     if place_labels {
         avoid_label_overlaps(&nodes, &clusters, &mut edges, LABEL_ROUTE_WORK);
     }
+    // The boxes and labels only: the edge stages' refit grows the canvas
+    // over every edge as painted (`edgepass::refit`), never over a
+    // curve's control points (report Q2), as in the static scene.
     let mut bb = Bbox::new();
-    grow_scene(&mut bb, &nodes, &edges, &clusters);
+    grow_boxes(&mut bb, &nodes, &clusters);
+    for e in edges.iter().filter(|e| edge_drawn(e)) {
+        grow_label(&mut bb, e);
+    }
     let (_, maxx, _, maxy) = bb.finish();
     Scene {
         nodes,
@@ -5800,14 +5816,7 @@ pub(crate) fn grow_scene(
     edges: &[SceneEdge],
     clusters: &[SceneCluster],
 ) {
-    for c in clusters {
-        bb.add(c.x, c.y);
-        bb.add(c.x + c.w, c.y + c.h);
-    }
-    for n in nodes {
-        bb.add(n.x - n.w / 2.0, n.y - n.h / 2.0);
-        bb.add(n.x + n.w / 2.0, n.y + n.h / 2.0);
-    }
+    grow_boxes(bb, nodes, clusters);
     for e in edges {
         // Invisible links shape the layout but are never drawn, so
         // their curve must not inflate the canvas (bughunter: they
@@ -5825,27 +5834,49 @@ pub(crate) fn grow_scene(
                 bb.add(x, y);
             }
         }
-        if let Some((_, m, w)) = &e.label {
-            bb.add(m.0 - w / 2.0, m.1 - 10.0);
-            bb.add(m.0 + w / 2.0, m.1 + 10.0);
-        }
+        grow_label(bb, e);
     }
 }
 
-/// Grow `bb` over everything painted: [`grow_scene`]'s bounds, and the
-/// ink of every drawn edge ([`grow_drawn_edge`]) — a route the router
-/// took round the outermost node, every stroke's width, every end glyph.
-/// The canvas — [`to_svg`]'s, a laid-out scene's own (`edgepass::refit`),
-/// the quality yardstick's — is this and [`MARGIN`] round it, so nothing
-/// drawn is clipped.
+/// Grow `bb` over every frame and node box.
+fn grow_boxes(bb: &mut Bbox, nodes: &[SceneNode], clusters: &[SceneCluster]) {
+    for c in clusters {
+        bb.add(c.x, c.y);
+        bb.add(c.x + c.w, c.y + c.h);
+    }
+    for n in nodes {
+        bb.add(n.x - n.w / 2.0, n.y - n.h / 2.0);
+        bb.add(n.x + n.w / 2.0, n.y + n.h / 2.0);
+    }
+}
+
+/// Grow `bb` over edge `e`'s label chip, if it has one.
+fn grow_label(bb: &mut Bbox, e: &SceneEdge) {
+    if let Some((_, m, w)) = &e.label {
+        bb.add(m.0 - w / 2.0, m.1 - LABEL_BOX_H / 2.0);
+        bb.add(m.0 + w / 2.0, m.1 + LABEL_BOX_H / 2.0);
+    }
+}
+
+/// Grow `bb` over everything painted: the frames, nodes and edge labels
+/// [`grow_scene`] covers, and the ink of every drawn edge
+/// ([`grow_drawn_edge`]) — a route the router took round the outermost
+/// node, every stroke's width, every end glyph. Never an edge's bezier
+/// control points: a bowed back-edge's handles reach far past the curve
+/// they shape, and bounding by them left a wide empty strip on one side
+/// of the drawing (report Q2: demo 65 px right of the bow against 27 on
+/// the left). The canvas — [`to_svg`]'s, a laid-out scene's own
+/// (`edgepass::refit`), the quality yardstick's — is this and [`MARGIN`]
+/// round it, so nothing drawn is clipped and the margins match.
 pub(crate) fn grow_canvas(
     bb: &mut Bbox,
     nodes: &[SceneNode],
     edges: &[SceneEdge],
     clusters: &[SceneCluster],
 ) {
-    grow_scene(bb, nodes, edges, clusters);
+    grow_boxes(bb, nodes, clusters);
     for e in edges.iter().filter(|e| edge_drawn(e)) {
+        grow_label(bb, e);
         grow_drawn_edge(bb, e);
     }
 }
@@ -7534,11 +7565,13 @@ mod tests {
     }
 
     /// Every edge whose ink `svg` paints off its own canvas (`0 0 width
-    /// height`), as "<title> by <px>": each edge path's every coordinate
-    /// (on the curve and its control points, half the stroke width out)
-    /// and each end marker's whole box — its `viewBox` placed by
-    /// `refX` / `refY` and `markerWidth`, turned along the path's end
-    /// as `orient="auto"` turns it. Read off the SVG's own numbers.
+    /// height`), as "<title> by <px>": each edge path's curve to its
+    /// exact extremes (every `M` / `L` point, each `C` segment's
+    /// [`cubic_bounds`] — its control points are no ink, report Q2), half
+    /// the stroke width out, and each end marker's whole box — its
+    /// `viewBox` placed by `refX` / `refY` and `markerWidth`, turned along
+    /// the path's end as `orient="auto"` turns it. Read off the SVG's own
+    /// numbers.
     fn ink_off_canvas(svg: &str) -> Vec<String> {
         let attr = |el: &str, name: &str| -> Option<String> {
             let rest = el.split(&format!(" {name}=\"")).nth(1)?;
@@ -7574,6 +7607,32 @@ mod tests {
             let half = attr(p, "stroke-width").map_or(1.0, |v| v.parse().unwrap()) / 2.0;
             let c = nums(&d);
             let pts: Vec<(f64, f64)> = c.chunks(2).map(|q| (q[0], q[1])).collect();
+            // The painted curve's extremes: `M` / `L` points as they are,
+            // a `C` segment by its exact bounds.
+            let mut ink: Vec<(f64, f64)> = Vec::new();
+            let mut at = (0.0, 0.0);
+            let (mut op, mut args) = ('M', Vec::new());
+            for tok in d.split([' ', ',']).filter(|t| !t.is_empty()) {
+                match tok.parse::<f64>() {
+                    Ok(v) => args.push(v),
+                    Err(_) => {
+                        op = tok.chars().next().unwrap();
+                        args.clear();
+                    }
+                }
+                let arity = if op == 'C' { 6 } else { 2 };
+                if args.len() == arity {
+                    let q: Vec<(f64, f64)> = args.chunks(2).map(|q| (q[0], q[1])).collect();
+                    if op == 'C' {
+                        let (x0, x1, y0, y1) = cubic_bounds(&[at, q[0], q[1], q[2]]);
+                        ink.extend([(x0, y0), (x1, y1)]);
+                    } else {
+                        ink.push(q[0]);
+                    }
+                    at = q[q.len() - 1];
+                    args.clear();
+                }
+            }
             let mut worst = f64::NEG_INFINITY;
             let mut off = |q: (f64, f64), pad: f64| {
                 worst = worst
@@ -7582,7 +7641,7 @@ mod tests {
                     .max(q.0 + pad - w)
                     .max(q.1 + pad - h);
             };
-            for &q in &pts {
+            for &q in &ink {
                 off(q, half);
             }
             for (key, at_start) in [("marker-start", true), ("marker-end", false)] {
@@ -11352,7 +11411,7 @@ mod tests {
     /// every flowchart and state fixture, the long-detour probes and
     /// seeded random graphs, in the static scene, `route` fed its
     /// centres, and drag frames (`route` and `route_partial` with a node
-    /// moved), every coordinate of every painted edge path (half its
+    /// moved), every painted edge path to its exact extremes (half its
     /// stroke out) and every end marker's box lies inside the SVG's
     /// view box; and the scene's own canvas (`width` × `height` from
     /// the origin) holds the drawing with its gutter, a static one
@@ -11420,6 +11479,110 @@ mod tests {
         }
         assert!(checked >= 150, "{checked} scenes");
         assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// Report Q2 + P1: a static flowchart's canvas is its drawing — the
+    /// curves to their exact extremes, never their control points — and
+    /// [`MARGIN`] on every side, in the scene (`width` × `height`, node
+    /// centres) exactly as in the SVG. A back-edge bow's handles used to
+    /// pad one side (demo 65 px right of the bow against 27 px left), and
+    /// an LR label's width was laid across the flow, so `scene()` of
+    /// wide-labels was 624 px tall for a 413 px SVG, every node 119 px
+    /// lower than drawn. `route`'s canvas reaches [`MARGIN`] past its
+    /// drawing alike.
+    #[test]
+    fn a_static_canvas_is_its_drawing_with_even_margins() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let fixture = |name: &str| {
+            std::fs::read_to_string(format!("{root}/tests/fixtures/quality/{name}.mmd")).unwrap()
+        };
+        let example =
+            |name: &str| std::fs::read_to_string(format!("{root}/examples/{name}.mmd")).unwrap();
+        let mut srcs: Vec<(String, String)> = ["back-edge", "wide-labels", "dense-td", "bench-75"]
+            .iter()
+            .map(|n| (n.to_string(), fixture(n)))
+            .chain(
+                ["demo", "stress", "lr", "state", "advanced"]
+                    .iter()
+                    .map(|n| (n.to_string(), example(n))),
+            )
+            .collect();
+        for (k, src) in CANVAS_PROBES.iter().enumerate() {
+            srcs.push((format!("probe {k}"), src.to_string()));
+        }
+        for dir in ["LR", "RL", "TD", "BT"] {
+            srcs.push((
+                format!("bow {dir}"),
+                format!("flowchart {dir}\nA --> B --> C --> D\nD -->|a rather long label on the way back| A"),
+            ));
+        }
+        let mut sizes = HashMap::new();
+        for (name, src) in &srcs {
+            use crate::model::Document;
+            let g = match crate::parser::parse_document(src) {
+                Ok(Document::Flowchart(g) | Document::State(g)) => g,
+                other => panic!("{name}: {:?}", other.err()),
+            };
+            let sc = scene(&g);
+            let mut bb = Bbox::new();
+            grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+            let (minx, maxx, miny, maxy) = bb.finish();
+            for (what, got) in [
+                ("left", minx),
+                ("top", miny),
+                ("right", sc.width - maxx),
+                ("bottom", sc.height - maxy),
+            ] {
+                assert!((got - MARGIN).abs() < 1e-6, "{name}: {what} margin {got}");
+            }
+            // The SVG draws the scene where it stands, on its canvas.
+            let svg = to_svg(&sc);
+            let vb = format!("viewBox=\"0 0 {:.0} {:.0}\"", sc.width, sc.height);
+            assert!(svg.contains(&vb), "{name}: {vb} not in the SVG");
+            sizes.insert(name.clone(), (sc.width, sc.height));
+            // `route` keeps the host's centres; its canvas reaches
+            // MARGIN past the drawing too, not past control points.
+            let centres: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+            let r = route(&g, &centres);
+            let mut bb = Bbox::new();
+            grow_canvas(&mut bb, &r.nodes, &r.edges, &r.clusters);
+            let (_, maxx, _, maxy) = bb.finish();
+            assert!(
+                (r.width - maxx - MARGIN).abs() < 1e-6,
+                "{name}: routed width {}",
+                r.width
+            );
+            assert!(
+                (r.height - maxy - MARGIN).abs() < 1e-6,
+                "{name}: routed height {}",
+                r.height
+            );
+        }
+        // The report's yardsticks (their bows narrow with B3).
+        assert!(
+            sizes["back-edge"].0 < 316.0,
+            "back-edge {:?}",
+            sizes["back-edge"]
+        );
+        assert!(sizes["stress"].0 < 222.0, "stress {:?}", sizes["stress"]);
+        assert!(sizes["demo"].0 < 347.0, "demo {:?}", sizes["demo"]);
+        assert!(
+            sizes["wide-labels"].1 < 350.0,
+            "wide-labels {:?}",
+            sizes["wide-labels"]
+        );
+        // The layout's own canvas lays an LR label along the flow: a
+        // straight labelled edge is no taller than its nodes and a chip
+        // beside them (the label's 300 px width made it 350 px tall).
+        let g = parse("flowchart LR\nA -->|a very very long label for one short edge| B").unwrap();
+        let sizes = g.nodes.iter().map(intrinsic_size).collect::<Vec<_>>();
+        let sc = scene_flat(&g, &sizes);
+        let tallest = sc.nodes.iter().map(|n| n.h).fold(0.0, f64::max);
+        assert!(
+            sc.height <= tallest + LABEL_BOX_H + 2.0 * MARGIN,
+            "LR layout canvas {} tall for {tallest} px of drawing",
+            sc.height
+        );
     }
 
     /// Each arrowhead `to_svg` paints for `sc`, read off the SVG's own

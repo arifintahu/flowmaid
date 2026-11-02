@@ -669,18 +669,19 @@ const STUB_ON_LINE: f64 = 0.01;
 /// Grow the canvas over everything painted ([`grow_canvas`]): a route
 /// round the outermost node, every stroke's width, every end glyph.
 ///
-/// A `Static` scene whose drawing reaches into the [`MARGIN`] gutter
-/// (or below zero) is shifted so its minimum becomes [`MARGIN`] — only
-/// a translation after every stage, so no route moves — and a static
-/// flowchart's canvas then reaches exactly [`MARGIN`] past the drawing:
-/// a host drawing the scene on its `width` × `height` sees the canvas
-/// `to_svg` writes, coordinate for coordinate (a layout that left room
-/// unused before the drawing still keeps it, report Q2). A `Routed`
-/// scene is never shifted: its node positions are the host's, exactly
-/// as given (the export handles a negative origin, see `fit_top_left`).
-/// Otherwise the canvas only grows. `static_fit` is false for an ER or
-/// class scene, whose painter draws `width` × `height` as-is, padded
-/// its own way: it is shifted only out of negative space.
+/// A static flowchart (`Static`, `static_fit`) is fitted to its drawing
+/// exactly: shifted so the drawing starts [`MARGIN`] in on both axes —
+/// only a translation after every stage, so no route moves — and its
+/// canvas reaches exactly [`MARGIN`] past the drawing's far side. So the
+/// margins match on all four sides (room the layout left before the
+/// drawing, or past a curve's control points, is dropped: report Q2),
+/// and a host drawing the scene on its `width` × `height` sees the
+/// canvas `to_svg` writes, coordinate for coordinate. A `Routed` scene
+/// is never shifted: its node positions are the host's, exactly as given
+/// (the export handles a negative origin, see `fit_top_left`); its canvas
+/// only grows. `static_fit` is false for an ER or class scene, whose
+/// painter draws `width` × `height` as-is, padded its own way: it is
+/// shifted only out of negative space and its canvas only grows.
 pub(crate) fn refit(sc: &mut Scene, mode: Mode, static_fit: bool) {
     let mut bb = Bbox::new();
     grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
@@ -688,6 +689,26 @@ pub(crate) fn refit(sc: &mut Scene, mode: Mode, static_fit: bool) {
         return;
     }
     let (minx, mut maxx, miny, mut maxy) = bb.finish();
+    if mode == Mode::Static && static_fit {
+        // Float noise from an earlier fit is no shift: the stages are
+        // idempotent, and so is the fit (`finish` run twice).
+        let (dx, dy) = (MARGIN - minx, MARGIN - miny);
+        let (dx, dy) = (
+            if dx.abs() > FIT_EPS { dx } else { 0.0 },
+            if dy.abs() > FIT_EPS { dy } else { 0.0 },
+        );
+        if dx != 0.0 || dy != 0.0 {
+            shift_scene(sc, dx, dy);
+        }
+        let (w, h) = (maxx - minx + 2.0 * MARGIN, maxy - miny + 2.0 * MARGIN);
+        if (sc.width - w).abs() > FIT_EPS {
+            sc.width = w;
+        }
+        if (sc.height - h).abs() > FIT_EPS {
+            sc.height = h;
+        }
+        return;
+    }
     let floor = if static_fit { MARGIN } else { 0.0 };
     if mode == Mode::Static && (minx < floor || miny < floor) {
         let dx = if minx < floor { MARGIN - minx } else { 0.0 };
@@ -701,6 +722,10 @@ pub(crate) fn refit(sc: &mut Scene, mode: Mode, static_fit: bool) {
     sc.width = sc.width.max(maxx + MARGIN);
     sc.height = sc.height.max(maxy + MARGIN);
 }
+
+/// How far (px) [`refit`] lets a static flowchart's drawing sit off its
+/// exact fit before it moves it: float noise, far below a pixel.
+const FIT_EPS: f64 = 1e-6;
 
 #[cfg(test)]
 mod tests {

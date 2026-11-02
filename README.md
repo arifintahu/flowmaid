@@ -436,7 +436,7 @@ Consumers built on this API (separate repos; the engine itself stays dependency-
 
 ## Limitations & ideas
 
-Already handled: the canvas is computed from the bounding box of all curve control points so self-loops and back-edges are never clipped; parallel edges (same node pair) separate automatically; long edges that align with a column of nodes bow sideways as a mitigation.
+Already handled: the canvas is the drawing itself — every curve to its exact extremes (not its control points, which reach far past a back-edge's bow), every stroke's width and end glyph, every label — plus a 28 px margin on each side, so self-loops and back-edges are never clipped and the margins match; a static `Scene`'s `width` × `height` and node centres are exactly the SVG's canvas and coordinates; parallel edges (same node pair) separate automatically; long edges that align with a column of nodes bow sideways as a mitigation.
 
 Still open: text width is estimated (~character-class table) since there are no real font metrics, so very long labels or CJK can be off; the long-edge mitigation is only a heuristic — the real solution is *virtual nodes* per crossed layer; edge labels can collide with nodes on dense diagrams; escaped quotes (`\"`) inside labels aren't supported; graphs with subgraphs route all edges with the position-aware free router (no layered back-edge arcs inside clusters). The full mermaid.js parity roadmap lives in [issue #10](https://github.com/go-routine-id/flowmaid/issues/10).
 

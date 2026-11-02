@@ -398,6 +398,28 @@ Minor, not patch: several class structs gain public fields (see
   (or for a box drawn to its own member) the stub to the frame stays. A
   box drawn to its own member no longer ranks the member below the box's
   exit members through a stand-in nobody saw.
+- **The canvas fits the drawing, with even margins.** The canvas was
+  bounded by each edge's bezier control points, which reach far past the
+  curve of a back-edge's bow: the demo had 65 px of empty canvas right of
+  its loop against 27 px on the left (now 28 px on both sides, 383 ->
+  346 px wide), back-edge's canvas was 351 px wide (now 315), stress's
+  251 (now 221), and state, lr, wide-labels, bench-75 and advanced were
+  padded the same way. The canvas (`to_svg`'s
+  view box, a scene's `width` / `height`, the quality yardstick's) is now
+  the drawing itself — each curve to its exact extremes, every stroke's
+  width and end glyph, every label — and the same 28 px margin on every
+  side: a static scene is shifted and sized to fit it exactly (room the
+  layout left before the drawing is dropped too: dense-td's scene had
+  315 px of it on the left), and `route` / `route_sized` / drag frames
+  size their canvas the same way (their node positions stay the host's).
+- **`scene()` of an LR / RL flowchart with wide edge labels has the
+  SVG's geometry.** The layout laid an edge label's width across the flow
+  in every direction, so in LR it inflated the scene's height: wide-labels
+  reported a 624 px tall scene for a 413 px SVG (now 345 px, both), every
+  node 119 px lower than drawn, so a host painting the `Scene` saw a
+  different picture than the SVG. A label's width now runs along the flow
+  in LR / RL, and a static scene's node centres are exactly where the SVG
+  draws them.
 - **Nothing drawn is cut off at the canvas edge.** The canvas (`to_svg`'s
   view box, a laid-out scene's `width` / `height`, the quality yardstick's
   `width` / `height`) was the bounds of the nodes, frames, labels and each
