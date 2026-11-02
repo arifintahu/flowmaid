@@ -77,7 +77,9 @@ use crate::clearance::{
     EDGE_SPACING, FRAME_INSET, FRAME_SEP, MIN_OVERLAP_RUN, NODE_CLEARANCE, NODE_SEP, PARALLEL_COS,
     PORT_ZONE, SAMPLE_STEP, TIGHT_RUN_MIN, WIGGLE_TOL,
 };
-use crate::scene::{edge_polyline, grow_scene, title_head, Bbox, Scene, ARROW_MARKER_PX, MARGIN};
+use crate::scene::{
+    edge_polyline, grow_scene, title_head, Bbox, Scene, ARROW_MARKER_PX, MARGIN, SVG_MARGIN,
+};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -671,7 +673,7 @@ impl World {
         // Title chips with the header corner they sit in, as `to_svg`
         // draws them (same math as the harness).
         let chips = (0..sc.clusters.len())
-            .map(|ci| title_head(&sc.clusters, ci, maxx + MARGIN))
+            .map(|ci| title_head(&sc.clusters, ci, maxx + SVG_MARGIN))
             .collect();
         let labels = sc
             .edges

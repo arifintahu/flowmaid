@@ -112,6 +112,44 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Changed
 
+- **One arrowhead size for every flowchart edge, sharper and square onto
+  the node** (report §2.3, Q1 + M1). Every end glyph — the arrowhead at
+  either end, the cross and the circle — is now 11 px in user space
+  (`markerUnits="userSpaceOnUse"`), so a thick `==>` edge no longer draws
+  a head twice the size (about 22 px) and a `linkStyle stroke-width` edge
+  shares the head too. The head is the wider `M 0 0 L 10 5 L 0 10 z`
+  triangle. The SVG painter stops the stroke half a head short under an
+  arrowhead (`refX` puts the tip back exactly on the node border), so the
+  butt end of a 2 or 3.5 px stroke no longer pokes out beside the tip and
+  the tip no longer overshoots into the node. A single-curve edge that
+  still turns at its glyph end is drawn with a straight, head-long stub
+  along the end's handle (the side's normal), so the head and the stroke
+  entering it point square into the side; a long edge's spline gets a
+  straight stub too (its last channel leg used to slant into the node,
+  head and all). The stub of a single curve and the cut under the head are
+  the SVG painter's: `SceneEdge::bezier` is unchanged and still ends on the
+  border (hosts draw their own heads along its end tangent, which already
+  points square in), and `Scene::edge_at` / `hits_in_rect` follow the
+  painted stroke. A long edge's stub is in `SceneEdge::waypoints`, so hosts
+  draw it too. Marker ids: a `linkStyle` width no longer needs a variant,
+  so the `-u` ids (`arrow-u`, `arrow-u__<colour>`) are gone — a coloured
+  end is `<base id>_<colour>` (`arrow__ff3`), an uncoloured one keeps its
+  base id. The advance painter draws the same head and cut.
+- **Stroke and canvas tokens** (report Q10): edges are 2 px (thick 3.5 px,
+  from 1.7 / 3.4), node outlines 1.8 px (from 1.6, the cylinder's lid, the
+  subroutine's bars and a final state's ring included), and the SVG pads
+  the drawing with 16 px instead of 28. Only the SVG's padding changed:
+  the scene keeps its 28 px gutter (`Scene` coordinates, `width`,
+  `height`) and every route is the same — moving the laid-out coordinates
+  would have flipped the router's float-exact tie-breaks. ER and class
+  SVGs keep their margins.
+- **Quality yardstick** (`quality::Metrics`): `end_tilt` judges each end
+  glyph's heading as painted (along the stroke cut short under it) and
+  reads frame ends either way across the border; new `end_kink` (appended
+  after `x_drawn`) counts glyph ends whose stroke meets the head's base
+  more than 10° off square. The yardstick measures the painted strokes
+  (straight glyph stubs included), as the crossing casing cuts its gaps in
+  them; `quality::ARROW_LEN` follows the head size (11 px).
 - **Class hierarchies read top-down, like mermaid and UML.** Relations are
   laid out in source order (left operand first), so in `Animal <|-- Dog`
   the parent sits above the child. Before, parents, interfaces and wholes
@@ -267,6 +305,11 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Fixed
 
+- **A twin's label in a `<<choice>>` fan finds a spot beside its line**
+  when its row is crossed by its twin's steeper line: it may now step
+  beside its line anywhere along the line's far half, so it is stacked
+  `FAN_SIBLING_GAP` clear of its siblings instead of being left to the
+  general placer.
 - **Class names with hyphens or backticks parse, as in mermaid.** A
   hyphenated name used in a relation or a `note for` (`Animal-Name --> Dog`,
   `A-B --> C-D`, `A- --> B`) was a parse error, though `class Animal-Name`

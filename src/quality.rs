@@ -18,8 +18,8 @@ use crate::layout::{text_width, title_extra, LABEL_BOX_H, TITLE_SCALE};
 use crate::model::{Direction, EdgeCurve, Graph, Shape};
 use crate::parser::parse_document;
 use crate::scene::{
-    self, edge_drawn, edge_end_tangent, edge_polyline, edge_stroke_width, node_outline, Scene,
-    SceneEdge, SceneNode, MARGIN,
+    self, edge_drawn, edge_end_tangent, edge_painted_polyline, edge_stroke_width, node_outline,
+    Scene, SceneEdge, SceneNode, SVG_MARGIN,
 };
 use crate::Document;
 use std::collections::HashMap;
@@ -52,9 +52,9 @@ pub const ORTHO_MIN_POINTS: usize = 4;
 /// Two boxes overlap when they share more than this much depth (px)
 /// on both axes — touching borders do not count.
 pub const OVERLAP_EPS: f64 = 0.5;
-/// Arrowhead length measured back from the tip (px): the default
-/// marker is 7 stroke widths of 1.7 px, its tip at 85% of that.
-pub const ARROW_LEN: f64 = 11.0;
+/// Arrowhead length measured back from the tip (px): the painter's one
+/// head size, on every edge whatever its stroke width.
+pub const ARROW_LEN: f64 = crate::scene::ARROW_MARKER_PX;
 /// A run along one frame border counts once it is longer than this
 /// (px); shorter ones are an edge crossing or leaving the border.
 pub const BORDER_RUN_MIN: f64 = 40.0;
@@ -247,10 +247,12 @@ pub struct Metrics {
     pub aspect: f64,
     /// Canvas area per node (px², G12).
     pub area_per_node: f64,
-    /// End glyphs (arrowheads, crosses, circles) whose drawn heading
-    /// is more than [`END_TILT_TOL`] off square to the side they land
-    /// on: the box side (top / bottom / left / right) the tip is on,
-    /// or the radius on a round node or state (report §2.3).
+    /// End glyphs (arrowheads, crosses, circles) whose drawn heading is
+    /// more than [`END_TILT_TOL`] off square to the side they land on —
+    /// the box side (top / bottom / left / right) the tip is on, the
+    /// radius on a round node or state, either way across a frame's
+    /// border (report §2.3). The heading as painted: an arrowhead faces
+    /// along the stroke the painter cuts short under it.
     pub end_tilt: usize,
     /// Largest such angle (degrees, 0 = square onto the side).
     pub end_tilt_max: f64,
@@ -307,6 +309,12 @@ pub struct Metrics {
     /// exactly level or plumb edge (an aligned spine), and with it the
     /// crossings a reader sees on it (report §2.13).
     pub x_drawn: usize,
+    /// End glyphs whose stroke meets the glyph's base — a head's length
+    /// ([`ARROW_LEN`]) back from the tip, as painted — more than [`END_TILT_TOL`] off square to the side, as
+    /// `end_tilt` judges it: a curve still turning under the head kinks
+    /// at its base however square the head itself (report §2.3, M1: the
+    /// last head length runs straight).
+    pub end_kink: usize,
     /// One line per node/frame crossing, parallel overlap, close edge
     /// pair, label on a node or arrowhead, wiggle, wrong frame side and
     /// shared port, naming the elements (`from->to kind other`), for
@@ -402,6 +410,7 @@ impl Metrics {
             ("idiom_spline", self.idiom_spline as f64, Sum),
             ("idiom_bow", self.idiom_bow as f64, Sum),
             ("x_drawn", self.x_drawn as f64, Sum),
+            ("end_kink", self.end_kink as f64, Sum),
         ]
     }
 
@@ -614,6 +623,31 @@ fn poly_area(poly: &[Pt]) -> f64 {
         })
         .sum();
     twice.abs() / 2.0
+}
+
+/// The heading (unit vector, into the end) of the drawn polyline `pts`
+/// where it meets an end glyph's base: on the piece holding the point a
+/// head's length ([`ARROW_LEN`]) of arc back from the
+/// end at the source (`at_start`) or the target, ties going to the piece
+/// nearer the end (a stub exactly a head long is its own heading).
+/// `None` for a line shorter than a head.
+fn head_base_heading(pts: &[Pt], at_start: bool) -> Option<Pt> {
+    let mut left = ARROW_LEN;
+    let n = pts.len();
+    for k in 0..n.saturating_sub(1) {
+        // The k-th piece from the end, as (farther, nearer) point.
+        let (far, near) = if at_start {
+            (pts[k + 1], pts[k])
+        } else {
+            (pts[n - 2 - k], pts[n - 1 - k])
+        };
+        let d = dist(far, near);
+        if d >= left - 1e-6 && d > 0.0 {
+            return Some(((near.0 - far.0) / d, (near.1 - far.1) / d));
+        }
+        left -= d;
+    }
+    None
 }
 
 /// Inward unit normal of the side of the box centred at `c` with half
@@ -930,7 +964,9 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
         .enumerate()
         .filter(|(_, e)| edge_drawn(e) && e.from != e.to)
         .map(|(idx, e)| {
-            let pts = edge_polyline(e);
+            // The stroke as painted (a cubic's straight glyph stubs
+            // included), as the casing cuts its gaps in it.
+            let pts = edge_painted_polyline(e);
             let (from, to) = (end_of(&e.from), end_of(&e.to));
             let mut allowed = frames_of(from);
             allowed.extend(frames_of(to));
@@ -967,7 +1003,7 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
     let chips: Vec<Rect> = (0..sc.clusters.len())
         .map(|ci| {
             let c = &sc.clusters[ci];
-            let title = scene::fit_cluster_title(&sc.clusters, ci, maxx + MARGIN);
+            let title = scene::fit_cluster_title(&sc.clusters, ci, maxx + SVG_MARGIN);
             let (x, y) = (c.x + CHIP_INSET_X, c.y + CHIP_INSET_Y);
             Rect(
                 x,
@@ -981,7 +1017,7 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
     // [`CHIP_SEP`] off (G6).
     let heads: Vec<Rect> = (0..sc.clusters.len())
         .map(|ci| {
-            let h = scene::title_head(&sc.clusters, ci, maxx + MARGIN);
+            let h = scene::title_head(&sc.clusters, ci, maxx + SVG_MARGIN);
             Rect(h.0, h.1, h.2, h.3)
         })
         .collect();
@@ -1584,15 +1620,33 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
             if glyph.is_none() || head == (0.0, 0.0) || normal == (0.0, 0.0) {
                 continue;
             }
-            let tilt = (head.0 * normal.0 + head.1 * normal.1)
-                .clamp(-1.0, 1.0)
-                .acos()
-                .to_degrees();
+            // Off square, in degrees; a frame is reached from inside as
+            // well as from out, so either way across its border is square.
+            let off = |h: Pt| {
+                let c = h.0 * normal.0 + h.1 * normal.1;
+                let c = if matches!(end, End::Frame(_)) {
+                    c.abs()
+                } else {
+                    c
+                };
+                c.clamp(-1.0, 1.0).acos().to_degrees()
+            };
+            let tilt = off(head);
             m.end_tilt_max = m.end_tilt_max.max(tilt);
             if tilt > END_TILT_TOL {
                 m.end_tilt += 1;
                 m.details.push(format!(
                     "{}->{} end_tilt {which} on {} {tilt:.1}deg",
+                    me.e.from,
+                    me.e.to,
+                    owner_id(end)
+                ));
+            }
+            let base = head_base_heading(&me.pts, at_start);
+            if let Some(kink) = base.map(off).filter(|&k| k > END_TILT_TOL) {
+                m.end_kink += 1;
+                m.details.push(format!(
+                    "{}->{} end_kink {which} on {} {kink:.1}deg",
                     me.e.from,
                     me.e.to,
                     owner_id(end)
@@ -1689,8 +1743,8 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
             m.center_off = ((c - (span_lo + span_hi) / 2.0).abs() / half).min(1.0);
         }
     }
-    m.width = (maxx - minx) + 2.0 * MARGIN;
-    m.height = (maxy - miny) + 2.0 * MARGIN;
+    m.width = (maxx - minx) + 2.0 * SVG_MARGIN;
+    m.height = (maxy - miny) + 2.0 * SVG_MARGIN;
     m.aspect = m.width.max(m.height) / m.width.min(m.height).max(1.0);
     m.area_per_node = m.width * m.height / m.nodes.max(1) as f64;
     // Ink: shapes as painted, label boxes, strokes (length × width).
@@ -1700,7 +1754,7 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
         .map(|(_, r)| (r.2 - r.0) * (r.3 - r.1))
         .sum::<f64>();
     for e in sc.edges.iter().filter(|e| edge_drawn(e)) {
-        let pts = edge_polyline(e);
+        let pts = edge_painted_polyline(e);
         let len: f64 = pts.windows(2).map(|w| dist(w[0], w[1])).sum();
         ink += len * edge_stroke_width(e);
     }
@@ -1797,6 +1851,24 @@ mod tests {
         let m = measure(&g, &sc);
         assert_eq!(m.end_tilt, 1, "{m:?}");
         assert!((m.end_tilt_max - 45.0).abs() < 1e-6, "{}", m.end_tilt_max);
+        assert_eq!(m.end_kink, 1, "{m:?}");
+        // A line still turning under the head kinks at its base however
+        // square the head: an S whose last 6 px drop straight onto the
+        // side meets the head's base (a head's length up) at 45°.
+        let tip = top(&sc.nodes[1]);
+        let mid = ((p0.1 + tip.1) / 2.0, tip.1 - 6.0);
+        draw_linear(
+            &mut sc.edges[0],
+            &[
+                p0,
+                (p0.0, mid.0),
+                (tip.0 - 20.0, mid.1 - 20.0),
+                (tip.0, mid.1),
+                tip,
+            ],
+        );
+        let m = measure(&g, &sc);
+        assert_eq!((m.end_tilt, m.end_kink), (0, 1), "{m:?}");
         // The heading is the drawn one: a polyline whose last leg drops
         // straight onto the side is square, however it got there.
         let mid = (p3.0 - 40.0, (p0.1 + p3.1) / 2.0);

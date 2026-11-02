@@ -14,7 +14,8 @@
 
 use crate::labels::seg_cells;
 use crate::scene::{
-    edge_drawn, edge_polyline, edge_stroke_width as stroke_width, DefsKey, Scene, ARROW_MARKER_PX,
+    edge_drawn, edge_painted_polyline, edge_stroke_width as stroke_width, DefsKey, Scene,
+    ARROW_MARKER_PX,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -166,7 +167,11 @@ fn crossings_with(sc: &Scene, skip_ends: bool) -> Vec<(usize, usize, Pt, Cut)> {
     if idx.len() < 2 {
         return Vec::new();
     }
-    let lines: Vec<Vec<Pt>> = idx.iter().map(|&i| edge_polyline(&sc.edges[i])).collect();
+    // The strokes as painted (a cubic's straight glyph stubs included).
+    let lines: Vec<Vec<Pt>> = idx
+        .iter()
+        .map(|&i| edge_painted_polyline(&sc.edges[i]))
+        .collect();
 
     // Segment grid: cell -> (line, segment). A segment too long to
     // bucket (a node dragged far away) is checked against every other
@@ -950,7 +955,7 @@ pub(crate) fn masks(sc: &Scene, t: &dyn Fn(Pt) -> Pt, dom_id: Option<&str>) -> M
     }
     let mut defs = String::new();
     for (u, holes) in per {
-        let pts = edge_polyline(&sc.edges[u]);
+        let pts = edge_painted_polyline(&sc.edges[u]);
         let (mut x0, mut y0, mut x1, mut y1) = (
             f64::INFINITY,
             f64::INFINITY,
@@ -1064,7 +1069,7 @@ mod tests {
         for x in 0..idx.len() {
             for y in x + 1..idx.len() {
                 let (ea, eb) = (&sc.edges[idx[x]], &sc.edges[idx[y]]);
-                let (a, b) = (edge_polyline(ea), edge_polyline(eb));
+                let (a, b) = (edge_painted_polyline(ea), edge_painted_polyline(eb));
                 let mut hits: Vec<Pt> = Vec::new();
                 for sa in a.windows(2) {
                     for sb in b.windows(2) {

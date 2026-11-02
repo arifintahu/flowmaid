@@ -32,7 +32,10 @@ const CEILINGS: &[(&str, Ceil, Ceil)] = &[
     // Routed edge_node 2 / 3 -> 0 once an edge the searches leave
     // through nodes gets the rescue detour (frames crossed, nodes not).
     ("dense-lr", (0, 11, 13), (0, 13, 20)),
-    ("dense-td", (0, 28, 42), (0, 28, 47)),
+    // dense-td static 42 -> 43 when the painter's straight glyph stubs
+    // (report M1) made one more pair of ends converging on a node read
+    // as parallel lines on top of each other (overlap_pairs 14 -> 15).
+    ("dense-td", (0, 28, 43), (0, 28, 47)),
     ("fanout-frames", (0, 0, 0), (0, 0, 0)),
     ("wide-labels", (0, 0, 0), (0, 0, 0)), // (0,0,6) (0,0,8)
 ];
@@ -45,9 +48,13 @@ const GAP_FLOORS: &[(&str, f64, f64)] = &[
     ("back-edge", 40.0, 40.0),
     // Static 3.4 before the channel nudge spread parallel legs apart.
     ("bench-75", 5.9, 2.1),
-    // The generated dense fixtures, as first measured.
-    ("dense-lr", 9.6, 5.5),
-    ("dense-td", 12.1, 3.2),
+    // The generated dense fixtures, as first measured; static 9.6 ->
+    // 9.2 and 12.1 -> 11.3 once the yardstick measures the strokes as
+    // painted, a cubic still turning at its glyph end drawn with a
+    // straight stub into it (report M1): such an end runs square into
+    // the side instead of curving away from its neighbour.
+    ("dense-lr", 9.2, 5.5),
+    ("dense-td", 11.3, 3.2),
     ("fanout-frames", 40.0, 40.0),
     ("wide-labels", 40.0, 40.0),
 ];
@@ -319,11 +326,19 @@ fn crossing_gaps_do_not_read_as_dashes() {
 /// the chip spacing off title chips (a reroute that used
 /// to slip past a chip now takes a lane beside another leg); routed hug
 /// 4 440 -> 3 700 with the rescue and detour lanes kept off borders.
+/// Report M1 (straight runs into end glyphs, measured as painted: a
+/// cubic still turning at its glyph end ends in a head-long stub, a
+/// long edge's spline in a straight stub along the side's normal): ends
+/// converging on one side now run parallel into it instead of fanning
+/// in, so more of them count as on top of or beside each other past
+/// the port zone — overlap 2 764 -> 3 232 | 7 514 -> 8 414, longest
+/// run 1 286 -> 1 366 routed, tight 9 342 -> 10 084 | 20 974 -> 21 998,
+/// hug 3 106 -> 3 117 static (routes themselves unchanged).
 const CHANNEL_MAX: [(&str, f64, f64); 4] = [
-    ("overlap_len", 2_920.0, 7_620.0),
-    ("overlap_max", 400.0, 1_290.0),
-    ("tight_len", 9_350.0, 21_900.0),
-    ("hug_len", 3_110.0, 3_700.0),
+    ("overlap_len", 3_240.0, 8_420.0),
+    ("overlap_max", 400.0, 1_370.0),
+    ("tight_len", 10_090.0, 22_000.0),
+    ("hug_len", 3_120.0, 3_700.0),
 ];
 
 /// Most edges (over all fixtures, per mode) that pass a title chip
@@ -331,8 +346,9 @@ const CHANNEL_MAX: [(&str, f64, f64); 4] = [
 /// (`route()` only prices a touch, as the wider rule costs a drag
 /// reroutes that lie on other edges, G1): 2 in `bench-75`, legs into
 /// the frame the chip names passing it within the spacing, never
-/// through it.
-const EDGE_CHIP_MAX: (usize, usize) = (0, 2);
+/// through it; 3 with `dense-td` n16->n43's straight glyph stub (report
+/// M1) running square into its node past g10's chip.
+const EDGE_CHIP_MAX: (usize, usize) = (0, 3);
 
 /// Edges keep their channel (G1/G4) and keep off frames' title chips
 /// (G6), in either mode.
@@ -384,21 +400,36 @@ fn channels_keep_edges_apart_and_off_chips() {
 /// count the edges not yet drawn orthogonally (§2.1: S-cubics, dummy
 /// chain splines, back-edge bows), `x_drawn` the crossings a reader
 /// sees, level and plumb edges included.
-const DEFECT_BASELINE: [(&str, f64, f64); 14] = [
-    ("end_tilt", 24.0, 19.0),
-    ("end_tilt_max", 86.5, 128.4),
+///
+/// B1 (report Q1 + M1): end_tilt 24 -> 8 static (heads face along the
+/// stroke cut short under them; S-cubics and long edges' splines end in
+/// straight stubs square to the side), max 86.5 -> 86.3 | 128.4 ->
+/// 127.6; the routed 19 left are back-edge bows (B3) and ends the ports
+/// stage turned round a corner. `end_kink` lands at 19 | 39: the
+/// stroke entering a head's base still turning, chiefly router paths
+/// whose final leg is only one clearance long, and the bows. Measured as
+/// painted, the stubs end converging edges in parallel runs: band_pairs
+/// 117 -> 119 and band_len 46 446 -> 47 754 routed, x_drawn 521 -> 523
+/// routed (two crossings by a stub near an end). idiom_spline 19 -> 27
+/// static: a long edge whose channel legs were level but whose last leg
+/// slanted into its node counted as orthogonal though it never was; the
+/// slant now sits before its stub, where the count sees it.
+const DEFECT_BASELINE: [(&str, f64, f64); 15] = [
+    ("end_tilt", 8.0, 19.0),
+    ("end_tilt_max", 86.3, 127.6),
     ("end_gaps", 11.0, 11.0),
     ("end_gap_max", 4.7, 4.7),
     ("lat_wiggles", 16.0, 19.0),
     ("lat_backtrack", 1_902.0, 674.0),
     ("own_frame_x", 1.0, 0.0),
     ("own_frame_len", 32.0, 0.0),
-    ("band_pairs", 93.0, 117.0),
-    ("band_len", 41_640.0, 46_446.0),
+    ("band_pairs", 93.0, 119.0),
+    ("band_len", 41_640.0, 47_754.0),
     ("idiom_scubic", 60.0, 83.0),
-    ("idiom_spline", 19.0, 21.0),
+    ("idiom_spline", 27.0, 21.0),
     ("idiom_bow", 7.0, 8.0),
-    ("x_drawn", 521.0, 521.0),
+    ("x_drawn", 521.0, 523.0),
+    ("end_kink", 19.0, 39.0),
 ];
 
 /// Least mean `ink` over the fixtures (static, routed): the painted

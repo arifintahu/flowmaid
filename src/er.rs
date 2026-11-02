@@ -206,6 +206,8 @@ fn assemble(d: &ErDiagram, tables: Vec<ErTable>, mut scene: Scene, g: &Graph) ->
 fn build(d: &ErDiagram) -> (Graph, Vec<ErTable>, Vec<(f64, f64)>) {
     let mut g = Graph::default();
     g.direction = d.direction;
+    // The ER painter strokes the edges and draws their ends itself.
+    g.edge_paint_width = Some(LINE_W);
     for e in &d.entities {
         g.ensure_node(&e.name, Some(e.title().to_string()), Some(Shape::Rect));
     }

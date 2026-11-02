@@ -31,7 +31,7 @@
 //! [`route`]: crate::scene::route
 
 use crate::model::{Direction, End, Graph};
-use crate::scene::{edge_drawn, grow_scene, shift_scene, Bbox, Scene, MARGIN};
+use crate::scene::{edge_drawn, grow_scene, shift_scene, Bbox, Scene, ARROW_MARKER_PX, MARGIN};
 
 /// Which builder produced the scene. `Routed` scenes keep their node
 /// positions exactly as the host gave them (no normalisation), so the
@@ -306,6 +306,7 @@ pub(crate) fn finish_fixed(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool]
     // keeps) the final ends; in the static scene it ends by putting each
     // side's ends in the order their paths now head (G9).
     crate::router::nudge(g, sc, &cx, mode, &mut moved);
+    glyph_stubs(sc, &cx, &mut moved);
     let budget = match mode {
         Mode::Static => crate::labels::LABEL_STATIC_WORK,
         Mode::Routed => crate::labels::LABEL_ROUTE_WORK,
@@ -313,6 +314,99 @@ pub(crate) fn finish_fixed(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool]
     crate::labels::relabel(g, sc, &cx, &moved, budget);
     refit(sc, mode);
 }
+
+/// How far (px) out of its end the straight stub [`glyph_stubs`] gives a
+/// waypoint edge's glyph end reaches: its two waypoints sit this far and
+/// half as far out, so the `curveBasis` spline through them runs
+/// straight for 1.25 heads ((2.5 + 4 × 1.25) / 6 × [`ARROW_MARKER_PX`])
+/// into the end — the head and the stroke entering its base square to
+/// the side.
+pub(crate) const WAYPOINT_STUB: f64 = 2.5 * ARROW_MARKER_PX;
+
+/// Give every glyph end of a waypoint edge the flowchart painter draws
+/// (not an ER or class scene's, see `paint_width`) a straight run into
+/// it along its side's normal, a head long at least (report §2.3): the
+/// spline the painter draws through the waypoints otherwise still turns
+/// under the head — a long edge's last leg runs straight from its last
+/// channel point, slanting into the side, and a port the ports stage
+/// slid along the side leaves its old stub askew. Where the run is
+/// short, the waypoints within [`WAYPOINT_STUB`] of the end along the
+/// normal give way to a stub's two points, when the path beyond reaches
+/// past it by a head (room to turn; a router path's own stub, cut short
+/// by a corner, is left as it is). Runs after the ports and the nudge
+/// settle the ends, before the labels; idempotent (a stubbed end is
+/// straight enough).
+fn glyph_stubs(sc: &mut Scene, cx: &Ctx, moved: &mut [bool]) {
+    for i in 0..sc.edges.len() {
+        let e = &sc.edges[i];
+        let (Some((from, to)), true) = (cx.ends[i], cx.drawn[i]) else {
+            continue;
+        };
+        if e.waypoints.len() < 2 || e.paint_width.is_some() || e.meta.curve.is_some() {
+            continue;
+        }
+        let glyphs = (
+            e.ends.start_marker(e.kind).is_some(),
+            e.ends.end_marker(e.kind).is_some(),
+        );
+        let mut wps = e.waypoints.clone();
+        let mut changed = false;
+        for (glyph, end, at_start) in [(glyphs.0, from, true), (glyphs.1, to, false)] {
+            if !glyph {
+                continue;
+            }
+            if at_start {
+                wps.reverse();
+            }
+            let n = wps.len();
+            let p = wps[n - 1];
+            let out = normal(side_of(end_rect(sc, end), p));
+            // How far out along the normal, and how far off its line.
+            let along = |q: (f64, f64)| (q.0 - p.0) * out.0 + (q.1 - p.1) * out.1;
+            let off = |q: (f64, f64)| ((q.0 - p.0) * out.1 - (q.1 - p.1) * out.0).abs();
+            // The run of waypoints on the normal's ray, end first.
+            let mut run = 1;
+            while run < n && off(wps[n - 1 - run]) < STUB_ON_LINE && along(wps[n - 1 - run]) > 0.0 {
+                run += 1;
+            }
+            // The straight stretch the spline draws into the end.
+            let straight = match run {
+                1 => 0.0,
+                2 => along(wps[n - 2]) / 6.0,
+                _ => {
+                    let k = n - run;
+                    (along(wps[k]) + 4.0 * along(wps[k + 1]) + along(wps[k + 2])) / 6.0
+                }
+            };
+            if straight < ARROW_MARKER_PX - STUB_ON_LINE {
+                // The points within the stub give way to it, and what
+                // lies beyond must leave a head's length to turn in.
+                let keep = wps[..n - 1]
+                    .iter()
+                    .rposition(|&q| along(q) > WAYPOINT_STUB || off(q) >= STUB_ON_LINE);
+                let room = keep.is_some_and(|k| along(wps[k]) >= WAYPOINT_STUB + ARROW_MARKER_PX);
+                if let (Some(k), true) = (keep, room) {
+                    let at = |d: f64| (p.0 + out.0 * d, p.1 + out.1 * d);
+                    wps.truncate(k + 1);
+                    wps.extend([at(WAYPOINT_STUB), at(WAYPOINT_STUB / 2.0), p]);
+                    changed = true;
+                }
+            }
+            if at_start {
+                wps.reverse();
+            }
+        }
+        if changed {
+            sc.edges[i].waypoints = wps;
+            moved[i] = true;
+        }
+    }
+}
+
+/// How far (px) a waypoint may lie off an end's normal and still count
+/// as on its stub ([`glyph_stubs`]), and the slack its straight stretch
+/// is judged with: rounding only.
+const STUB_ON_LINE: f64 = 0.01;
 
 /// Grow the canvas over everything drawn; never shrink it.
 ///
@@ -359,6 +453,41 @@ mod tests {
         let mut again = rs.clone();
         finish(&g, &mut again, Mode::Routed);
         assert_eq!(format!("{rs:?}"), format!("{again:?}"), "routed: {src}");
+    }
+
+    /// A long edge's spline runs straight into its arrowhead along the
+    /// side's normal for a head's length at least (report M1): its last
+    /// channel leg used to slant straight into the node, the head riding
+    /// the slant; the stub points sit on the normal, the finished scene
+    /// stays a fixed point of `finish`.
+    #[test]
+    fn long_edges_run_straight_into_their_arrowheads() {
+        let src = "flowchart TD\nA --> B --> C --> D\nA --> D";
+        let g = parse(src).unwrap();
+        let sc = scene(&g);
+        let mut seen = 0;
+        // The dummy chain A -> D past B and C (a router path keeps its
+        // own stub, a corner one clearance out).
+        for e in sc
+            .edges
+            .iter()
+            .filter(|e| e.from == "A" && e.to == "D" && e.waypoints.len() >= 3)
+        {
+            let w = &e.waypoints;
+            let n = w.len();
+            let p = w[n - 1];
+            // Plumb into the top side: the two stub points right above.
+            assert_eq!((w[n - 2].0, w[n - 3].0), (p.0, p.0), "{w:?}");
+            let up = |q: (f64, f64)| p.1 - q.1;
+            assert!((up(w[n - 2]) - WAYPOINT_STUB / 2.0).abs() < 1e-9, "{w:?}");
+            assert!((up(w[n - 3]) - WAYPOINT_STUB).abs() < 1e-9, "{w:?}");
+            // The curveBasis spline's straight run into the end.
+            let straight = (up(w[n - 3]) + 4.0 * up(w[n - 2])) / 6.0;
+            assert!(straight >= ARROW_MARKER_PX, "{straight}");
+            seen += 1;
+        }
+        assert!(seen > 0, "a long edge");
+        assert_idempotent(src);
     }
 
     #[test]

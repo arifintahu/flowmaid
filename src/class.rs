@@ -2933,6 +2933,9 @@ fn build(d: &ClassDiagram) -> Built {
     g.direction = d.direction;
     g.flat_leaves = true;
     g.tight_sources = true;
+    // The class painter strokes the edges and draws their ends itself
+    // (a note link's width is set apart in `assemble`).
+    g.edge_paint_width = Some(REL_W);
     let annotated = d
         .relations
         .iter()
