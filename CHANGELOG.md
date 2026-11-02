@@ -112,6 +112,53 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Changed
 
+- **Back-edges run in orthogonal lanes, as in mermaid** (report §2.2,
+  Q4 + M4). A flowchart or state edge running against the flow used to be
+  one wide cubic "bow" round every node on the layers it spans, its own
+  ends included, entering its target at 13–17° and often under the box.
+  It now leaves its source square out of the side facing upstream, runs
+  in a lane just past what lies *between* its ends (the layers strictly
+  between them, and anything on an end's layer that reaches into the
+  band), and enters its target square, with rounded corners delivered as
+  densely sampled `SceneEdge::waypoints` (router style, so a host's spline
+  through them draws the same path; `bezier` is a cubic through the lane's
+  corners). The lane keeps 24 px plus half its label from what it passes,
+  takes the side that crosses fewer edges (then the shorter way round),
+  never threads a gap between nodes, and nests with other lanes, the
+  inner lane's stubs the longer so the legs never cross. When another
+  edge fans out of (or into) an end toward the lane — a hub — the lane
+  meets that end on its side facing the lane instead. demo is 321 px wide
+  (was 383), back-edge 290 (351); the state `retry` and fanout's `no`
+  loops go round the outside. The same rule runs in `scene()`, in the
+  layout's own estimate of the drawing it centres (so it reserves exactly
+  the lane's room) and in `route()` / `route_partial()` (O(nodes + edges)
+  per back-edge, inside the drag budget).
+- **A back-edge with nothing between its ends crosses the gap** like a
+  forward edge, a reversed S out of its source's flow-in side — a 2-cycle
+  (`A --> B`, `B --> A`) draws its two edges side by side, uncrossed, in
+  every direction, both labels in the gap (the layout fits the gap to
+  the return edge's label too). lr is 226 px tall (was 299, the return
+  edge a V-shaped loop below the row); the twins' ports keep their drawn
+  order at both ends, and the pair counts as one link when the layout
+  aligns the two nodes.
+- **An LR / RL back-edge's label takes its height across the flow**, not
+  its width: wide-labels is 160 px tall (was 413, the loop under the row
+  sized by a 337 px label).
+- **An edge between two members of a subgraph stays inside it**: the
+  frame grows over a back-edge's lane and its label (advanced's `fail`
+  edge bulged out of CI/CD), and the router prices any path that leaves
+  the innermost frame holding both its ends (a last tie-break, never a
+  reason to reroute).
+- **Self-loops keep their room** (report P0 #13): the layout keeps a
+  looped node's loop (and 12 px) clear of its high-side neighbour, so a
+  long edge's channel beside it no longer runs through the loop's apex
+  (stress: `A ==> D`), and a back-edge's lane clears the loop too.
+- **A labelled parallel edge keeps its label off its twin** (report
+  P0 #13): in TD / BT, parallel edges next to a labelled one leave
+  half the label's width plus 15 px between their lines (a 16 px gap put
+  stress's `parallel` label on the unlabelled edge), and a label both
+  lines touch counts as the one whose line runs nearer its centre.
+
 - **One arrowhead size for every flowchart edge, sharper and square onto
   the node** (report §2.3, Q1 + M1). Every end glyph — the arrowhead at
   either end, the cross and the circle — is now 11 px in user space

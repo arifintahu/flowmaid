@@ -233,7 +233,7 @@ const H_WEIGHT: f64 = 1.5;
 const ROUTE_MAX_EDGES: usize = 400;
 /// Corner rounding distance (px) of a candidate while it is searched
 /// and scored, capped at half the shorter leg.
-const CORNER_R: f64 = 14.0;
+pub(crate) const CORNER_R: f64 = 14.0;
 /// The widest corner rounding (px) a finished path gets where its legs
 /// and the free room round the corner allow (one soft-orthogonal style
 /// next to the builder's free curves).
@@ -437,8 +437,8 @@ fn outline_gap(r: R, shape: Shape, p: Pt) -> f64 {
 /// monotone one wins); then px on top of accepted edges, crossings at
 /// an arrowhead, cramped nodes,
 /// crossings with accepted edges, px cramped beside accepted edges,
-/// other edges' labels it runs under, and px along frame borders and
-/// node sides.
+/// other edges' labels it runs under, px along frame borders and node
+/// sides, and px outside its own frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Score {
     node: usize,
@@ -469,6 +469,11 @@ struct Score {
     /// [`TIGHT_RUN_MIN`] (G4): of two otherwise equal routes, the one in
     /// the middle of its channel wins.
     hug: usize,
+    /// px of path outside the innermost frame holding both its ends
+    /// (report §2.2): an edge between two members of a box belongs
+    /// inside it. The softest price: never a reason to reroute, but of
+    /// two otherwise equal candidates the one that stays home wins.
+    out: usize,
 }
 
 impl Score {
@@ -526,6 +531,9 @@ struct Info {
     /// The two ends overlap along the flow (same rank): no path round
     /// what lies between them can be monotone, so none is asked for.
     sideways: bool,
+    /// The innermost frame holding both ends (two nodes), which the
+    /// path is priced for leaving ([`Score::out`]).
+    home: Option<usize>,
 }
 
 /// The accepted edges as later edges see them: their drawn segments in
@@ -797,6 +805,22 @@ impl World {
             });
             if enters {
                 s.frame += 1;
+            }
+        }
+        // The run outside its own frame (sampled finely enough that a
+        // segment with one end out counts half).
+        if let Some(r) = info.home.and_then(|f| self.frames.get(f)) {
+            let r = grow(*r, FRAME_INSET);
+            if !(inside(r, (bb.0, bb.1)) && inside(r, (bb.2, bb.3))) {
+                self.look(pts.len());
+                let out: f64 = pts
+                    .windows(2)
+                    .map(|w| {
+                        let k = usize::from(!inside(r, w[0])) + usize::from(!inside(r, w[1]));
+                        dist(w[0], w[1]) * k as f64 / 2.0
+                    })
+                    .sum();
+                s.out = out.round() as usize;
             }
         }
         // Title chips it touches or passes closer than `chip_reach`,
@@ -3971,6 +3995,7 @@ fn reorder(
                     near: t.near + s.near,
                     cross: t.cross + s.cross,
                     tight: t.tight + s.tight,
+                    out: t.out + s.out,
                     label: t.label + s.label,
                     hug: t.hug + s.hug,
                 };
@@ -4044,12 +4069,18 @@ fn info_of(g: &Graph, w: &World, cx: &Ctx, i: usize) -> Option<Info> {
         (p.min(q), p.max(q))
     };
     let ((a0, a1), (b0, b1)) = (span(w.end_rect(a)), span(w.end_rect(b)));
+    // `node_frames` lists a node's frames innermost first.
+    let home = match (a, b) {
+        (EndRef::Node(_), EndRef::Node(_)) => fa.iter().copied().find(|f| fb.contains(f)),
+        _ => None,
+    };
     Some(Info {
         ends: (a, b),
         allowed,
         blocked_frames,
         back: cx.back.get(i).copied().unwrap_or(false),
         sideways: a1.min(b1) > a0.max(b0),
+        home,
     })
 }
 
@@ -4652,6 +4683,7 @@ mod tests {
             blocked_frames: Vec::new(),
             back: false,
             sideways: false,
+            home: None,
         };
         w.score(&info, i, &edge_polyline(&sc.edges[i]), None)
     }
@@ -5283,6 +5315,7 @@ mod tests {
             blocked_frames: Vec::new(),
             back: false,
             sideways: false,
+            home: None,
         };
         let mut e = scene(&parse("flowchart LR\nA-->B").unwrap()).edges[0].clone();
         e.waypoints.clear();
@@ -5310,6 +5343,7 @@ mod tests {
             blocked_frames: Vec::new(),
             back: false,
             sideways: false,
+            home: None,
         })
     }
 
@@ -5538,6 +5572,7 @@ mod tests {
             blocked_frames: Vec::new(),
             back: false,
             sideways: true,
+            home: None,
         };
         // Through the chip, then along the top border inside.
         let s = w.score(

@@ -506,13 +506,19 @@ mod tests {
 
     #[test]
     fn back_edge_routes_around_widest_layer() {
+        // The lane clears the widest layer it passes (report §2.2): the
+        // drawn path reaches past every node box.
         let src =
             "flowchart TD\nA --> B1\nA --> B2\nA --> B3\nB1 --> C\nB2 --> C\nB3 --> C\nC --> A";
         let g = parse(src).unwrap();
         let svg = render(&g);
         let back = paths(&svg).pop().unwrap(); // last edge = C --> A
         let c = coords(&back);
-        let apex_x = 0.125 * (c[0].0 + c[3].0) + 0.75 * c[1].0;
+        let lane_x = |pick: fn(f64, f64) -> f64, init: f64| c.iter().map(|p| p.0).fold(init, pick);
+        let (lo, hi) = (
+            lane_x(f64::min, f64::INFINITY),
+            lane_x(f64::max, f64::NEG_INFINITY),
+        );
         let mut min_left = f64::INFINITY;
         let mut max_right = f64::NEG_INFINITY;
         for line in svg.lines().filter(|l| l.starts_with("<rect x=")) {
@@ -522,11 +528,16 @@ mod tests {
             max_right = max_right.max(x + w);
         }
         assert!(
-            apex_x > max_right + 8.0 || apex_x < min_left - 8.0,
-            "back-edge apex ({:.0}) must clear the nodes [{:.0}..{:.0}]",
-            apex_x,
-            min_left,
-            max_right
+            hi > max_right + 8.0 || lo < min_left - 8.0,
+            "back-edge lane ({lo:.0}..{hi:.0}) must clear the nodes [{min_left:.0}..{max_right:.0}]"
         );
+        // Square out of and into its ends: across the flow side, or (by
+        // A's fan and C's fan-in heading the lane's way) the side facing
+        // the lane.
+        let n = c.len();
+        let square =
+            |p: (f64, f64), q: (f64, f64)| (p.0 - q.0).abs() < 0.2 || (p.1 - q.1).abs() < 0.2;
+        assert!(square(c[0], c[1]), "leaves square: {c:?}");
+        assert!(square(c[n - 1], c[n - 2]), "enters square: {c:?}");
     }
 }

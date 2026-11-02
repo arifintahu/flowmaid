@@ -774,6 +774,38 @@ impl StrokeGrid {
         });
         (mine, other)
     }
+
+    /// Squared distances from the centre of box `a` to the nearest
+    /// stroke of edge `own` and to the nearest stroke of any other edge
+    /// that the box touches or comes within `reach` of (capped at
+    /// `reach`² plus the box's half diagonal², as [`StrokeGrid::dists2`]).
+    fn centre_dists2(&self, a: Rect, own: usize, reach: f64) -> (f64, f64) {
+        let c = ((a.0 + a.2) / 2.0, (a.1 + a.3) / 2.0);
+        let half = ((a.2 - a.0).powi(2) + (a.3 - a.1).powi(2)) / 4.0;
+        let cap = reach * reach + half;
+        let q = (a.0 - reach, a.1 - reach, a.2 + reach, a.3 + reach);
+        let (mut mine, mut other) = (cap, cap);
+        self.each_seg(q, |si| {
+            let (ei, p, r) = self.segs[si];
+            let best = if ei == own { &mut mine } else { &mut other };
+            *best = best.min(point_seg_dist2(c, p, r));
+            true
+        });
+        (mine, other)
+    }
+}
+
+/// Squared distance from point `c` to segment `a`–`b`.
+fn point_seg_dist2(c: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 {
+        (((c.0 - a.0) * dx + (c.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (px, py) = (a.0 + t * dx - c.0, a.1 + t * dy - c.1);
+    px * px + py * py
 }
 
 /// Bounding box of segment `a`–`b`.
@@ -1170,10 +1202,20 @@ impl Field<'_> {
     }
 
     /// Does box `r` still read as label `ei`'s: within the drift limit
-    /// of its own line and no other line nearer?
+    /// of its own line and no other line nearer? A box both lines touch
+    /// (both at distance 0) reads as the one whose line runs nearer its
+    /// centre: a label laid across its unlabelled parallel twin, its own
+    /// line only clipping a corner, reads as the twin's (report P0 #13).
     fn reads_own(&self, r: Rect, ei: usize) -> bool {
         let (own2, other2) = self.strokes().dists2(r, ei, LABEL_DRIFT_MAX);
-        own2 < LABEL_DRIFT_MAX * LABEL_DRIFT_MAX && other2 >= own2
+        if own2 >= LABEL_DRIFT_MAX * LABEL_DRIFT_MAX || other2 < own2 {
+            return false;
+        }
+        if other2 > own2 {
+            return true;
+        }
+        let (own_c, other_c) = self.strokes().centre_dists2(r, ei, LABEL_DRIFT_MAX);
+        own_c <= other_c
     }
 
     /// Nothing could beat `k` but a spot nearer the preferred one.
