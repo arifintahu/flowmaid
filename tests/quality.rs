@@ -145,8 +145,12 @@ fn quality_gate() {
 /// fixtures, per mode (static, routed). Before the router priced border
 /// runs: 1826 static, 2387 routed (hand-made dense fixtures). Re-measured
 /// on the generated dense fixtures, whose long edges cross nested
-/// frames: 1069 / 2131.
-const BORDER_LEN_MAX: (f64, f64) = (1_070.0, 2_140.0);
+/// frames: 1069 / 2131. B1 review r3 (#3): 1082 static — two bench-75
+/// ends just inside the `data` frame (svc3 -> db, user -> gw) that swing
+/// in from the side now enter their heads along the line touching their
+/// curve instead of an S hugging it, and that line runs 9 and 3 px
+/// longer within reach of the frame's left border; no route changed.
+const BORDER_LEN_MAX: (f64, f64) = (1_082.0, 2_140.0);
 
 /// Edges keep off frame borders where their channel has room (G4).
 #[test]
@@ -402,7 +406,14 @@ fn channels_keep_edges_apart_and_off_chips() {
 /// bench-75), band_len 46 446 -> 46 610 routed. idiom_spline 19 -> 25
 /// static: a long edge whose channel legs were level but whose last leg
 /// slanted into its node counted as orthogonal though it never was; the
-/// slant now sits before its stub, where the count sees it.
+/// slant now sits before its stub, where the count sees it. B1 review r3
+/// (#3): end_kink 62 | 81 -> 60 | 77, band_len 46 610 -> 46 604 and
+/// x_drawn 521 -> 520 routed — a curve swinging in from the side enters
+/// its head along the line touching it (no S where it leaves the curve,
+/// no hump before the head), and one that slips in under the head first
+/// keeps its own curve up to there. The kinks left are those S-cubics:
+/// their stroke meets the head at the angle the scene's curve arrives
+/// at, which only the edge's own shape can change.
 const DEFECT_BASELINE: [(&str, f64, f64); 15] = [
     ("end_tilt", 14.0, 19.0),
     ("end_tilt_max", 86.3, 128.4),
@@ -413,12 +424,12 @@ const DEFECT_BASELINE: [(&str, f64, f64); 15] = [
     ("own_frame_x", 1.0, 0.0),
     ("own_frame_len", 32.0, 0.0),
     ("band_pairs", 93.0, 117.0),
-    ("band_len", 41_640.0, 46_610.0),
+    ("band_len", 41_640.0, 46_604.0),
     ("idiom_scubic", 60.0, 83.0),
     ("idiom_spline", 25.0, 21.0),
     ("idiom_bow", 7.0, 8.0),
-    ("x_drawn", 521.0, 521.0),
-    ("end_kink", 62.0, 81.0),
+    ("x_drawn", 521.0, 520.0),
+    ("end_kink", 60.0, 77.0),
 ];
 
 /// Least mean `ink` over the fixtures (static, routed): the painted

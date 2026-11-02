@@ -994,9 +994,10 @@ const SQUARE_END_ARC: f64 = GLYPH_STUB + SQUARE_END_BENDS[0] * GLYPH_STUB;
 /// the curve it replaces is at most [`SQUARE_END_ARC`] long, and the
 /// new stretch keeps within the hull of where it leaves the curve, the
 /// bend's handles (a third of its chord, which is at most that arc and
-/// a run long) and the run. Picking a target farther than this from an
+/// a run — or the straight entry's corner — long) and the run. Picking a target farther than this from an
 /// end measures the scene curve there instead ([`edge_distance`]).
-const SQUARE_END_REACH: f64 = SQUARE_END_ARC + (SQUARE_END_ARC + GLYPH_STUB) / 3.0 + 0.5;
+const SQUARE_END_REACH: f64 =
+    SQUARE_END_ARC + (SQUARE_END_ARC + ARROW_MARKER_PX + SQUARE_END_ENTRY) / 3.0 + 0.5;
 /// Most (px) a squared end that turns into its arrowhead from the side
 /// may stray from the scene curve outside the head ([`square_end`]'s
 /// straight entry and its last resort): a few px, two heads from the
@@ -1019,21 +1020,21 @@ const SQUARE_END_HEAD_REACH: f64 = ARROW_MARKER_PX * 1.12;
 /// (long enough that the SVG's 0.1 px rounding turns it under 4°), and
 /// the corner onto it lies well inside the head.
 const SQUARE_END_ENTRY: f64 = 1.5;
-/// Farthest (px of arc back from the end) the straight entry under the
-/// head ([`square_end`]) leaves the curve: two heads, so what it strays
-/// stays near the head, even where the line touching the curve would
-/// leave it farther back (the entry then meets the curve at a slight
-/// angle instead).
-const SQUARE_END_ENTRY_REACH: f64 = 2.0 * GLYPH_STUB;
+/// How near (degrees) the curve's heading must come to the line from
+/// the straight entry's corner for [`square_end`] to leave the curve
+/// there: the join shows no S, and the nearest such point to the end
+/// keeps the straight line short (it runs beside less of what the
+/// routing spaced against the curve).
+const SQUARE_END_TOUCH: f64 = 5.0;
 /// Pieces a squared end's new bend is sampled in where [`square_end`]
 /// measures its stray (each a px or two long).
 const SQUARE_END_BEND_STEPS: usize = 24;
 /// Every how many samples of the curve's tail [`square_end`] tries to
 /// leave it for the straight entry under the head (about every 2 px).
-const SQUARE_END_ENTRY_STEP: usize = 4;
+const SQUARE_END_ENTRY_STEP: usize = 2;
 /// Arc step (px) the curve is sampled at where [`square_end`] measures
 /// its stray.
-const SQUARE_END_STEP: f64 = 0.5;
+const SQUARE_END_STEP: f64 = 1.0;
 /// How far (px) the curve may lie off its end tangent and still count
 /// as already running straight into the end.
 const SQUARE_END_FLAT: f64 = 0.05;
@@ -1053,8 +1054,12 @@ const SQUARE_END_FLAT: f64 = 0.05;
 /// stretch the painter cuts under it, > 0) the stroke enters the head
 /// straight along a line touching the curve, onto a run just past the
 /// cut — the head must face along the end tangent with its tip on the
-/// end point, whatever the curve does — straying from the curve only
-/// within [`SQUARE_END_ENTRY_REACH`] of the end. The new stretch leaves
+/// end point, whatever the curve does — leaving the curve where the
+/// line touches it (within [`SQUARE_END_ARC`] of the end), so the stroke
+/// runs on straight, with no S or hump before the head, straying at
+/// most [`SQUARE_END_MAX_STRAY`]. A curve that slips in under the head
+/// first is kept up to there, joined to the run inside the head (no
+/// stray at all). The new stretch leaves
 /// the curve within `share` of its length from the end (half, when the
 /// other end is squared too). Unchanged when the curve already runs
 /// straight that far, or has no direction at its end; the rest of the
@@ -1084,15 +1089,25 @@ fn square_end(
         return (start, segs, None);
     };
     // Each command's arc-length table, worked out once: every
-    // candidate below cuts the curve somewhere along its tail.
-    let tabs: Vec<[f64; TRIM_STEPS + 1]> = segs
-        .iter()
-        .zip(&froms)
-        .map(|(&s, &f)| seg_lengths(f, s))
-        .collect();
-    let lens: Vec<f64> = tabs.iter().map(|t| t[TRIM_STEPS]).collect();
-    let total: f64 = lens.iter().sum();
+    // candidate below cuts the curve somewhere along its tail. Measured
+    // from the end back past the farthest any candidate reaches (the
+    // whole path when the other end shares it): a long route's other
+    // commands are never cut, and its length beyond is only ever
+    // compared with what is reached (`total` stands at infinity then).
     let longest = want + SQUARE_END_BENDS[0] * GLYPH_STUB;
+    let mut tabs = vec![[0.0; TRIM_STEPS + 1]; n];
+    let (mut lo, mut reached) = (n, 0.0);
+    while lo > 0 && (share < 1.0 || reached <= longest + 1.0) {
+        lo -= 1;
+        tabs[lo] = seg_lengths(froms[lo], segs[lo]);
+        reached += tabs[lo][TRIM_STEPS];
+    }
+    let lens: Vec<f64> = tabs.iter().map(|t| t[TRIM_STEPS]).collect();
+    let total: f64 = if lo == 0 {
+        lens.iter().sum()
+    } else {
+        f64::INFINITY
+    };
     let tail = tail_samples(&froms, &segs, &tabs, longest.min(total));
     // Off the end tangent (signed), and back along it from the end.
     let lat = |q: (f64, f64)| (q.0 - b.0) * d.1 - (q.1 - b.1) * d.0;
@@ -1192,12 +1207,21 @@ fn square_end(
         let outside = pts.iter().copied().filter(|&q| !covered(q));
         stray_from(outside, &tail_pts[..m], &tail_boxes, limit)
     };
+    // Whether it keeps within `limit` (its stray itself not wanted).
+    let strays_within = |pts: &[(f64, f64)], s_j: f64, limit: f64| -> bool {
+        let m = tail
+            .iter()
+            .take_while(|&&(s, _)| s <= s_j + SQUARE_END_STEP)
+            .count();
+        let outside = pts.iter().copied().filter(|&q| !covered(q));
+        stray_within(outside, &tail_pts[..m], &tail_boxes, limit)
+    };
     // A straight run of `run` px, the bend into it leaving the curve
     // `run + bend` px back, smooth at both ends. As (stray, commands);
     // `None` for a bend that would bulge back up from the run before
     // reaching it (a curve turning hard right at the end), or one
     // straying over `limit`.
-    let smooth = |run: f64, bend: f64, limit: f64| -> Option<Candidate> {
+    let smooth = |run: f64, bend: f64, limit: f64, exact: bool| -> Option<Candidate> {
         let s_j = run + bend;
         let cut = cut_at(s_j)?;
         let (j, tj) = (cut.2, cut.3);
@@ -1215,18 +1239,25 @@ fn square_end(
         {
             return None;
         }
-        Some((stray(&pts, s_j, limit)?, s_j.min(total), cut, bent))
+        let st = if exact {
+            stray(&pts, s_j, limit)?
+        } else if strays_within(&pts, s_j, limit) {
+            limit
+        } else {
+            return None;
+        };
+        Some((st, s_j.min(total), cut, bent))
     };
     // A curve swinging in from the side right at its end: it is kept up
     // to where the line from a point `run_in` px up the end tangent
-    // touches it (within SQUARE_END_ENTRY_REACH), then runs down that
-    // line in under the head — leaving the curve along its own heading,
-    // the corner onto the tangent hidden under the head — and on along
-    // the tangent into the end.
+    // touches it (within SQUARE_END_ARC), then runs straight down that
+    // line in under the head — it leaves the curve along its own heading,
+    // so with no wiggle, and the corner onto the tangent hides under the
+    // head — and on along the tangent into the end.
     let run_in = need + SQUARE_END_ENTRY;
     let entry = || -> Option<Candidate> {
         let p = (b.0 - d.0 * run_in, b.1 - d.1 * run_in);
-        let lim = SQUARE_END_ENTRY_REACH.min(if share < 1.0 { share * total } else { total });
+        let lim = SQUARE_END_ARC.min(if share < 1.0 { share * total } else { total });
         let turn = |k: usize| {
             // The curve's heading at sample k (toward the end) against the
             // line from it to `p`.
@@ -1239,10 +1270,10 @@ fn square_end(
             }
             -(hx * lx + hy * ly) / den
         };
-        // Off the curve along its own heading at sample k, so the entry
-        // leaves it smoothly, then straight at the corner. As (stray, how
-        // far back it leaves the curve, commands); `None` past `limit`.
-        let at = |k: usize, limit: f64| -> Option<Candidate> {
+        // Off the curve along its own heading at sample k, then straight
+        // to the corner. As (stray, how far back it leaves the curve,
+        // commands); `None` past `limit`.
+        let at = |k: usize, limit: f64, exact: bool| -> Option<Candidate> {
             let cut = cut_at(tail[k].0)?;
             let (j, tj) = (cut.2, cut.3);
             let len = (p.0 - j.0).hypot(p.1 - j.1);
@@ -1253,18 +1284,23 @@ fn square_end(
                 (p.0 - dir.0 * h, p.1 - dir.1 * h),
                 p,
             );
-            Some((
-                stray(&samples(j, into), tail[k].0, limit)?,
-                tail[k].0,
-                cut,
-                into,
-            ))
+            let pts = samples(j, into);
+            let st = if exact {
+                stray(&pts, tail[k].0, limit)?
+            } else if strays_within(&pts, tail[k].0, limit) {
+                limit
+            } else {
+                return None;
+            };
+            Some((st, tail[k].0, cut, into))
         };
-        // Where it strays least, the line nearest touching the curve
-        // among equals — leaving it no nearer the end along the tangent
-        // than the corner (the stroke would double back towards the
-        // corner, a hook). A curve that never gets that far back within
-        // reach is left where the line touches it most nearly.
+        // Where the line touches the curve most nearly — the curve there
+        // heading at the corner, so the stroke runs on straight, with no
+        // S where it leaves the curve and no hump before the head —
+        // leaving it no nearer the end along the tangent than the corner
+        // (the stroke would double back towards the corner, a hook), or,
+        // for a curve that never gets that far back within reach,
+        // anywhere.
         let ks: Vec<usize> = (1..tail.len().saturating_sub(1))
             .filter(|&k| tail[k].0 >= run_in && tail[k].0 <= lim)
             .collect();
@@ -1273,22 +1309,46 @@ fn square_end(
             .copied()
             .filter(|&k| along(tail[k].1) >= run_in)
             .collect();
-        if far.is_empty() {
-            let k = ks
-                .into_iter()
-                .min_by(|&x, &y| turn(x).total_cmp(&turn(y)))?;
-            return at(k, SQUARE_END_MAX_STRAY);
+        let pool = if far.is_empty() { &ks } else { &far };
+        // The point nearest the end within SQUARE_END_TOUCH of touching
+        // most nearly: the shortest straight line, leaving the curve with
+        // no visible S.
+        let turns: Vec<f64> = pool.iter().map(|&k| turn(k)).collect();
+        let most = turns.iter().copied().fold(f64::INFINITY, f64::min);
+        let near = |deg: f64| {
+            let slack = 1.0 - deg.to_radians().cos();
+            pool.iter()
+                .zip(&turns)
+                .filter(move |&(_, &t)| t <= most + slack)
+                .map(|(&k, _)| k)
+        };
+        let k = near(SQUARE_END_TOUCH).next()?;
+        if let Some(c) = at(k, SQUARE_END_MAX_STRAY, false) {
+            return Some(c);
         }
-        // The least stray to the 0.01 px, the first such of least turn
-        // among equals; a candidate stops being measured once its stray
-        // rounds above the best so far.
+        // Touching it there strays too far: the nearest point to the end
+        // a little farther from touching that keeps within the stray,
+        // then where it strays least, to the 0.01 px (the first such of
+        // least turn among equals; a candidate stops being measured once
+        // its stray rounds above the best so far).
+        for deg in [2.0, 4.0].map(|f| f * SQUARE_END_TOUCH) {
+            if let Some(c) = near(deg).find_map(|k| at(k, SQUARE_END_MAX_STRAY, false)) {
+                return Some(c);
+            }
+        }
         let key = |s: f64| (s * 100.0).round();
         let mut best: Option<(f64, Candidate)> = None;
-        for &k in far.iter().step_by(SQUARE_END_ENTRY_STEP).chain(far.last()) {
+        for &k in pool
+            .iter()
+            .step_by(SQUARE_END_ENTRY_STEP)
+            .chain(pool.last())
+        {
             let limit = best
                 .as_ref()
                 .map_or(SQUARE_END_MAX_STRAY, |b| (key(b.1 .0) + 0.51) / 100.0);
-            let Some(c) = at(k, limit) else { continue };
+            let Some(c) = at(k, limit, true) else {
+                continue;
+            };
             let tk = turn(k);
             let better = best.as_ref().map_or(true, |b| {
                 key(c.0)
@@ -1313,13 +1373,39 @@ fn square_end(
     let bent = runs.iter().find_map(|&run| {
         SQUARE_END_BENDS
             .iter()
-            .find_map(|&bend| smooth(run, bend * GLYPH_STUB, SQUARE_END_DEV))
+            .find_map(|&bend| smooth(run, bend * GLYPH_STUB, SQUARE_END_DEV, false))
     });
     if let Some((_, cut, at, seg)) = bent {
         return (start, joined(at, seg), Some(cut));
     }
     if need <= 0.0 {
         return (start, segs, None);
+    }
+    // Under an arrowhead, a curve that turns square only in its last px
+    // (a hook: an S-cubic whose end handle is short for its sideways
+    // reach) mostly slips in under the head first. It is kept up to the
+    // point nearest the end, a run's length or more up the tangent,
+    // where its stroke lies wholly inside the head, and joined there to
+    // the run — straight, so the joins stay inside the triangle, where
+    // the head's ink hides them. Outside the head the stroke is the
+    // scene curve itself, curling into the head as it always has, and
+    // the head still faces along the end tangent with its tip on the end
+    // point.
+    if let Some(hw) = head {
+        let inside = |q: (f64, f64)| {
+            let a = along(q);
+            (run_in..=ARROW_MARKER_PX).contains(&a) && lat(q).abs() + hw <= a / 2.0
+        };
+        let under = (1..tail.len())
+            .filter(|&k| tail[k].0 >= run_in)
+            .find(|&k| inside(tail[k].1))
+            .and_then(|k| Some((tail[k].0, cut_at(tail[k].0)?)));
+        if let Some((s_j, cut)) = under {
+            let p = (b.0 - d.0 * run_in, b.1 - d.1 * run_in);
+            if inside(cut.2) {
+                return (start, joined(cut, Seg::L(p)), Some(s_j.min(total)));
+            }
+        }
     }
     // Under an arrowhead, else: the curve turns too hard over its last
     // stretch to meet a run within a px. The straight entry — a bend into
@@ -1335,7 +1421,7 @@ fn square_end(
     let mut best: Option<Candidate> = None;
     for &bend in &SQUARE_END_BENDS {
         let limit = best.as_ref().map_or(SQUARE_END_MAX_STRAY, |b| b.0);
-        if let Some(c) = smooth(need, bend * GLYPH_STUB, limit) {
+        if let Some(c) = smooth(need, bend * GLYPH_STUB, limit, true) {
             if best.as_ref().map_or(true, |b| c.0 < b.0) {
                 best = Some(c);
             }
@@ -1406,6 +1492,32 @@ fn stray_from(
     boxes: &[[f64; 4]],
     limit: f64,
 ) -> Option<f64> {
+    stray_scan(pts, old, boxes, limit, true)
+}
+
+/// Whether every one of `pts` lies within `limit` of the polyline `old`
+/// ([`stray_from`] of them is at most `limit`): a point is cleared by
+/// the first segment found within `limit`, so this costs far less than
+/// measuring the stray when only the bound matters.
+fn stray_within(
+    pts: impl Iterator<Item = (f64, f64)>,
+    old: &[(f64, f64)],
+    boxes: &[[f64; 4]],
+    limit: f64,
+) -> bool {
+    stray_scan(pts, old, boxes, limit, false).is_some()
+}
+
+/// [`stray_from`] (`exact`), or [`stray_within`] (else: `Some(limit)`
+/// when every point is within `limit`, a point clearing as soon as a
+/// segment within `limit` of it turns up).
+fn stray_scan(
+    pts: impl Iterator<Item = (f64, f64)>,
+    old: &[(f64, f64)],
+    boxes: &[[f64; 4]],
+    limit: f64,
+    exact: bool,
+) -> Option<f64> {
     let nseg = old.len().saturating_sub(1);
     // Compared squared (no root per segment); the distance a point
     // raises the max to is measured as `point_seg_dist` measures it.
@@ -1422,6 +1534,9 @@ fn stray_from(
         dx * dx + dy * dy
     };
     let (mut worst, mut worst2): (f64, f64) = (0.0, 0.0);
+    // A point within this (squared) of a segment cannot change the
+    // answer.
+    let clear2 = |worst2: f64| if exact { worst2 } else { limit * limit };
     let mut hint = 0;
     for q in pts {
         if nseg == 0 {
@@ -1429,7 +1544,7 @@ fn stray_from(
             break;
         }
         let mut best2 = seg2(q, hint);
-        if best2 <= worst2 {
+        if best2 <= clear2(worst2) {
             continue;
         }
         let mut arg = hint;
@@ -1447,20 +1562,23 @@ fn stray_from(
                 let d2 = seg2(q, k);
                 if d2 < best2 {
                     (best2, arg) = (d2, k);
-                    if best2 <= worst2 {
+                    if best2 <= clear2(worst2) {
                         break 'blocks;
                     }
                 }
             }
         }
         hint = arg;
-        if best2 > worst2 {
+        if best2 > clear2(worst2) {
             worst2 = best2;
             worst = worst.max(point_seg_dist(q.0, q.1, old[arg], old[arg + 1]));
             if worst > limit {
                 return None;
             }
         }
+    }
+    if !exact {
+        return (worst <= limit).then_some(limit);
     }
     (worst <= limit).then_some(worst)
 }
@@ -9360,7 +9478,7 @@ mod tests {
                 tip,
                 heading,
                 Some(edge_stroke_width(e) / 2.0),
-                SQUARE_END_ENTRY_REACH,
+                SQUARE_END_ARC,
             );
             assert!(far <= SQUARE_END_DEV + 0.05, "{}->{}: {far}", e.from, e.to);
             assert!(
@@ -9374,6 +9492,117 @@ mod tests {
         // run longer than the cut; the outermost swing in too hard for one
         // within a px and enter the head along the end tangent.
         assert_eq!(longer, 3);
+    }
+
+    /// B1 review r3 (#3): an S-cubic whose end handle is short for its
+    /// sideways reach turns square only in its last px (fanout-frames
+    /// n0 -> g1: 23 px handles over a 351 px rise; dense-td n16 -> n23, a
+    /// shallow curve hooking down onto a top side). Its stroke used to
+    /// leave the curve at an angle and make an S, or a hump before the
+    /// head, then an elbow. Now it leaves the curve where the line to the
+    /// corner under the head touches it, and runs on straight: no turn
+    /// back anywhere along the new stretch outside the head, the head
+    /// square, the tip on the end, the stray within its bound.
+    #[test]
+    fn a_curve_swinging_in_from_the_side_enters_its_head_straight() {
+        let cubic = |b: [(f64, f64); 4]| SceneEdge {
+            bezier: b,
+            waypoints: vec![],
+            ..routed_edge(b[0], b[3], vec![])
+        };
+        for e in [
+            cubic([
+                (215.0, 908.5),
+                (238.0, 908.5),
+                (238.0, 557.0),
+                (261.0, 557.0),
+            ]),
+            cubic([
+                (400.0, 100.0),
+                (400.0, 140.0),
+                (100.0, 160.0),
+                (100.0, 180.0),
+            ]),
+            cubic([(0.0, 0.0), (40.0, 0.0), (40.0, 90.0), (80.0, 90.0)]),
+        ] {
+            let tip = e.bezier[3];
+            let d = {
+                let (dx, dy) = (tip.0 - e.bezier[2].0, tip.1 - e.bezier[2].1);
+                let l = dx.hypot(dy);
+                (dx / l, dy / l)
+            };
+            let (t, head) = edge_end_tangent(&e, false);
+            assert_eq!(t, tip);
+            assert!(
+                (head.0 - d.0).abs() < 1e-6 && (head.1 - d.1).abs() < 1e-6,
+                "{head:?}"
+            );
+            let (start, segs) = drawn_segs(&e, |p| p);
+            let plain = sample_cubic(&e.bezier, 400);
+            let pts = dense_path(start, &segs, 64);
+            // The new stretch: where the drawn curve leaves the scene's.
+            let off = |q: (f64, f64)| {
+                plain
+                    .windows(2)
+                    .map(|w| point_seg_dist(q.0, q.1, w[0], w[1]))
+                    .fold(f64::INFINITY, f64::min)
+            };
+            let first = pts.iter().position(|&q| off(q) > 0.05).expect("squared");
+            let along = |q: (f64, f64)| (tip.0 - q.0) * d.0 + (tip.1 - q.1) * d.1;
+            let lat = |q: (f64, f64)| (q.0 - tip.0) * d.1 - (q.1 - tip.1) * d.0;
+            // Outside the head, the heading never swings back by more
+            // than the join's SQUARE_END_TOUCH (no S), and the stroke
+            // never heads back away from the side (no hump).
+            let outside: Vec<(f64, f64)> = pts[first.saturating_sub(1)..]
+                .iter()
+                .copied()
+                .filter(|&q| along(q) > ARROW_MARKER_PX)
+                .collect();
+            let heads: Vec<f64> = outside
+                .windows(2)
+                .filter(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1) > 1e-6)
+                .map(|w| (w[1].1 - w[0].1).atan2(w[1].0 - w[0].0))
+                .collect();
+            if heads.len() >= 2 {
+                let turn = |a: f64, b: f64| {
+                    let t = b - a;
+                    (t + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+                        - std::f64::consts::PI
+                };
+                let net = turn(heads[0], heads[heads.len() - 1]).signum();
+                let mut acc: f64 = 0.0;
+                let mut back: f64 = 0.0;
+                let mut peak: f64 = 0.0;
+                for w in heads.windows(2) {
+                    acc += turn(w[0], w[1]) * net;
+                    peak = peak.max(acc);
+                    back = back.max(peak - acc);
+                }
+                assert!(
+                    back.to_degrees() <= SQUARE_END_TOUCH + 0.5,
+                    "{:?}: an S, {:.1} deg back",
+                    e.bezier,
+                    back.to_degrees()
+                );
+            }
+            assert!(
+                outside
+                    .windows(2)
+                    .all(|w| along(w[1]) <= along(w[0]) + 1e-6),
+                "{:?}: a hump",
+                e.bezier
+            );
+            // The head's own run: the last stretch before the cut lies on
+            // the end tangent.
+            let cut = trim_segs(start, segs.clone(), 0.0, ARROW_TRIM).1;
+            let end = cut.last().unwrap().end();
+            assert!(
+                lat(end).abs() < 1e-6 && (along(end) - ARROW_TRIM).abs() < 0.01,
+                "{end:?}"
+            );
+            let stray = pts.iter().map(|&q| off(q)).fold(0.0, f64::max);
+            assert!(stray <= SQUARE_END_MAX_STRAY + 0.5, "{stray}");
+        }
     }
 
     #[test]
@@ -9643,8 +9872,7 @@ mod tests {
                             }
                         }
                         let hw = (m == Marker::Arrow).then(|| edge_stroke_width(e) / 2.0);
-                        let (far, close) =
-                            end_stray(&painted, &plain, tip, d, hw, SQUARE_END_ENTRY_REACH);
+                        let (far, close) = end_stray(&painted, &plain, tip, d, hw, SQUARE_END_ARC);
                         squared += usize::from(far + close > 0.0);
                         assert!(far <= SQUARE_END_DEV + 0.1, "{what}: {far}");
                         assert!(close <= ARROW_MARKER_PX / 2.0, "{what}: {close}");

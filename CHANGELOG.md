@@ -128,8 +128,12 @@ Minor, not patch: several class structs gain public fields (see
   straight run along that tangent, bending into it within a pixel of the
   curve, so the stroke reaches the head's base already heading its way;
   a curve that swings in from the side too hard for that (a wide fan's
-  outer branches) enters the head straight along a line touching it, its
-  head still square with the tip on the border. A long edge's spline whose
+  outer branches, an S-curve whose short end handle only turns square in
+  its last pixels) leaves its curve where the line to the head touches it
+  and runs on straight into the head — no S where it leaves the curve, no
+  hump before the head — its head still square with the tip on the
+  border, and one that slips in under the head first keeps its own curve
+  up to there. A long edge's spline whose
   last channel leg slanted into its node gets a straight stub along the
   side's normal in `SceneEdge::waypoints` (so hosts draw it too), unless
   the stub would bring it nearer a node or along another edge than the
