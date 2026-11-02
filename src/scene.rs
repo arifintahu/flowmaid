@@ -3830,8 +3830,9 @@ fn sub_edge_proxies(g: &Graph, node_cluster: &[Vec<usize>], grid: &[RankGroup]) 
 /// Index-parallel with `g.sub_edges`: for a sub-edge from a member to
 /// its own enclosing box (`Dev --> CI` with `Dev` inside `CI`), the
 /// member it is drawn to — the box's first entry member other than the
-/// node itself ([`sub_edge_proxies`]), the stand-in `scene_clustered`
-/// lays out and ranks. The edge is drawn and routed as an edge between
+/// node itself and the members it already links to
+/// ([`sub_edge_proxies`]), the stand-in `scene_clustered` lays out and
+/// ranks. The edge is drawn and routed as an edge between
 /// the two nodes, in the static scene, in [`route`] and in every edge
 /// stage (`edgepass::ctx`): no line can reach the box from inside it,
 /// and a stub out to the frame's border pointed at nothing (against the
