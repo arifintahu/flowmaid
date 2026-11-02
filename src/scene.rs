@@ -717,6 +717,49 @@ pub(crate) fn edge_end_chord(
     (tip, pts[pts.len() - 1])
 }
 
+/// One end of an edge's DRAWN curve (the one [`edge_path_d`] emits) as
+/// `(tip, heading)`: the end point and the unit direction the curve
+/// runs INTO it there — the way an `orient="auto"` end glyph faces at
+/// the target, and the reverse of the way the curve sets off at the
+/// source. Exact for every drawing form, read off the control point
+/// next to the tip: the last command of a mermaid `curve`, the closing
+/// `L` of the `curveBasis` spline (along the last waypoint leg), the
+/// cubic's end tangent. `(0, 0)` only for a curve without length.
+pub(crate) fn edge_end_tangent(e: &SceneEdge, at_start: bool) -> ((f64, f64), (f64, f64)) {
+    // The tip, then the points that set the tangent there, nearest
+    // first (a coincident control point defers to the next one).
+    let mut seq: Vec<(f64, f64)> = if let Some((start, segs)) = curve_geometry(e) {
+        let mut all = vec![start];
+        for seg in &segs {
+            match *seg {
+                Seg::L(p) => all.push(p),
+                Seg::Q(c, p) => all.extend([c, p]),
+                Seg::C(c1, c2, p) => all.extend([c1, c2, p]),
+            }
+        }
+        all
+    } else if e.waypoints.len() >= 2 {
+        e.waypoints.clone()
+    } else {
+        e.bezier.to_vec()
+    };
+    if !at_start {
+        seq.reverse();
+    }
+    let tip = seq[0];
+    let toward = seq[1..]
+        .iter()
+        .find(|q| (q.0 - tip.0).hypot(q.1 - tip.1) > 1e-9)
+        .copied()
+        .unwrap_or(tip);
+    let (dx, dy) = (tip.0 - toward.0, tip.1 - toward.1);
+    let l = dx.hypot(dy);
+    if l == 0.0 {
+        return (tip, (0.0, 0.0));
+    }
+    (tip, (dx / l, dy / l))
+}
+
 /// Dense sample of [`curve_geometry`] for picking and the bounding box.
 fn curve_sample(start: (f64, f64), segs: &[Seg]) -> Vec<(f64, f64)> {
     const STEPS: usize = 12;
@@ -2814,6 +2857,94 @@ const ARROW_MARKER_UNITS: f64 = 7.0;
 /// styled line keeps a normal head (mermaid's markers don't scale).
 pub(crate) const ARROW_MARKER_PX: f64 = ARROW_MARKER_UNITS * EDGE_WIDTH;
 
+/// Corner radius (px) `to_svg` paints a plain box with: `Rect`,
+/// `Subroutine` and a fork/join bar.
+const BOX_RX: f64 = 3.0;
+/// Corner radius (px) of a `Rounded` node.
+const ROUNDED_RX: f64 = 9.0;
+/// Most inset (px) of a hexagon's side points and of a parallelogram's
+/// slant; a quarter of the width on a narrower node.
+const SLANT_MAX: f64 = 14.0;
+/// Most half height (px) of a cylinder's cap ellipse; a quarter of the
+/// node's height on a shorter one.
+const CYLINDER_RY_MAX: f64 = 8.0;
+/// How far (px) a flattened arc of [`node_outline`] may bow off its
+/// chords: well under a pixel, so a distance to the polygon is a
+/// distance to the painted curve.
+const OUTLINE_FLATNESS: f64 = 0.05;
+/// Most chords per arc of [`node_outline`]: a node thousands of px
+/// across is flattened a little coarser rather than into a huge polygon.
+const OUTLINE_MAX_STEPS: f64 = 256.0;
+
+/// The outline `to_svg` paints node `n` with — its outer one for the
+/// double ring and the final state — as a closed polygon (the closing
+/// segment from the last point back to the first is implied), its
+/// rounded corners, caps and circles flattened to within
+/// [`OUTLINE_FLATNESS`]. The yardstick for where an edge end should sit
+/// ([`crate::quality`]): the box `w` × `h` is only the outline of the
+/// rectangular shapes.
+pub(crate) fn node_outline(n: &SceneNode) -> Vec<(f64, f64)> {
+    let (cx, cy, w, h) = (n.x, n.y, n.w.max(0.0), n.h.max(0.0));
+    let (l, r, t, b) = (cx - w / 2.0, cx + w / 2.0, cy - h / 2.0, cy + h / 2.0);
+    // Elliptic arc round (ox, oy) from angle a0 to a1 (radians, y down).
+    let arc = |out: &mut Vec<(f64, f64)>, o: (f64, f64), rx: f64, ry: f64, a0: f64, a1: f64| {
+        let rmax = rx.max(ry);
+        let step = if rmax > OUTLINE_FLATNESS {
+            2.0 * (1.0 - OUTLINE_FLATNESS / rmax).acos()
+        } else {
+            a1 - a0
+        };
+        let k = ((a1 - a0) / step).ceil().clamp(1.0, OUTLINE_MAX_STEPS) as usize;
+        out.extend((0..=k).map(|i| {
+            let a = a0 + (a1 - a0) * i as f64 / k as f64;
+            (o.0 + rx * a.cos(), o.1 + ry * a.sin())
+        }));
+    };
+    use std::f64::consts::{FRAC_PI_2, PI};
+    // An SVG `<rect rx>`: ry = rx, each clamped to its half extent.
+    let rounded = |rx: f64| {
+        let (rx, ry) = (rx.min(w / 2.0), rx.min(h / 2.0));
+        let mut out = Vec::new();
+        arc(&mut out, (l + rx, t + ry), rx, ry, PI, PI + FRAC_PI_2);
+        arc(&mut out, (r - rx, t + ry), rx, ry, PI + FRAC_PI_2, 2.0 * PI);
+        arc(&mut out, (r - rx, b - ry), rx, ry, 0.0, FRAC_PI_2);
+        arc(&mut out, (l + rx, b - ry), rx, ry, FRAC_PI_2, PI);
+        out
+    };
+    let k = SLANT_MAX.min(w / 4.0);
+    match n.shape {
+        Shape::Rect | Shape::Subroutine | Shape::ForkBar => rounded(BOX_RX),
+        Shape::Rounded => rounded(ROUNDED_RX),
+        Shape::Stadium => rounded(h / 2.0),
+        Shape::Circle | Shape::DoubleCircle | Shape::StateStart | Shape::StateEnd => {
+            let mut out = Vec::new();
+            arc(&mut out, (cx, cy), w / 2.0, w / 2.0, 0.0, 2.0 * PI);
+            out.pop(); // the closing point repeats the first
+            out
+        }
+        Shape::Diamond => vec![(cx, t), (r, cy), (cx, b), (l, cy)],
+        Shape::Hexagon => vec![
+            (l, cy),
+            (l + k, t),
+            (r - k, t),
+            (r, cy),
+            (r - k, b),
+            (l + k, b),
+        ],
+        Shape::Parallelogram => vec![(l + k, t), (r, t), (r - k, b), (l, b)],
+        Shape::ParallelogramAlt => vec![(l, t), (r - k, t), (r, b), (l + k, b)],
+        Shape::Cylinder => {
+            // The top cap's upper half, the right side, the bottom
+            // cap's lower half; the left side closes the polygon.
+            let ry = CYLINDER_RY_MAX.min(h / 4.0);
+            let mut out = Vec::new();
+            arc(&mut out, (cx, t + ry), w / 2.0, ry, PI, 2.0 * PI);
+            arc(&mut out, (cx, b - ry), w / 2.0, ry, 0.0, PI);
+            out
+        }
+    }
+}
+
 /// A marker variant a `linkStyle`d edge end needs: the glyph in the
 /// edge's stroke colour and/or at a fixed user-space size.
 #[derive(Clone, PartialEq)]
@@ -3350,9 +3481,9 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
         match n.shape {
             Shape::Rect | Shape::Rounded | Shape::Stadium => {
                 let rx = match n.shape {
-                    Shape::Rounded => 9.0,
+                    Shape::Rounded => ROUNDED_RX,
                     Shape::Stadium => h / 2.0,
-                    _ => 3.0,
+                    _ => BOX_RX,
                 };
                 s.push_str(&format!(
                     "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
@@ -3397,8 +3528,8 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
             }
             Shape::Cylinder => {
                 let (l, r, t, b) = (cx - w / 2.0, cx + w / 2.0, cy - h / 2.0, cy + h / 2.0);
-                let ry = 8.0_f64.min(h / 4.0); // cap ellipse radius
-                                               // Body + bottom arc, then the top ellipse on top.
+                let ry = CYLINDER_RY_MAX.min(h / 4.0); // cap ellipse radius
+                                                       // Body + bottom arc, then the top ellipse on top.
                 s.push_str(&format!(
                     "<path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 0 {r:.1} {ty:.1} \
                      L {r:.1} {by:.1} A {rx:.1} {ry:.1} 0 0 1 {l:.1} {by:.1} Z\" {style}/>\n\
@@ -3426,7 +3557,7 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
             }
             Shape::Hexagon => {
                 let (l, r, t, b) = (cx - w / 2.0, cx + w / 2.0, cy - h / 2.0, cy + h / 2.0);
-                let k = 14.0_f64.min(w / 4.0);
+                let k = SLANT_MAX.min(w / 4.0);
                 s.push_str(&format!(
                     "<polygon points=\"{a:.1},{cy:.1} {b1:.1},{t:.1} {c:.1},{t:.1} {r:.1},{cy:.1} {c:.1},{b:.1} {b1:.1},{b:.1}\" {style}/>\n",
                     a = l, b1 = l + k, c = r - k, r = r, t = t, b = b, cy = cy, style = style,
@@ -3434,7 +3565,7 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
             }
             Shape::Parallelogram | Shape::ParallelogramAlt => {
                 let (l, r, t, b) = (cx - w / 2.0, cx + w / 2.0, cy - h / 2.0, cy + h / 2.0);
-                let k = 14.0_f64.min(w / 4.0);
+                let k = SLANT_MAX.min(w / 4.0);
                 let pts = if matches!(n.shape, Shape::Parallelogram) {
                     // bottom-left slanted right: /  /
                     format!(
@@ -5394,6 +5525,113 @@ mod tests {
         let dot = routed_edge((5.0, 5.0), (5.0, 5.0), Vec::new());
         let (tip, toward) = edge_end_chord(&dot, true, 14.0);
         assert!(near(tip, toward));
+    }
+
+    #[test]
+    fn edge_end_tangent_is_the_drawn_heading_into_each_end() {
+        let near =
+            |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+        // Routed L: the spline leaves straight down and closes along the
+        // last leg, rightwards; at the start the heading points back.
+        let e = routed_edge(
+            (0.0, 0.0),
+            (80.0, 50.0),
+            vec![(0.0, 0.0), (0.0, 50.0), (80.0, 50.0)],
+        );
+        let (tip, head) = edge_end_tangent(&e, false);
+        assert!(
+            near(tip, (80.0, 50.0)) && near(head, (1.0, 0.0)),
+            "{head:?}"
+        );
+        let (tip, head) = edge_end_tangent(&e, true);
+        assert!(near(tip, (0.0, 0.0)) && near(head, (0.0, -1.0)), "{head:?}");
+        // One cubic: its end tangents; a control point on the tip defers
+        // to the next one (the degenerate chord runs along itself).
+        let mut c = routed_edge((0.0, 0.0), (30.0, 40.0), Vec::new());
+        c.bezier = [(0.0, 0.0), (0.0, 20.0), (30.0, 10.0), (30.0, 40.0)];
+        assert!(near(edge_end_tangent(&c, false).1, (0.0, 1.0)));
+        assert!(near(edge_end_tangent(&c, true).1, (0.0, -1.0)));
+        let chord = routed_edge((0.0, 0.0), (30.0, 40.0), Vec::new());
+        assert!(near(edge_end_tangent(&chord, false).1, (0.6, 0.8)));
+        // A mermaid curve: its own last command (rounded corners end on
+        // a straight run).
+        let mut r = e.clone();
+        r.meta.curve = Some(EdgeCurve::Rounded);
+        assert!(near(edge_end_tangent(&r, false).1, (1.0, 0.0)));
+        assert!(near(edge_end_tangent(&r, true).1, (0.0, -1.0)));
+        let dot = routed_edge((5.0, 5.0), (5.0, 5.0), Vec::new());
+        assert_eq!(edge_end_tangent(&dot, false).1, (0.0, 0.0));
+    }
+
+    #[test]
+    fn node_outline_traces_each_painted_shape() {
+        let sc = scene(
+            &parse(
+                "flowchart TD\nA[rect]-->B(rounded)-->C([stadium])-->D((circle))\n\
+                 D-->E{diamond}-->F[(cylinder)]-->G[[subroutine]]-->H{{hexagon}}\n\
+                 H-->I[/lean right/]-->J[\\lean left\\]-->K(((double)))",
+            )
+            .unwrap(),
+        );
+        let area = |p: &[(f64, f64)]| {
+            let n = p.len();
+            let twice: f64 = (0..n)
+                .map(|i| p[i].0 * p[(i + 1) % n].1 - p[(i + 1) % n].0 * p[i].1)
+                .sum();
+            twice.abs() / 2.0
+        };
+        let pi = std::f64::consts::PI;
+        for n in &sc.nodes {
+            let o = node_outline(n);
+            // Inside the box, reaching all four of its sides (a round
+            // side up to the flattening).
+            let (l, r, t, b) = (
+                n.x - n.w / 2.0,
+                n.x + n.w / 2.0,
+                n.y - n.h / 2.0,
+                n.y + n.h / 2.0,
+            );
+            let eps = 1e-9;
+            assert!(
+                o.iter().all(|p| p.0 >= l - eps && p.0 <= r + eps),
+                "{}",
+                n.id
+            );
+            assert!(
+                o.iter().all(|p| p.1 >= t - eps && p.1 <= b + eps),
+                "{}",
+                n.id
+            );
+            for (k, side) in [l, r, t, b].into_iter().enumerate() {
+                let on = |p: &(f64, f64)| {
+                    (if k < 2 { p.0 } else { p.1 } - side).abs() <= OUTLINE_FLATNESS
+                };
+                assert!(o.iter().any(on), "{} misses side {k}", n.id);
+            }
+            let k = SLANT_MAX.min(n.w / 4.0);
+            let want = match n.shape {
+                Shape::Rect | Shape::Subroutine => n.w * n.h - (4.0 - pi) * BOX_RX * BOX_RX,
+                Shape::Rounded => n.w * n.h - (4.0 - pi) * ROUNDED_RX * ROUNDED_RX,
+                Shape::Stadium => n.w * n.h - (4.0 - pi) * (n.h / 2.0).powi(2),
+                Shape::Circle | Shape::DoubleCircle => pi * (n.w / 2.0).powi(2),
+                Shape::Diamond => n.w * n.h / 2.0,
+                Shape::Hexagon | Shape::Parallelogram | Shape::ParallelogramAlt => (n.w - k) * n.h,
+                Shape::Cylinder => {
+                    let ry = CYLINDER_RY_MAX.min(n.h / 4.0);
+                    n.w * (n.h - 2.0 * ry) + pi * (n.w / 2.0) * ry
+                }
+                _ => unreachable!("not in this chart"),
+            };
+            // Flattened arcs lose at most a flattening's depth all
+            // along the perimeter (at most the box's).
+            let got = area(&o);
+            let slack = OUTLINE_FLATNESS * 2.0 * (n.w + n.h);
+            assert!((got - want).abs() <= slack, "{}: {got} vs {want}", n.id);
+        }
+        // A node thousands of px across stays a bounded polygon.
+        let mut big = sc.nodes[3].clone();
+        (big.w, big.h) = (1e6, 1e6);
+        assert!(node_outline(&big).len() <= OUTLINE_MAX_STEPS as usize + 1);
     }
 
     #[test]

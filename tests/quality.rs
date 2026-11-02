@@ -87,10 +87,16 @@ fn quality_gate() {
         .iter()
         .map(|f| f.0)
         .collect();
+    let tail: Vec<&str> = Metrics::default()
+        .tail_fields()
+        .iter()
+        .map(|f| f.0)
+        .collect();
     println!(
-        "file\tmode\t{}\tdefects\t{}",
+        "file\tmode\t{}\tdefects\t{}\t{}",
         header.join("\t"),
-        late.join("\t")
+        late.join("\t"),
+        tail.join("\t")
     );
     let mut bad = Vec::new();
     for &(name, cs, cr) in CEILINGS {
@@ -111,11 +117,17 @@ fn quality_gate() {
                 .iter()
                 .map(|f| format!("{:.2}", f.1))
                 .collect();
+            let tail: Vec<String> = m
+                .tail_fields()
+                .iter()
+                .map(|f| format!("{:.2}", f.1))
+                .collect();
             println!(
-                "{name}\t{mode}\t{}\t{}\t{}",
+                "{name}\t{mode}\t{}\t{}\t{}\t{}",
                 vals.join("\t"),
                 m.defects(),
-                late.join("\t")
+                late.join("\t"),
+                tail.join("\t")
             );
             bad.extend(check(name, mode, m, ceil));
             if m.min_edge_gap < floor {
@@ -358,4 +370,99 @@ fn channels_keep_edges_apart_and_off_chips() {
             row.2
         );
     }
+}
+
+/// The report-M0 yardsticks (`Metrics::tail_fields`, report §2.13: the
+/// defects the older columns cannot see) over all fixtures, static |
+/// routed — summed, or the largest value for the `_max` rows. Ratchets
+/// at the values measured when the metrics landed, the defect baseline
+/// of phase B: each later package LOWERS the rows its fix brings down,
+/// and never raises one without saying why. End glyphs askew to their
+/// side and ends off the painted outline (§2.3, §2.5), sideways hooks
+/// and hairpins (§2.13), edges leaving the frame both their ends share
+/// (§2.2, §2.8), long cables of edges 6–26 px apart; the idiom rows
+/// count the edges not yet drawn orthogonally (§2.1: S-cubics, dummy
+/// chain splines, back-edge bows), `x_drawn` the crossings a reader
+/// sees, level and plumb edges included.
+const DEFECT_BASELINE: [(&str, f64, f64); 14] = [
+    ("end_tilt", 24.0, 19.0),
+    ("end_tilt_max", 86.5, 128.4),
+    ("end_gaps", 11.0, 11.0),
+    ("end_gap_max", 4.7, 4.7),
+    ("lat_wiggles", 16.0, 19.0),
+    ("lat_backtrack", 1_902.0, 674.0),
+    ("own_frame_x", 1.0, 0.0),
+    ("own_frame_len", 32.0, 0.0),
+    ("band_pairs", 93.0, 117.0),
+    ("band_len", 41_640.0, 46_446.0),
+    ("idiom_scubic", 60.0, 83.0),
+    ("idiom_spline", 19.0, 21.0),
+    ("idiom_bow", 7.0, 8.0),
+    ("x_drawn", 521.0, 521.0),
+];
+
+/// Least mean `ink` over the fixtures (static, routed): the painted
+/// share of the canvas (report §6 keeps the compact, text-sized
+/// drawing; B6 judges sparse canvases by it). A floor at the landing
+/// values (0.0889 | 0.1048), raised as canvases tighten.
+const INK_MEAN_MIN: (f64, f64) = (0.088, 0.104);
+
+/// The defect baseline of report M0 holds in either mode: no package
+/// adds askew ends, gaps at outlines, sideways wiggles, own-frame
+/// escapes, cables, non-orthogonal edges or crossings.
+#[test]
+fn defect_baseline_gate() {
+    use flowmaid::quality::Agg;
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/quality");
+    // Per mode: every tail field of every fixture.
+    type Rows = Vec<Vec<(&'static str, f64, Agg)>>;
+    let mut cols: [Rows; 2] = [Vec::new(), Vec::new()];
+    for &(name, ..) in CEILINGS {
+        let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");
+        let rep = measure_source(&src, false).expect("flowchart fixture");
+        cols[0].push(rep.statik.tail_fields());
+        cols[1].push(rep.routed.tail_fields());
+    }
+    let fold = |rows: &Rows, c: usize| {
+        let vals = rows.iter().map(|r| r[c].1);
+        match rows[0][c].2 {
+            Agg::Sum => vals.sum::<f64>(),
+            Agg::Max => vals.fold(f64::NEG_INFINITY, f64::max),
+            Agg::Min => vals.fold(f64::INFINITY, f64::min),
+            Agg::Mean => vals.sum::<f64>() / rows.len() as f64,
+        }
+    };
+    let mut bad = Vec::new();
+    for (k, mode) in ["static", "routed"].into_iter().enumerate() {
+        let rows = &cols[k];
+        for c in 0..rows[0].len() {
+            let (col, got) = (rows[0][c].0, fold(rows, c));
+            println!("{mode}\t{col}\t{got:.4}");
+            // The idiom counts partition the edges: the ceilings on the
+            // other three are this one's floor.
+            if col == "idiom_ortho" {
+                continue;
+            }
+            if col == "ink" {
+                let min = [INK_MEAN_MIN.0, INK_MEAN_MIN.1][k];
+                if got < min {
+                    bad.push(format!("{mode} ink {got:.4} < floor {min}"));
+                }
+                continue;
+            }
+            let row = DEFECT_BASELINE
+                .iter()
+                .find(|r| r.0 == col)
+                .unwrap_or_else(|| panic!("{col} has no row in DEFECT_BASELINE"));
+            let max = [row.1, row.2][k];
+            if got > max {
+                bad.push(format!("{mode} {col} {got:.2} > ceiling {max}"));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "defect baseline regressions:\n{}",
+        bad.join("\n")
+    );
 }

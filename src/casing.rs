@@ -1089,10 +1089,12 @@ mod tests {
             let sc = scene(&g);
             let all = crossings_with(&sc, false).len();
             assert_eq!(all, brute(&sc), "{name}: grid search vs brute force");
-            // The yardstick skips pairs whose bounding boxes it finds
-            // disjoint, which misses an exactly level or plumb edge.
+            // The yardstick's `edge_edge_x` skips pairs whose bounding
+            // boxes it finds disjoint, which misses an exactly level or
+            // plumb edge; its `x_drawn` counts every drawn crossing.
             let m = crate::quality::measure(&g, &sc);
             assert!(all >= m.edge_edge_x, "{name}: {all} < {}", m.edge_edge_x);
+            assert_eq!(all, m.x_drawn, "{name}: drawn crossings");
             let svg = to_svg(&sc);
             let holes = svg.matches("fill=\"#000\"/>").count();
             assert_eq!(holes, crossings(&sc).len(), "{name}: one hole per crossing");
