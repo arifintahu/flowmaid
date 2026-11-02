@@ -167,7 +167,7 @@ fn crossings_with(sc: &Scene, skip_ends: bool) -> Vec<(usize, usize, Pt, Cut)> {
     if idx.len() < 2 {
         return Vec::new();
     }
-    // The strokes as painted (a cubic's straight glyph stubs included).
+    // The strokes as painted (their squared glyph ends included).
     let lines: Vec<Vec<Pt>> = idx
         .iter()
         .map(|&i| edge_painted_polyline(&sc.edges[i]))

@@ -119,22 +119,32 @@ Minor, not patch: several class structs gain public fields (see
   a head twice the size (about 22 px) and a `linkStyle stroke-width` edge
   shares the head too. The head is the wider `M 0 0 L 10 5 L 0 10 z`
   triangle. The SVG painter stops the stroke half a head short under an
-  arrowhead (`refX` puts the tip back exactly on the node border), so the
-  butt end of a 2 or 3.5 px stroke no longer pokes out beside the tip and
-  the tip no longer overshoots into the node. A single-curve edge that
-  still turns at its glyph end is drawn with a straight, head-long stub
-  along the end's handle (the side's normal), so the head and the stroke
-  entering it point square into the side; a long edge's spline gets a
-  straight stub too (its last channel leg used to slant into the node,
-  head and all). The stub of a single curve and the cut under the head are
-  the SVG painter's: `SceneEdge::bezier` is unchanged and still ends on the
-  border (hosts draw their own heads along its end tangent, which already
-  points square in), and `Scene::edge_at` / `hits_in_rect` follow the
-  painted stroke. A long edge's stub is in `SceneEdge::waypoints`, so hosts
-  draw it too. Marker ids: a `linkStyle` width no longer needs a variant,
-  so the `-u` ids (`arrow-u`, `arrow-u__<colour>`) are gone — a coloured
-  end is `<base id>_<colour>` (`arrow__ff3`), an uncoloured one keeps its
-  base id. The advance painter draws the same head and cut.
+  arrowhead — a `linkStyle` stroke wider than that its own width short, up
+  to a whole head — with `refX` putting the tip back exactly on the node
+  border, so the butt end of the stroke no longer pokes out beside the tip
+  and the tip no longer overshoots into the node. Every glyph faces along
+  its curve's own end tangent (square to the side wherever the curve
+  arrives square): the painter ends a curve that still turns there in a
+  straight run along that tangent, bending into it within a pixel of the
+  curve, so the stroke reaches the head's base already heading its way;
+  a curve that swings in from the side too hard for that (a wide fan's
+  outer branches) enters the head straight along a line touching it, its
+  head still square with the tip on the border. A long edge's spline whose
+  last channel leg slanted into its node gets a straight stub along the
+  side's normal in `SceneEdge::waypoints` (so hosts draw it too), unless
+  the stub would bring it nearer a node or along another edge than the
+  routing left it. The squared ends and the cut are the SVG painter's:
+  `SceneEdge::bezier` is unchanged and still ends on the border (hosts draw
+  their own heads along its end tangent), the painted curve stays within a
+  pixel of it outside the head beyond two head lengths of the tip, and
+  `Scene::edge_at` / `hits_in_rect` follow the painted stroke. Marker ids:
+  a `linkStyle` width no longer needs a size variant, so the `-u` ids
+  (`arrow-u`, `arrow-u__<colour>`) are gone — a coloured end is
+  `<base id>_<colour>` (`arrow__ff3`), a stroke wider than 5.5 px gets
+  `<base id>-t<width>` (`arrow-t8`, the same head set further ahead), and
+  an unstyled one keeps its base id. The advance painter draws the same
+  head and cut. A crossing gap is no longer cut within a head and a gap's
+  radius of an edge end, where it could bite the arrowhead.
 - **Stroke and canvas tokens** (report Q10): edges are 2 px (thick 3.5 px,
   from 1.7 / 3.4), node outlines 1.8 px (from 1.6, the cylinder's lid, the
   subroutine's bars and a final state's ring included), and the SVG pads
@@ -148,7 +158,7 @@ Minor, not patch: several class structs gain public fields (see
   reads frame ends either way across the border; new `end_kink` (appended
   after `x_drawn`) counts glyph ends whose stroke meets the head's base
   more than 10° off square. The yardstick measures the painted strokes
-  (straight glyph stubs included), as the crossing casing cuts its gaps in
+  (squared glyph ends included), as the crossing casing cuts its gaps in
   them; `quality::ARROW_LEN` follows the head size (11 px).
 - **Class hierarchies read top-down, like mermaid and UML.** Relations are
   laid out in source order (left operand first), so in `Animal <|-- Dog`

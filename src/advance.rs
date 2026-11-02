@@ -32,6 +32,15 @@ fn scene_key(sc: &AdvanceScene) -> String {
     k.finish()
 }
 
+/// Stroke width an advance edge is painted with: its style's, else its
+/// kind's (the flowchart's widths).
+fn advance_edge_width(e: &AdvanceSceneEdge) -> f64 {
+    e.style.stroke_width.unwrap_or(match e.kind {
+        EdgeKind::Thick | EdgeKind::ThickOpen => crate::scene::EDGE_WIDTH_THICK,
+        _ => crate::scene::EDGE_WIDTH,
+    })
+}
+
 // ------------------------------------------------------------------
 // Public error type
 // ------------------------------------------------------------------
@@ -5753,22 +5762,26 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
     // page both emitted `advance-arrow-1` and the second one's arrows
     // took the first one's colours.
     let key = scene_key(sc);
-    let mut markers: Vec<(String, String)> = Vec::new();
+    // (colour, how far the stroke stops short of the tip, id): a stroke
+    // wider than the usual cut stops further back, its head set further
+    // ahead to keep the tip on the route's end.
+    let mut markers: Vec<(String, f64, String)> = Vec::new();
     for e in &sc.edges {
         if matches!(e.kind, EdgeKind::Invisible) || !e.kind.has_arrow() {
             continue;
         }
         let color = crate::scene::style_attr(e.style.color.as_deref(), &sc.style.edge_color);
-        if !markers.iter().any(|(c, _)| *c == color) {
+        let trim = crate::scene::arrow_trim(advance_edge_width(e));
+        if !markers.iter().any(|(c, t, _)| *c == color && *t == trim) {
             let id = format!("advance-arrow-{}-{}", key, markers.len() + 1);
-            markers.push((color, id));
+            markers.push((color, trim, id));
         }
     }
     // The flowchart's own head (one size, in user space), so both
     // painters draw the same glyph.
     let mut defs = String::new();
-    for (color, id) in &markers {
-        defs.push_str(&crate::scene::arrow_marker_def(id, color));
+    for (color, trim, id) in &markers {
+        defs.push_str(&crate::scene::arrow_marker_def(id, color, *trim));
     }
     if !defs.is_empty() {
         s.push_str(&format!("<defs>{}</defs>\n", defs));
@@ -5822,26 +5835,20 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
             Some(d) => format!(" stroke-dasharray=\"{}\"", d),
             None => String::new(),
         };
-        let sw = e.style.stroke_width.unwrap_or(match e.kind {
-            EdgeKind::Thick | EdgeKind::ThickOpen => crate::scene::EDGE_WIDTH_THICK,
-            _ => crate::scene::EDGE_WIDTH,
-        });
+        let sw = advance_edge_width(e);
+        let head_trim = crate::scene::arrow_trim(sw);
         let marker = if e.kind.has_arrow() {
             markers
                 .iter()
-                .find(|(c, _)| *c == color)
-                .map(|(_, id)| format!(" marker-end=\"url(#{})\"", id))
+                .find(|(c, t, _)| *c == color && *t == head_trim)
+                .map(|(_, _, id)| format!(" marker-end=\"url(#{})\"", id))
                 .unwrap_or_default()
         } else {
             String::new()
         };
         // The stroke stops short under the head, whose tip the marker
         // puts back on the route's end.
-        let trim = if marker.is_empty() {
-            0.0
-        } else {
-            crate::scene::ARROW_TRIM
-        };
+        let trim = if marker.is_empty() { 0.0 } else { head_trim };
         let d = crate::scene::polyline_d_painted(&e.points, trim);
         s.push_str(&format!(
             "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.1}\"{}{}/>\n",
@@ -7128,7 +7135,11 @@ mod tests {
             .expect("a marker");
         let color = scene.style.edge_color.clone();
         assert!(
-            svg.contains(&crate::scene::arrow_marker_def(id, &color)),
+            svg.contains(&crate::scene::arrow_marker_def(
+                id,
+                &color,
+                crate::scene::ARROW_TRIM
+            )),
             "{svg}"
         );
         assert!(svg.contains("stroke-width=\"3.5\""), "{svg}");
