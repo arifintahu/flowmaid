@@ -137,7 +137,11 @@ Minor, not patch: several class structs gain public fields (see
   `SceneEdge::bezier` is unchanged and still ends on the border (hosts draw
   their own heads along its end tangent), the painted curve stays within a
   pixel of it outside the head beyond two head lengths of the tip, and
-  `Scene::edge_at` / `hits_in_rect` follow the painted stroke. Marker ids:
+  `Scene::edge_at` / `hits_in_rect` follow the painted stroke — at their
+  old speed: `to_svg` squares each end once (the crossing casing reuses
+  the strokes it paints), and picking squares an end only where that can
+  change the answer (near its tip, close to the curve), so a marquee or a
+  pointer away from the arrowheads costs what it did. Marker ids:
   a `linkStyle` width no longer needs a size variant, so the `-u` ids
   (`arrow-u`, `arrow-u__<colour>`) are gone — a coloured end is
   `<base id>_<colour>` (`arrow__ff3`), a stroke wider than 5.5 px gets

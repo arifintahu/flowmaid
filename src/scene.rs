@@ -427,51 +427,86 @@ impl PickTarget for PickRect {
 /// are flattened. Once a part touches the target (distance 0) nothing
 /// nearer can follow, and the rest of the walk is skipped.
 fn edge_distance<T: PickTarget>(e: &SceneEdge, target: T, reach: f64) -> f64 {
-    let mut best = f64::INFINITY;
-    let mut probe = |seg_start: (f64, f64), seg: Seg| {
-        if best <= 0.0 {
-            return;
+    let walk = |start: (f64, f64), segs: &[Seg], reach: f64| {
+        let mut best = f64::INFINITY;
+        let mut cur = start;
+        for &seg in segs {
+            if best <= 0.0 {
+                break;
+            }
+            let lim = best.min(reach);
+            let d = match seg {
+                Seg::L(p) => target.seg_dist(cur, p),
+                // A quadratic is the cubic with its control points 2/3
+                // of the way toward the shared one.
+                Seg::Q(c, p) => cubic_dist(
+                    target,
+                    &[cur, lerp(cur, c, 2.0 / 3.0), lerp(p, c, 2.0 / 3.0), p],
+                    lim,
+                    0,
+                ),
+                Seg::C(c1, c2, p) => cubic_dist(target, &[cur, c1, c2, p], lim, 0),
+            };
+            best = best.min(d);
+            cur = seg.end();
         }
-        let lim = best.min(reach);
-        let d = match seg {
-            Seg::L(p) => target.seg_dist(seg_start, p),
-            // A quadratic is the cubic with its control points 2/3 of
-            // the way toward the shared one.
-            Seg::Q(c, p) => cubic_dist(
-                target,
-                &[
-                    seg_start,
-                    lerp(seg_start, c, 2.0 / 3.0),
-                    lerp(p, c, 2.0 / 3.0),
-                    p,
-                ],
-                lim,
-                0,
-            ),
-            Seg::C(c1, c2, p) => cubic_dist(target, &[seg_start, c1, c2, p], lim, 0),
-        };
-        best = best.min(d);
+        best
     };
     // The very commands edge_path_d emits, span for span. Squaring an
-    // end ([`square_end`]) changes the curve only within
-    // SQUARE_END_REACH of that end: a target farther from both ends than
-    // that and `reach` is measured on the scene curve alone, so a
-    // pointer move far from every tip never squares an end.
+    // end ([`square_end`]) costs far more than a pick, so it is done only
+    // where it can change the answer. It changes nothing farther than
+    // SQUARE_END_REACH from that end's tip (`far`), and keeps the tip
+    // itself; outside the head its new stretch keeps within
+    // SQUARE_END_PICK_SLACK of the scene curve, and under the head
+    // within SQUARE_END_HEAD_REACH of the tip. So the scene curve's own
+    // distance (`d`, measured out to `reach` and that slack) settles the
+    // pick whenever it is nearer than everything the end could change,
+    // or when even the nearest the new stretch could come is out of
+    // reach — a pointer away from every tip, or right on a line, never
+    // squares an end; one away from every tip measures the curve alone,
+    // as far out as `reach`.
     let (start, segs) = plain_segs(e, |p| p);
-    let tip = segs.last().map_or(start, |s| s.end());
-    let near = |q: (f64, f64)| target.box_gap(q.0, q.1, q.0, q.1) <= SQUARE_END_REACH + reach;
-    let (start, segs) = if near(start) || near(tip) {
-        let (start, segs, _) = square_ends(e, start, segs);
-        (start, segs)
-    } else {
-        (start, segs)
-    };
-    let mut cur = start;
-    for seg in segs {
-        probe(cur, seg);
-        cur = seg.end();
+    let ends = squared_ends(e);
+    if ends == [false; 2] {
+        return walk(start, &segs, reach);
     }
-    best
+    let tip = segs.last().map_or(start, |s| s.end());
+    let gap = |q: (f64, f64)| target.box_gap(q.0, q.1, q.0, q.1);
+    let tips = [start, tip];
+    if (0..2).any(|k| ends[k] && gap(tips[k]) <= 0.0) {
+        return 0.0; // on a tip, which the squared stroke keeps
+    }
+    let near = walk(start, &segs, reach);
+    let far = |k: usize| (gap(tips[k]) - SQUARE_END_REACH).max(0.0);
+    if (0..2).all(|k| !ends[k] || far(k) > reach) {
+        return near;
+    }
+    let d = if near <= reach {
+        near
+    } else {
+        walk(start, &segs, reach + SQUARE_END_PICK_SLACK)
+    };
+    // Whether squaring end k could change `answer`, the distance to a
+    // path that has that end as the scene curve has it.
+    let open = |k: usize, answer: f64| {
+        let far = far(k);
+        let nearest = (d - SQUARE_END_PICK_SLACK).min(gap(tips[k]) - SQUARE_END_HEAD_REACH);
+        ends[k] && far <= reach && far <= answer && nearest <= reach
+    };
+    if !open(0, d) && !open(1, d) {
+        return d;
+    }
+    // The target end alone squares exactly as with both; the source end
+    // only after it.
+    if !open(0, d) {
+        let (s, g, _) = square_ends_of(e, start, segs.clone(), [false, true]);
+        let d1 = walk(s, &g, reach);
+        if !open(0, d1) {
+            return d1;
+        }
+    }
+    let (s, g, _) = square_ends(e, start, segs);
+    walk(s, &g, reach)
 }
 
 /// `a + (b - a) * t`.
@@ -545,8 +580,31 @@ pub(crate) fn edge_polyline(e: &SceneEdge) -> Vec<(f64, f64)> {
 /// What the crossing casing cuts gaps in and the quality yardstick
 /// measures.
 pub(crate) fn edge_painted_polyline(e: &SceneEdge) -> Vec<(f64, f64)> {
+    painted_polyline(e, &painted_edge(e))
+}
+
+/// The stroke the flowchart painter draws for `e`, worked out once per
+/// paint: its scene curve ([`plain_segs`], scene coordinates) with each
+/// glyph end squared ([`square_ends`]), whole (uncut by the arrow
+/// trims). [`to_svg`] strokes it ([`painted_path_d`]) and hands its
+/// samples ([`painted_polyline`]) to the crossing casing, so no paint
+/// squares an end twice.
+pub(crate) struct PaintedEdge {
+    start: (f64, f64),
+    segs: Vec<Seg>,
+    cuts: Cuts,
+}
+
+/// [`PaintedEdge`] of `e`.
+pub(crate) fn painted_edge(e: &SceneEdge) -> PaintedEdge {
     let (start, segs) = plain_segs(e, |p| p);
     let (start, segs, cuts) = square_ends(e, start, segs);
+    PaintedEdge { start, segs, cuts }
+}
+
+/// [`edge_painted_polyline`] of `e` from its [`PaintedEdge`] `p`.
+pub(crate) fn painted_polyline(e: &SceneEdge, p: &PaintedEdge) -> Vec<(f64, f64)> {
+    let (start, segs, cuts) = (p.start, &p.segs, p.cuts);
     let orig = edge_polyline(e);
     if cuts == [None, None] {
         return orig;
@@ -827,7 +885,32 @@ fn plain_segs(e: &SceneEdge, t: impl Fn((f64, f64)) -> (f64, f64)) -> ((f64, f64
 /// a [`GLYPH_STUB`] — a mermaid `curve` is the author's and only gets
 /// what its head needs.
 fn square_ends(e: &SceneEdge, start: (f64, f64), segs: Vec<Seg>) -> ((f64, f64), Vec<Seg>, Cuts) {
+    square_ends_of(e, start, segs, [true; 2])
+}
+
+/// Which ends of `e` [`square_ends`] may change, as (source, target):
+/// those with an end glyph, on an edge the flowchart painter strokes
+/// (not a self-loop).
+fn squared_ends(e: &SceneEdge) -> [bool; 2] {
     if e.paint_width.is_some() || e.from == e.to || !edge_drawn(e) {
+        return [false; 2];
+    }
+    [
+        e.ends.start_marker(e.kind).is_some(),
+        e.ends.end_marker(e.kind).is_some(),
+    ]
+}
+
+/// [`square_ends`] of the ends `which` (source, target) alone. The
+/// target is squared first, so squaring it alone gives that end exactly
+/// as squaring both does (the source is squared on the result).
+fn square_ends_of(
+    e: &SceneEdge,
+    start: (f64, f64),
+    segs: Vec<Seg>,
+    which: [bool; 2],
+) -> ((f64, f64), Vec<Seg>, Cuts) {
+    if squared_ends(e) == [false; 2] {
         return (start, segs, [None; 2]);
     }
     let author = e.meta.curve.is_some_and(|c| c != EdgeCurve::Basis);
@@ -844,7 +927,9 @@ fn square_ends(e: &SceneEdge, start: (f64, f64), segs: Vec<Seg>) -> ((f64, f64),
         (false, e.ends.end_marker(e.kind), trims.1),
         (true, e.ends.start_marker(e.kind), trims.0),
     ] {
-        let Some(m) = m else { continue };
+        let Some(m) = m.filter(|_| which[usize::from(!at_start)]) else {
+            continue;
+        };
         let want = if author { trim } else { GLYPH_STUB.max(trim) };
         let head = if m == Marker::Arrow { head } else { None };
         if at_start {
@@ -900,10 +985,34 @@ const SQUARE_END_RUNS: [f64; 3] = [1.0, 0.75, 0.5];
 /// Lengths (in [`GLYPH_STUB`]s) of the bend from the curve into the
 /// straight run that [`square_end`] tries, gentlest first.
 const SQUARE_END_BENDS: [f64; 5] = [3.0, 2.0, 1.5, 1.0, 0.5];
-/// How far (px) from its end a squared end's new stretch can lie: the
-/// longest run and bend, and the bend's handles (a third of its chord
-/// each) beyond them — twice that, to spare.
-const SQUARE_END_REACH: f64 = 2.0 * (GLYPH_STUB + ARROW_MARKER_PX + 3.0 * GLYPH_STUB);
+/// Most (px of arc) a squared end ([`square_end`]) takes off the curve
+/// it replaces: the longest run it wants (a [`GLYPH_STUB`], or an
+/// arrowhead's cut, which is never longer than a head) and the longest
+/// bend into it.
+const SQUARE_END_ARC: f64 = GLYPH_STUB + SQUARE_END_BENDS[0] * GLYPH_STUB;
+/// How far (px) from its end anything a squared end changes can lie:
+/// the curve it replaces is at most [`SQUARE_END_ARC`] long, and the
+/// new stretch keeps within the hull of where it leaves the curve, the
+/// bend's handles (a third of its chord, which is at most that arc and
+/// a run long) and the run. Picking a target farther than this from an
+/// end measures the scene curve there instead ([`edge_distance`]).
+const SQUARE_END_REACH: f64 = SQUARE_END_ARC + (SQUARE_END_ARC + GLYPH_STUB) / 3.0 + 0.5;
+/// Most (px) a squared end that turns into its arrowhead from the side
+/// may stray from the scene curve outside the head ([`square_end`]'s
+/// straight entry and its last resort): a few px, two heads from the
+/// tip at most — farther, the head is left as the curve has it.
+const SQUARE_END_MAX_STRAY: f64 = 6.0;
+/// How far (px) any point of a squared end's new stretch can lie from
+/// the scene curve, outside its arrowhead: [`SQUARE_END_MAX_STRAY`]
+/// (bends that keep within a px take [`SQUARE_END_DEV`]), measured at
+/// samples a few px apart on a bend, so half that spacing more between
+/// them. Picking measures the scene curve alone wherever that settles
+/// it ([`edge_distance`]).
+const SQUARE_END_PICK_SLACK: f64 = SQUARE_END_MAX_STRAY + 3.0;
+/// How far (px) from the tip a squared end's points under its
+/// arrowhead can lie: inside the head's triangle (as long as the head,
+/// half as wide either side at its base), or on the run into the tip.
+const SQUARE_END_HEAD_REACH: f64 = ARROW_MARKER_PX * 1.12;
 /// How far (px) up the end tangent beyond the arrow cut a curve that
 /// swings in from the side meets it ([`square_end`]): the last stretch
 /// before the cut runs along the tangent, so the head faces that way
@@ -958,6 +1067,8 @@ fn square_end(
     head: Option<f64>,
     share: f64,
 ) -> ((f64, f64), Vec<Seg>, Option<f64>) {
+    #[cfg(test)]
+    SQUARED.with(|c| c.set(c.get() + 1));
     let n = segs.len();
     if n == 0 || want <= 0.0 {
         return (start, segs, None);
@@ -972,14 +1083,17 @@ fn square_end(
     let Some(d) = end_heading(froms[n - 1], segs[n - 1]) else {
         return (start, segs, None);
     };
-    let lens: Vec<f64> = segs
+    // Each command's arc-length table, worked out once: every
+    // candidate below cuts the curve somewhere along its tail.
+    let tabs: Vec<[f64; TRIM_STEPS + 1]> = segs
         .iter()
         .zip(&froms)
-        .map(|(&s, &f)| seg_lengths(f, s)[TRIM_STEPS])
+        .map(|(&s, &f)| seg_lengths(f, s))
         .collect();
+    let lens: Vec<f64> = tabs.iter().map(|t| t[TRIM_STEPS]).collect();
     let total: f64 = lens.iter().sum();
     let longest = want + SQUARE_END_BENDS[0] * GLYPH_STUB;
-    let tail = tail_samples(&froms, &segs, &lens, longest.min(total));
+    let tail = tail_samples(&froms, &segs, &tabs, longest.min(total));
     // Off the end tangent (signed), and back along it from the end.
     let lat = |q: (f64, f64)| (q.0 - b.0) * d.1 - (q.1 - b.1) * d.0;
     let along = |q: (f64, f64)| (b.0 - q.0) * d.0 + (b.1 - q.1) * d.1;
@@ -1003,10 +1117,27 @@ fn square_end(
     for i in (0..n - 1).rev() {
         back[i] = back[i + 1] + lens[i + 1];
     }
-    // The curve kept up to `s_j` px of arc back from the end (its start,
-    // when shorter), as (its commands, where it stops, the heading
-    // there); `None` past this end's share or where it has no heading.
-    let keep = |s_j: f64| -> Option<Kept> {
+    // The finer arc tables of the pieces cut so far, by (command,
+    // piece): the candidates below all cut the same few pieces.
+    let pieces: std::cell::RefCell<Vec<(usize, usize, [f64; TRIM_STEPS + 1])>> =
+        std::cell::RefCell::new(Vec::new());
+    let param_at = |i: usize, len: f64| {
+        seg_param_with(froms[i], segs[i], len, &tabs[i], &mut |k| {
+            let mut c = pieces.borrow_mut();
+            if let Some(&(_, _, f)) = c.iter().find(|&&(ci, ck, _)| (ci, ck) == (i, k)) {
+                return f;
+            }
+            let f = piece_lengths(froms[i], segs[i], k);
+            c.push((i, k, f));
+            f
+        })
+    };
+    // Where the curve is cut `s_j` px of arc back from the end (its
+    // start, when shorter): the command and its parameter there, the
+    // point, and the heading; `None` past this end's share or where it
+    // has no heading. What is kept up to it ([`Kept`]) is built for the
+    // winning candidate alone.
+    let cut_at = |s_j: f64| -> Option<Kept> {
         if share < 1.0 && s_j > share * total + 1e-9 {
             return None;
         }
@@ -1014,47 +1145,62 @@ fn square_end(
             (0, 0.0)
         } else {
             let i = (0..n).find(|&i| back[i] <= s_j && s_j < back[i] + lens[i])?;
-            (
-                i,
-                seg_param_at(froms[i], segs[i], lens[i] - (s_j - back[i])),
-            )
+            (i, param_at(i, lens[i] - (s_j - back[i])))
         };
-        let mut out: Vec<Seg> = segs[..i].to_vec();
         let j = if u > 0.0 {
-            let (_, part) = segs[i].part(froms[i], 0.0, u);
-            out.push(part);
-            part.end()
+            segs[i].part(froms[i], 0.0, u).1.end()
         } else {
             froms[i]
         };
-        Some((out, j, seg_heading_at(froms[i], segs[i], u)?))
+        Some((i, u, j, seg_heading_at(froms[i], segs[i], u)?))
+    };
+    // The curve kept up to a cut ([`Kept`]), then `seg` into the run and
+    // the run into the end.
+    let joined = |(i, u, ..): Kept, seg: Seg| -> Vec<Seg> {
+        let mut out: Vec<Seg> = Vec::with_capacity(i + 3);
+        out.extend_from_slice(&segs[..i]);
+        if u > 0.0 {
+            out.push(segs[i].part(froms[i], 0.0, u).1);
+        }
+        out.extend([seg, Seg::L(b)]);
+        out
+    };
+    // A new stretch's samples: the cubic `seg` from `j`, then the run
+    // from its end into the end point.
+    let samples = |j: (f64, f64), seg: Seg| -> [(f64, f64); SQUARE_END_BEND_STEPS + 3] {
+        let bb = seg.cubic(j);
+        let mut pts = [b; SQUARE_END_BEND_STEPS + 3];
+        for (k, q) in pts.iter_mut().enumerate().take(SQUARE_END_BEND_STEPS + 1) {
+            *q = cubic_at(&bb, k as f64 / SQUARE_END_BEND_STEPS as f64);
+        }
+        pts[SQUARE_END_BEND_STEPS + 1] = lerp(seg.end(), b, 0.5);
+        pts
     };
     // How far the new stretch (sampled as `pts`) strays from the curve
     // it replaces (its last `s_j` px), outside the head: where it could
     // come nearer anything the curve kept clear of. What it leaves out
-    // only gives room.
-    let stray = |pts: &[(f64, f64)], s_j: f64| {
-        let old: Vec<(f64, f64)> = tail
+    // only gives room. `None` once it is over `limit`: every caller
+    // only wants a stray within some bound (or the least of several),
+    // so a candidate stops being measured the moment it cannot be had.
+    let tail_pts: Vec<(f64, f64)> = tail.iter().map(|&(_, q)| q).collect();
+    let tail_boxes = stray_boxes(&tail_pts);
+    let stray = |pts: &[(f64, f64)], s_j: f64, limit: f64| -> Option<f64> {
+        let m = tail
             .iter()
             .take_while(|&&(s, _)| s <= s_j + SQUARE_END_STEP)
-            .map(|&(_, q)| q)
-            .collect();
-        pts.iter()
-            .filter(|&&q| !covered(q))
-            .map(|&q| {
-                old.windows(2)
-                    .map(|w| point_seg_dist(q.0, q.1, w[0], w[1]))
-                    .fold(f64::INFINITY, f64::min)
-            })
-            .fold(0.0, f64::max)
+            .count();
+        let outside = pts.iter().copied().filter(|&q| !covered(q));
+        stray_from(outside, &tail_pts[..m], &tail_boxes, limit)
     };
     // A straight run of `run` px, the bend into it leaving the curve
     // `run + bend` px back, smooth at both ends. As (stray, commands);
     // `None` for a bend that would bulge back up from the run before
-    // reaching it (a curve turning hard right at the end).
-    let smooth = |run: f64, bend: f64| -> Option<(f64, f64, Vec<Seg>)> {
+    // reaching it (a curve turning hard right at the end), or one
+    // straying over `limit`.
+    let smooth = |run: f64, bend: f64, limit: f64| -> Option<Candidate> {
         let s_j = run + bend;
-        let (mut out, j, tj) = keep(s_j)?;
+        let cut = cut_at(s_j)?;
+        let (j, tj) = (cut.2, cut.3);
         let p = (b.0 - d.0 * run, b.1 - d.1 * run);
         let k = (p.0 - j.0).hypot(p.1 - j.1) / 3.0;
         let bent = Seg::C(
@@ -1062,16 +1208,14 @@ fn square_end(
             (p.0 - d.0 * k, p.1 - d.1 * k),
             p,
         );
-        let bb = bent.cubic(j);
-        let mut pts: Vec<(f64, f64)> = (0..=SQUARE_END_BEND_STEPS)
-            .map(|k| cubic_at(&bb, k as f64 / SQUARE_END_BEND_STEPS as f64))
-            .collect();
-        if pts.windows(2).any(|w| along(w[1]) > along(w[0]) + 1e-9) {
+        let pts = samples(j, bent);
+        if pts[..=SQUARE_END_BEND_STEPS]
+            .windows(2)
+            .any(|w| along(w[1]) > along(w[0]) + 1e-9)
+        {
             return None;
         }
-        pts.extend([lerp(p, b, 0.5), b]);
-        out.extend([bent, Seg::L(b)]);
-        Some((stray(&pts, s_j), s_j.min(total), out))
+        Some((stray(&pts, s_j, limit)?, s_j.min(total), cut, bent))
     };
     // A curve swinging in from the side right at its end: it is kept up
     // to where the line from a point `run_in` px up the end tangent
@@ -1080,7 +1224,7 @@ fn square_end(
     // the corner onto the tangent hidden under the head — and on along
     // the tangent into the end.
     let run_in = need + SQUARE_END_ENTRY;
-    let entry = || -> Option<(f64, f64, Vec<Seg>)> {
+    let entry = || -> Option<Candidate> {
         let p = (b.0 - d.0 * run_in, b.1 - d.1 * run_in);
         let lim = SQUARE_END_ENTRY_REACH.min(if share < 1.0 { share * total } else { total });
         let turn = |k: usize| {
@@ -1097,9 +1241,10 @@ fn square_end(
         };
         // Off the curve along its own heading at sample k, so the entry
         // leaves it smoothly, then straight at the corner. As (stray, how
-        // far back it leaves the curve, commands).
-        let at = |k: usize| -> Option<(f64, f64, Vec<Seg>)> {
-            let (mut out, j, tj) = keep(tail[k].0)?;
+        // far back it leaves the curve, commands); `None` past `limit`.
+        let at = |k: usize, limit: f64| -> Option<Candidate> {
+            let cut = cut_at(tail[k].0)?;
+            let (j, tj) = (cut.2, cut.3);
             let len = (p.0 - j.0).hypot(p.1 - j.1);
             let h = len / 3.0;
             let dir = ((p.0 - j.0) / len, (p.1 - j.1) / len);
@@ -1108,13 +1253,12 @@ fn square_end(
                 (p.0 - dir.0 * h, p.1 - dir.1 * h),
                 p,
             );
-            let bb = into.cubic(j);
-            let mut pts: Vec<(f64, f64)> = (0..=SQUARE_END_BEND_STEPS)
-                .map(|k| cubic_at(&bb, k as f64 / SQUARE_END_BEND_STEPS as f64))
-                .collect();
-            pts.extend([lerp(p, b, 0.5), b]);
-            out.extend([into, Seg::L(b)]);
-            Some((stray(&pts, tail[k].0), tail[k].0, out))
+            Some((
+                stray(&samples(j, into), tail[k].0, limit)?,
+                tail[k].0,
+                cut,
+                into,
+            ))
         };
         // Where it strays least, the line nearest touching the curve
         // among equals — leaving it no nearer the end along the tangent
@@ -1133,17 +1277,30 @@ fn square_end(
             let k = ks
                 .into_iter()
                 .min_by(|&x, &y| turn(x).total_cmp(&turn(y)))?;
-            return at(k);
+            return at(k, SQUARE_END_MAX_STRAY);
         }
-        far.iter()
-            .step_by(SQUARE_END_ENTRY_STEP)
-            .chain(far.last())
-            .filter_map(|&k| at(k).map(|c| (turn(k), c)))
-            .min_by(|a, b| {
-                let key = |c: &(f64, (f64, f64, Vec<Seg>))| (c.1 .0 * 100.0).round();
-                key(a).total_cmp(&key(b)).then(a.0.total_cmp(&b.0))
-            })
-            .map(|(_, c)| c)
+        // The least stray to the 0.01 px, the first such of least turn
+        // among equals; a candidate stops being measured once its stray
+        // rounds above the best so far.
+        let key = |s: f64| (s * 100.0).round();
+        let mut best: Option<(f64, Candidate)> = None;
+        for &k in far.iter().step_by(SQUARE_END_ENTRY_STEP).chain(far.last()) {
+            let limit = best
+                .as_ref()
+                .map_or(SQUARE_END_MAX_STRAY, |b| (key(b.1 .0) + 0.51) / 100.0);
+            let Some(c) = at(k, limit) else { continue };
+            let tk = turn(k);
+            let better = best.as_ref().map_or(true, |b| {
+                key(c.0)
+                    .total_cmp(&key(b.1 .0))
+                    .then(tk.total_cmp(&b.0))
+                    .is_lt()
+            });
+            if better {
+                best = Some((tk, c));
+            }
+        }
+        best.map(|(_, c)| c)
     };
     // The first bend that keeps within the stray with a run longer than
     // the head's own cut (the stroke reaching the head's base already
@@ -1156,10 +1313,10 @@ fn square_end(
     let bent = runs.iter().find_map(|&run| {
         SQUARE_END_BENDS
             .iter()
-            .find_map(|&bend| smooth(run, bend * GLYPH_STUB).filter(|c| c.0 <= SQUARE_END_DEV))
+            .find_map(|&bend| smooth(run, bend * GLYPH_STUB, SQUARE_END_DEV))
     });
-    if let Some((_, cut, out)) = bent {
-        return (start, out, Some(cut));
+    if let Some((_, cut, at, seg)) = bent {
+        return (start, joined(at, seg), Some(cut));
     }
     if need <= 0.0 {
         return (start, segs, None);
@@ -1171,22 +1328,142 @@ fn square_end(
     // touches it, and strays (up to a few px, for a curve swinging in
     // from the side) only within a head or two of the tip. A curve too
     // short for it: the bend into the cut straying least.
-    if let Some((_, cut, out)) = entry() {
-        return (start, out, Some(cut));
+    if let Some((_, cut, at, seg)) = entry() {
+        return (start, joined(at, seg), Some(cut));
     }
-    let best = SQUARE_END_BENDS
-        .iter()
-        .filter_map(|&bend| smooth(need, bend * GLYPH_STUB))
-        .min_by(|a, b| a.0.total_cmp(&b.0));
+    // The first of least stray (a later one must stray less to win).
+    let mut best: Option<Candidate> = None;
+    for &bend in &SQUARE_END_BENDS {
+        let limit = best.as_ref().map_or(SQUARE_END_MAX_STRAY, |b| b.0);
+        if let Some(c) = smooth(need, bend * GLYPH_STUB, limit) {
+            if best.as_ref().map_or(true, |b| c.0 < b.0) {
+                best = Some(c);
+            }
+        }
+    }
     match best {
-        Some((_, cut, out)) => (start, out, Some(cut)),
+        Some((_, cut, at, seg)) => (start, joined(at, seg), Some(cut)),
         None => (start, segs, None),
     }
 }
 
-/// A curve kept up to a point ([`square_end`]): its commands, where it
-/// stops, and its unit heading there.
-type Kept = (Vec<Seg>, (f64, f64), (f64, f64));
+#[cfg(test)]
+thread_local! {
+    /// How many ends [`square_end`] has squared on this thread: the
+    /// tests hold the painter and picking to squaring an end only where
+    /// it must.
+    static SQUARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Where [`square_end`] cuts a curve to keep it up to there: the
+/// command, its parameter, the point, and the unit heading there.
+type Kept = (usize, f64, (f64, f64), (f64, f64));
+
+/// A new stretch [`square_end`] weighs: its stray, how far back (px of
+/// arc) it leaves the curve, where it cuts it, and the cubic from the
+/// cut into the straight run.
+type Candidate = (f64, f64, Kept, Seg);
+
+/// Segments of a sampled tail [`stray_from`] boxes together.
+const STRAY_BLOCK: usize = 8;
+
+/// The bounding box `[x0, y0, x1, y1]` of each run of [`STRAY_BLOCK`]
+/// segments of the polyline `pts` (block `b` holds segments
+/// `b * STRAY_BLOCK ..`), for [`stray_from`] to pass over whole runs at
+/// once.
+fn stray_boxes(pts: &[(f64, f64)]) -> Vec<[f64; 4]> {
+    let nseg = pts.len().saturating_sub(1);
+    (0..nseg.div_ceil(STRAY_BLOCK))
+        .map(|b| {
+            let hi = ((b + 1) * STRAY_BLOCK).min(nseg);
+            pts[b * STRAY_BLOCK..=hi].iter().fold(
+                [
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ],
+                |[x0, y0, x1, y1], q| [x0.min(q.0), y0.min(q.1), x1.max(q.0), y1.max(q.1)],
+            )
+        })
+        .collect()
+}
+
+/// The largest distance from one of `pts` to the polyline `old`
+/// (infinity for one of fewer than two points), or `None` once it is
+/// over `limit` — exactly the max of the min distances, found without
+/// measuring every point against every segment. `boxes` are
+/// [`stray_boxes`] of a polyline `old` is a leading part of (a box of
+/// more points still bounds the ones `old` keeps). A point that lies
+/// within the largest distance so far of some segment cannot raise it,
+/// and the segment that was nearest the last point is tried first (the
+/// points run along `old`); only a point farther than that from all of
+/// `old` is measured to the end, skipping each run of segments whose
+/// box is no nearer than the best so far.
+fn stray_from(
+    pts: impl Iterator<Item = (f64, f64)>,
+    old: &[(f64, f64)],
+    boxes: &[[f64; 4]],
+    limit: f64,
+) -> Option<f64> {
+    let nseg = old.len().saturating_sub(1);
+    // Compared squared (no root per segment); the distance a point
+    // raises the max to is measured as `point_seg_dist` measures it.
+    let seg2 = |q: (f64, f64), k: usize| {
+        let (a, b) = (old[k], old[k + 1]);
+        let (abx, aby) = (b.0 - a.0, b.1 - a.1);
+        let len2 = abx * abx + aby * aby;
+        let t = if len2 <= f64::EPSILON {
+            0.0
+        } else {
+            (((q.0 - a.0) * abx + (q.1 - a.1) * aby) / len2).clamp(0.0, 1.0)
+        };
+        let (dx, dy) = (a.0 + t * abx - q.0, a.1 + t * aby - q.1);
+        dx * dx + dy * dy
+    };
+    let (mut worst, mut worst2): (f64, f64) = (0.0, 0.0);
+    let mut hint = 0;
+    for q in pts {
+        if nseg == 0 {
+            worst = f64::INFINITY;
+            break;
+        }
+        let mut best2 = seg2(q, hint);
+        if best2 <= worst2 {
+            continue;
+        }
+        let mut arg = hint;
+        'blocks: for (b, bx) in boxes.iter().enumerate() {
+            let lo = b * STRAY_BLOCK;
+            if lo >= nseg {
+                break;
+            }
+            let gx = (bx[0] - q.0).max(q.0 - bx[2]).max(0.0);
+            let gy = (bx[1] - q.1).max(q.1 - bx[3]).max(0.0);
+            if gx * gx + gy * gy >= best2 {
+                continue;
+            }
+            for k in lo..(lo + STRAY_BLOCK).min(nseg) {
+                let d2 = seg2(q, k);
+                if d2 < best2 {
+                    (best2, arg) = (d2, k);
+                    if best2 <= worst2 {
+                        break 'blocks;
+                    }
+                }
+            }
+        }
+        hint = arg;
+        if best2 > worst2 {
+            worst2 = best2;
+            worst = worst.max(point_seg_dist(q.0, q.1, old[arg], old[arg + 1]));
+            if worst > limit {
+                return None;
+            }
+        }
+    }
+    (worst <= limit).then_some(worst)
+}
 
 /// The unit heading of `seg` (from `from`) INTO its end, read off the
 /// nearest control point that is not the end itself; `None` for a
@@ -1231,13 +1508,13 @@ fn seg_heading_at(from: (f64, f64), seg: Seg, u: f64) -> Option<(f64, f64)> {
 }
 
 /// The last `reach` px of arc of a path (`froms[i]` where command `i`
-/// starts, `lens[i]` its length), end first, as (arc back from the
-/// end, point) every [`SQUARE_END_STEP`] px or so — the end itself and
-/// the stretch's far end included.
+/// starts, `tabs[i]` its [`seg_lengths`]), end first, as (arc back from
+/// the end, point) every [`SQUARE_END_STEP`] px or so — the end itself
+/// and the stretch's far end included.
 fn tail_samples(
     froms: &[(f64, f64)],
     segs: &[Seg],
-    lens: &[f64],
+    tabs: &[[f64; TRIM_STEPS + 1]],
     reach: f64,
 ) -> Vec<(f64, (f64, f64))> {
     let n = segs.len();
@@ -1248,14 +1525,14 @@ fn tail_samples(
         if left <= 0.0 {
             break;
         }
-        let len = lens[i];
+        let len = tabs[i][TRIM_STEPS];
         if len <= 0.0 {
             continue;
         }
         let u0 = if left >= len {
             0.0
         } else {
-            seg_param_at(froms[i], segs[i], len - left)
+            seg_param_in(froms[i], segs[i], len - left, &tabs[i])
         };
         let steps = (left.min(len) / SQUARE_END_STEP).ceil().max(1.0) as usize;
         let b = segs[i].cubic(froms[i]);
@@ -1310,7 +1587,7 @@ fn spline_segs(pts: &[(f64, f64)]) -> ((f64, f64), Vec<Seg>) {
 /// around. [`edge_polyline`] samples exactly this curve (picking) and
 /// [`edge_end_chord`] reads its ends (glyph placement). The flowchart
 /// painter strokes it less the stretch under an arrowhead
-/// ([`edge_path_d_painted`]).
+/// ([`painted_path_d`]).
 pub(crate) fn edge_path_d(e: &SceneEdge, t: impl Fn((f64, f64)) -> (f64, f64)) -> String {
     let (start, segs) = drawn_segs(e, t);
     curve_d(start, &segs, |p| p)
@@ -1336,13 +1613,26 @@ pub(crate) fn arrow_trims(e: &SceneEdge) -> (f64, f64) {
     )
 }
 
-/// The path `d` the flowchart painter strokes for `e`: [`edge_path_d`]
-/// cut back by [`arrow_trims`] at each end, the cut taken off the drawn
-/// curve by arc length. Painter-only — picking and the scene keep the
-/// whole curve (a host draws its own heads), and a curve too short to
-/// lose that much is stroked whole.
+/// [`painted_path_d`] of `e`, its stroke worked out afresh.
+#[cfg(test)]
 fn edge_path_d_painted(e: &SceneEdge, t: impl Fn((f64, f64)) -> (f64, f64)) -> String {
-    let (start, segs) = drawn_segs(e, t);
+    painted_path_d(e, &painted_edge(e), t)
+}
+
+/// The path `d` the flowchart painter strokes for `e`, mapped through
+/// `t`: [`edge_path_d`] (here from `e`'s [`PaintedEdge`] `p`) cut back
+/// by [`arrow_trims`] at each end, the cut taken off the drawn curve by
+/// arc length. Painter-only — picking and the scene keep the whole
+/// curve (a host draws its own heads), and a curve too short to lose
+/// that much is stroked whole. An edge with neither end squared is
+/// drawn off its scene curve mapped through `t` first ([`plain_segs`]),
+/// as the painter always drew it.
+fn painted_path_d(e: &SceneEdge, p: &PaintedEdge, t: impl Fn((f64, f64)) -> (f64, f64)) -> String {
+    let (start, segs) = if p.cuts == [None, None] {
+        plain_segs(e, t)
+    } else {
+        (t(p.start), p.segs.iter().map(|s| s.map(&t)).collect())
+    };
     let (t0, t3) = arrow_trims(e);
     let (start, segs) = trim_segs(start, segs, t0, t3);
     curve_d(start, &segs, |p| p)
@@ -1411,15 +1701,18 @@ fn seg_param_at(from: (f64, f64), seg: Seg, len: f64) -> f64 {
             0.0
         };
     }
-    let lens = seg_lengths(from, seg);
-    let k = lens.partition_point(|&l| l < len).clamp(1, TRIM_STEPS);
-    let (l0, l1) = (lens[k - 1], lens[k]);
-    if l1 <= l0 {
-        return (k - 1) as f64 / TRIM_STEPS as f64;
-    }
-    // Within the piece, by its own finer pieces (their lengths scaled to
-    // the piece's): the speed along a long cubic's piece varies, and a
-    // straight interpolation there is off by a tenth of a px.
+    seg_param_in(from, seg, len, &seg_lengths(from, seg))
+}
+
+/// [`seg_param_at`] of a command whose [`seg_lengths`] are `lens`
+/// (worked out once for a command measured many times).
+fn seg_param_in(from: (f64, f64), seg: Seg, len: f64, lens: &[f64; TRIM_STEPS + 1]) -> f64 {
+    seg_param_with(from, seg, len, lens, &mut |k| piece_lengths(from, seg, k))
+}
+
+/// Arc length of piece `k` (1-based, of [`TRIM_STEPS`]) of `seg` from
+/// `from`, from its start up to each of [`TRIM_STEPS`] finer steps.
+fn piece_lengths(from: (f64, f64), seg: Seg, k: usize) -> [f64; TRIM_STEPS + 1] {
     let b = seg.cubic(from);
     let (t0, t1) = (
         (k - 1) as f64 / TRIM_STEPS as f64,
@@ -1435,6 +1728,39 @@ fn seg_param_at(from: (f64, f64), seg: Seg, len: f64) -> f64 {
     for j in 1..=TRIM_STEPS {
         fine[j] += fine[j - 1];
     }
+    fine
+}
+
+/// [`seg_param_in`], piece `k`'s [`piece_lengths`] given by `piece(k)`
+/// (a caller cutting one curve many times keeps them).
+fn seg_param_with(
+    from: (f64, f64),
+    seg: Seg,
+    len: f64,
+    lens: &[f64; TRIM_STEPS + 1],
+    piece: &mut dyn FnMut(usize) -> [f64; TRIM_STEPS + 1],
+) -> f64 {
+    if let Seg::L(p) = seg {
+        let l = (p.0 - from.0).hypot(p.1 - from.1);
+        return if l > 0.0 {
+            (len / l).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+    let k = lens.partition_point(|&l| l < len).clamp(1, TRIM_STEPS);
+    let (l0, l1) = (lens[k - 1], lens[k]);
+    if l1 <= l0 {
+        return (k - 1) as f64 / TRIM_STEPS as f64;
+    }
+    // Within the piece, by its own finer pieces (their lengths scaled to
+    // the piece's): the speed along a long cubic's piece varies, and a
+    // straight interpolation there is off by a tenth of a px.
+    let (t0, t1) = (
+        (k - 1) as f64 / TRIM_STEPS as f64,
+        k as f64 / TRIM_STEPS as f64,
+    );
+    let fine = piece(k);
     let scale = (l1 - l0) / fine[TRIM_STEPS].max(f64::MIN_POSITIVE);
     let want = (len - l0) / scale;
     let j = fine.partition_point(|&l| l < want).clamp(1, TRIM_STEPS);
@@ -1460,34 +1786,47 @@ fn trim_segs(start: (f64, f64), segs: Vec<Seg>, t0: f64, t3: f64) -> ((f64, f64)
         froms.push(cur);
         cur = s.end();
     }
-    let lens: Vec<f64> = segs
-        .iter()
-        .zip(&froms)
-        .map(|(&s, &f)| seg_lengths(f, s)[TRIM_STEPS])
-        .collect();
-    let total: f64 = lens.iter().sum();
-    if total <= t0 + t3 + 1.0 {
+    // Each command's length, measured only once a cut or the length
+    // check below reaches it: a cut takes a few px off a long path.
+    let mut known: Vec<Option<f64>> = vec![None; segs.len()];
+    let mut len_of =
+        |i: usize| *known[i].get_or_insert_with(|| seg_lengths(froms[i], segs[i])[TRIM_STEPS]);
+    // Longer than both cuts and a pixel, summing from both ends until
+    // that is plain (the lengths are never negative).
+    let need = t0 + t3 + 1.0;
+    let (mut sum, mut lo, mut hi) = (0.0, 0, segs.len());
+    while sum <= need && lo < hi {
+        sum += len_of(lo);
+        lo += 1;
+        if sum <= need && lo < hi {
+            hi -= 1;
+            sum += len_of(hi);
+        }
+    }
+    if sum <= need {
         return (start, segs);
     }
     // (command index, parameter) where the kept part starts and ends.
     let (mut i0, mut u0) = (0, 0.0);
     let mut left = t0;
     while i0 < segs.len() && left > 0.0 {
-        if lens[i0] > left {
+        let l = len_of(i0);
+        if l > left {
             u0 = seg_param_at(froms[i0], segs[i0], left);
             break;
         }
-        left -= lens[i0];
+        left -= l;
         i0 += 1;
     }
     let (mut i3, mut u3) = (segs.len() - 1, 1.0);
     let mut left = t3;
     while left > 0.0 {
-        if lens[i3] > left {
-            u3 = seg_param_at(froms[i3], segs[i3], lens[i3] - left);
+        let l = len_of(i3);
+        if l > left {
+            u3 = seg_param_at(froms[i3], segs[i3], l - left);
             break;
         }
-        left -= lens[i3];
+        left -= l;
         i3 -= 1;
     }
     let mut out = Vec::with_capacity(i3 + 1 - i0);
@@ -1552,7 +1891,7 @@ pub(crate) fn edge_end_chord(
 /// One end of an edge's DRAWN curve as `(tip, heading)`: the end point
 /// and the unit direction its end glyph faces, the way an
 /// `orient="auto"` marker reads it off the path the flowchart painter
-/// strokes ([`edge_path_d_painted`], cut short under an arrowhead) — the
+/// strokes ([`painted_path_d`], cut short under an arrowhead) — the
 /// curve's heading INTO the end at the target, the reverse of the way it
 /// sets off at the source. Read off the control point next to the
 /// stroke's end (a coincident one defers to the next): along the
@@ -3895,7 +4234,7 @@ fn edge_markers(edges: &[SceneEdge]) -> EdgeMarkers {
 /// [`ARROW_MARKER_PX`] in user space and oriented along the drawn end.
 /// An arrow's `refX` puts its tip on the end point although the painter
 /// stops the stroke `trim` px short of it ([`arrow_trims`],
-/// [`edge_path_d_painted`]); a cross or circle sits just outside the
+/// [`painted_path_d`]); a cross or circle sits just outside the
 /// node, the stroke still running to the border beneath it.
 fn marker_def(id: &str, m: Marker, start: bool, color: &str, trim: f64) -> String {
     let px = ARROW_MARKER_PX;
@@ -4162,7 +4501,18 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
     let mut s = String::new();
     svg_open_root(&mut s, width, height, 14, title, desc, dom_id, opts);
     let markers = edge_markers(&sc.edges);
-    let casing = crate::casing::masks(sc, &t, dom_id);
+    // Each drawn edge's stroke, worked out once for the casing and the
+    // paths both.
+    let painted: Vec<Option<PaintedEdge>> = sc
+        .edges
+        .iter()
+        .map(|e| edge_drawn(e).then(|| painted_edge(e)))
+        .collect();
+    let line_of = |i: usize| match &painted[i] {
+        Some(p) => painted_polyline(&sc.edges[i], p),
+        None => edge_polyline(&sc.edges[i]),
+    };
+    let casing = crate::casing::masks(sc, &line_of, &t, dom_id);
     s.push_str(&format!(
         "<defs>{}{}{}{}{}</defs>\n",
         marker_def(
@@ -4244,7 +4594,10 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
         );
         // The arrow marker orients to the end tangent of the stroke,
         // which stops short under an arrowhead.
-        let path_d = edge_path_d_painted(e, t);
+        let path_d = match &painted[i] {
+            Some(p) => painted_path_d(e, p, t),
+            None => continue,
+        };
         // <title> child = screen-reader / hover description (issue #16).
         // A two-way edge reads ↔ rather than →.
         let dir = if e.ends.start_marker(e.kind).is_some() {
@@ -9054,6 +9407,158 @@ mod tests {
         };
         let tilt = (p.0 - c2.0).atan2(p.1 - c2.1).to_degrees().abs();
         assert!(tilt > 5.0, "{tilt}");
+    }
+
+    /// Every flowchart and state fixture's scene, by file name.
+    fn flow_fixture_scenes() -> Vec<(String, Scene)> {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut files: Vec<std::path::PathBuf> = ["tests/fixtures/quality", "examples"]
+            .iter()
+            .flat_map(|d| std::fs::read_dir(format!("{root}/{d}")).unwrap())
+            .map(|f| f.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "mmd"))
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .filter_map(|f| {
+                let src = std::fs::read_to_string(f).unwrap();
+                match crate::parser::parse_document(&src) {
+                    Ok(crate::model::Document::Flowchart(g) | crate::model::Document::State(g)) => {
+                        Some((f.file_name()?.to_string_lossy().into_owned(), scene(&g)))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    fn squared_count() -> usize {
+        SQUARED.with(|c| c.get())
+    }
+
+    /// B1 review (r3 #1): a paint squares each glyph end once — the
+    /// casing's crossings, its masks and the paths share one
+    /// [`PaintedEdge`] per edge (it squared every end three times, the
+    /// SVG of a 200-node chart taking ten times as long).
+    #[test]
+    fn a_paint_squares_each_glyph_end_once() {
+        let mut checked = 0;
+        for (name, sc) in flow_fixture_scenes() {
+            let ends: usize = sc
+                .edges
+                .iter()
+                .map(|e| squared_ends(e).iter().filter(|&&b| b).count())
+                .sum();
+            let before = squared_count();
+            let svg = to_svg(&sc);
+            assert_eq!(squared_count() - before, ends, "{name}");
+            checked += usize::from(svg.contains("<mask") && ends > 0);
+        }
+        assert!(checked >= 3, "fixtures with casing masks: {checked}");
+    }
+
+    /// The pick distance as squaring both ends every time measures it:
+    /// the reference [`edge_distance`]'s shortcuts must agree with.
+    fn edge_distance_squaring_always<T: PickTarget>(e: &SceneEdge, target: T, reach: f64) -> f64 {
+        let (start, segs) = drawn_segs(e, |p| p);
+        let mut best = f64::INFINITY;
+        let mut cur = start;
+        for seg in segs {
+            let lim = best.min(reach);
+            let d = cubic_dist(target, &seg.cubic(cur), lim, 0);
+            best = best.min(d);
+            cur = seg.end();
+        }
+        best
+    }
+
+    /// B1 review (r3 #2): picking squares an end only where squaring can
+    /// change the answer — a marquee over the whole canvas squares none,
+    /// nor does a pointer far from every tip — and gives exactly what
+    /// measuring the squared curve every time gives: the same edges in
+    /// reach, at the same distance (to the flattening's 0.05 px).
+    #[test]
+    fn picking_squares_ends_only_where_it_can_change_the_answer() {
+        let (mut probes, mut squarings, mut near_tip) = (0usize, 0usize, 0usize);
+        for (name, sc) in flow_fixture_scenes() {
+            let before = squared_count();
+            let all = sc.hits_in_rect(-50.0, -50.0, sc.width + 50.0, sc.height + 50.0);
+            assert_eq!(squared_count(), before, "{name}: whole-canvas marquee");
+            let drawn = sc.edges.iter().filter(|e| edge_drawn(e)).count();
+            let edges = all.iter().filter(|h| matches!(h, Hit::Edge(_))).count();
+            assert_eq!(edges, drawn, "{name}");
+            // A pointer grid, and small marquees, against the reference.
+            let step = (sc.width * sc.height / 1500.0).sqrt().max(6.0);
+            let mut y = -10.0;
+            while y < sc.height + 10.0 {
+                let mut x = -10.0;
+                while x < sc.width + 10.0 {
+                    for e in sc.edges.iter().filter(|e| edge_drawn(e)) {
+                        let half = edge_stroke_width(e) / 2.0;
+                        let reach = 4.0 + half;
+                        let before = squared_count();
+                        let got = edge_distance(e, (x, y), reach);
+                        let tips = {
+                            let (st, sg) = plain_segs(e, |p| p);
+                            [st, sg.last().map_or(st, |g| g.end())]
+                        };
+                        let tip_gap = tips
+                            .iter()
+                            .map(|t| (t.0 - x).hypot(t.1 - y))
+                            .fold(f64::INFINITY, f64::min);
+                        let squared = squared_count() - before;
+                        squarings += usize::from(squared > 0);
+                        let far = tip_gap > SQUARE_END_REACH + reach;
+                        if far {
+                            assert_eq!(squared, 0, "{name}: far from both tips");
+                        } else {
+                            near_tip += 1;
+                        }
+                        probes += 1;
+                        if far && got > reach + 1.0 {
+                            continue; // the scene curve settles it (nothing squared)
+                        }
+                        // Equal up to the flattening (a squared end's
+                        // kept part is a piece of the scene's cubic, flattened
+                        // into other chords).
+                        let want = edge_distance_squaring_always(e, (x, y), reach);
+                        let tol = 0.06;
+                        if want <= reach - tol {
+                            assert!((got - want).abs() <= tol, "{name}: {x},{y} {got} vs {want}");
+                        } else if want > reach + tol {
+                            assert!(got > reach, "{name}: {x},{y} {got} vs {want}");
+                        }
+                        let r = PickRect {
+                            x0: x,
+                            y0: y,
+                            x1: x + step / 3.0,
+                            y1: y + step / 5.0,
+                        };
+                        let (got, want) = (
+                            edge_distance(e, r, half),
+                            edge_distance_squaring_always(e, r, half),
+                        );
+                        if want <= half - tol || want > half + tol {
+                            assert_eq!(got <= half, want <= half, "{name}: rect at {x},{y}");
+                        }
+                    }
+                    x += step;
+                }
+                y += step;
+            }
+        }
+        assert!(
+            probes > 100_000 && near_tip > 5_000,
+            "{probes} probes, {near_tip} near a tip"
+        );
+        // Squaring is the exception: well under a tenth of the probes
+        // near a tip (each on an edge whose curve passes near the
+        // pointer there).
+        assert!(
+            squarings * 10 < near_tip,
+            "{squarings} squarings, {near_tip} near a tip"
+        );
     }
 
     #[test]
