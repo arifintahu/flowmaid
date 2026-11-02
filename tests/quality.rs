@@ -150,13 +150,15 @@ fn quality_gate() {
 /// in from the side now enter their heads along the line touching their
 /// curve instead of an S hugging it, and that line runs 9 and 3 px
 /// longer within reach of the frame's left border; no route changed.
-/// B3 (report §2.2): 2140 -> 2070 routed; static 1082 -> 1120 — in
+/// B3 (report §2.2): 2140 -> 2070 routed; static 1082 -> 1020 — in
 /// bench-75 the back-edges no longer bow through the zones but run in
 /// lanes clear of every node (its static drawing crosses 15 fewer edges,
-/// defects 13 -> 5), so `svc4 -> logs`, which the router used to redraw
-/// round `alerts -> gw`'s bow, keeps the channel the layout gave it, and
-/// that channel's first 99 px run along the app frame's right border.
-const BORDER_LEN_MAX: (f64, f64) = (1_120.0, 2_070.0);
+/// defects 13 -> 5), and `svc4 -> logs`, which the router used to redraw
+/// round `alerts -> gw`'s bow and whose layout channel rides the app
+/// frame's right border for 99 px, is searched on past a first
+/// candidate that does not beat it (`router::repair`) and leaves the
+/// border (`dense-td`'s `n21 -> n16`, a 63 px ride, is a reversed S now).
+const BORDER_LEN_MAX: (f64, f64) = (1_020.0, 2_070.0);
 
 /// Edges keep off frame borders where their channel has room (G4).
 #[test]
@@ -337,16 +339,15 @@ fn crossing_gaps_do_not_read_as_dashes() {
 /// the chip spacing off title chips (a reroute that used
 /// to slip past a chip now takes a lane beside another leg); routed hug
 /// 4 440 -> 3 700 with the rescue and detour lanes kept off borders.
-/// B3 (back-edge lanes): static hug 3 110 -> 3 180 — bench-75's
-/// `svc4 -> logs` keeps the channel along the app frame's border (see
-/// `BORDER_LEN_MAX`, 162 px within reach of it) — while routed hug drops
-/// 3 667 -> 3 447, tight 9 224 -> 8 174 static and 20 942 -> 19 120
-/// routed, overlap 2 746 -> 2 390 and 7 594 -> 6 748.
+/// B3 (back-edge lanes): static hug 3 110 -> 3 010 (bench-75's
+/// `svc4 -> logs` off the app frame's border, see `BORDER_LEN_MAX`),
+/// routed hug 3 667 -> 3 447, tight 9 224 -> 8 142 static and
+/// 20 942 -> 19 120 routed, overlap 2 746 -> 2 390 and 7 594 -> 6 748.
 const CHANNEL_MAX: [(&str, f64, f64); 4] = [
     ("overlap_len", 2_920.0, 7_620.0),
     ("overlap_max", 400.0, 1_290.0),
     ("tight_len", 9_350.0, 21_900.0),
-    ("hug_len", 3_180.0, 3_700.0),
+    ("hug_len", 3_010.0, 3_700.0),
 ];
 
 /// Most edges (over all fixtures, per mode) that pass a title chip
@@ -450,44 +451,47 @@ fn channels_keep_edges_apart_and_off_chips() {
 /// beside what lies between its ends, or across the gap when nothing
 /// does and its ends lie near enough across the flow, so the obstacle
 /// bows are gone and so are their grazing ends (end_tilt 14 | 19 ->
-/// 9 | 11, end_tilt_max 86.3 -> 76.8 static, end_kink 60 | 77 ->
-/// 56 | 71) and the escapes from an edge's own frame (own_frame 1 / 32 px
+/// 8 | 11, end_tilt_max 86.3 -> 76.8 static, end_kink 60 | 77 ->
+/// 55 | 71) and the escapes from an edge's own frame (own_frame 1 / 32 px
 /// -> 0); the lanes nest without crossing, are planned on the edges as
 /// drawn and handed to the router first, so the drawings cross less
 /// (x_drawn 521 | 517 -> 505 | 508; bench-75 364 | 377 -> 349 | 375) and
-/// cable less (band_pairs 93 | 118 -> 90 | 101, band_len 41 640 -> 40 580
-/// static); lat_backtrack 1 902 -> 1 828 static, lat_wiggles 19 -> 16
-/// routed. idiom_bow 7 | 8 -> 2 | 1: what is left are wide-labels'
+/// cable less (band_pairs 93 | 118 -> 91 | 101, band_len 41 640 -> 41 064
+/// static: 40 580 until bench-75's `svc4 -> logs` left the app frame's
+/// border, see `BORDER_LEN_MAX`, for a channel beside `metrics -> dash`
+/// and `svc5 -> objects`, 484 px of cable for 261 px along the border
+/// and a wiggle); lat_backtrack 1 902 -> 1 813 static, lat_wiggles
+/// 19 -> 16 routed, idiom_spline 25 -> 23 static (`svc4 -> logs` is
+/// orthogonal now). idiom_bow 7 | 8 -> 2 | 1: what is left are wide-labels'
 /// labelled 2-cycle, whose two curves bow apart by a label's height so
 /// each label rides its own line (it covered its twin). Raised, as
 /// intended drawing changes: an adjacent-layer back-edge is drawn
 /// across its gap as a reversed S (report §2.2 fix 4), so idiom_scubic
 /// 60 -> 61 static (dense-td's `n21 -> n16` 2-cycle, bench-75's reversed
 /// `svc4 -> cache` / `svc4 -> db` where a bow was) and idiom_spline
-/// 21 -> 22 routed (bench-75); lat_wiggles 16 -> 17 static (wide-labels'
-/// `query by primary key` edge one bump sideways past the bowed twins,
-/// bench-75's `svc4 -> logs` channel kept, see `BORDER_LEN_MAX`);
-/// routed lat_backtrack 676 -> 696 (wide-labels' `health probe` steps
-/// below the return edge's label, 14.5 px, and bench-75's 586 -> 592)
+/// 21 -> 22 routed (bench-75); routed lat_backtrack 676 -> 696
+/// (wide-labels' `health probe`, whose route() curve ran under the
+/// bowed return edge's label, is rerouted below it and steps 14.5 px
+/// up into its target's side; bench-75's 586 -> 592)
 /// and band_len 46 246 -> 47 104 (dense-td's `n43 -> n16`, whose ends
 /// lie 2 000 px apart across one gap, now runs in a lane beside its
 /// twin instead of sweeping along the gap through 8 edges).
 const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
-    ("end_tilt", 9.0, 11.0),
+    ("end_tilt", 8.0, 11.0),
     ("end_tilt_max", 76.8, 128.4),
     ("end_gaps", 11.0, 11.0),
     ("end_gap_max", 4.7, 4.7),
-    ("lat_wiggles", 17.0, 16.0),
-    ("lat_backtrack", 1_828.0, 696.1),
+    ("lat_wiggles", 16.0, 16.0),
+    ("lat_backtrack", 1_813.0, 696.1),
     ("own_frame_x", 0.0, 0.0),
     ("own_frame_len", 0.0, 0.0),
-    ("band_pairs", 90.0, 101.0),
-    ("band_len", 40_580.0, 47_104.0),
+    ("band_pairs", 91.0, 101.0),
+    ("band_len", 41_064.0, 47_104.0),
     ("idiom_scubic", 61.0, 81.0),
-    ("idiom_spline", 24.0, 22.0),
+    ("idiom_spline", 23.0, 22.0),
     ("idiom_bow", 2.0, 1.0),
     ("x_drawn", 505.0, 508.0),
-    ("end_kink", 56.0, 71.0),
+    ("end_kink", 55.0, 71.0),
     ("ink_out", 0.0, 0.0),
 ];
 

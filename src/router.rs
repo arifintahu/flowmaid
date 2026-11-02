@@ -4533,7 +4533,19 @@ pub(crate) fn repair(g: &Graph, sc: &mut Scene, cx: &Ctx, mode: Mode, moved: &mu
             if best.as_ref().map_or(true, |b| s < b.0) {
                 best = Some((s, corners, pts));
             }
-            if s.hard() == 0 && s.wiggle == 0 && lone {
+            // A soft edge in the static scene (cramped, or riding a
+            // border, nothing broken) searches on while what it found
+            // does not beat its original: the wider lattice may
+            // (bench-75's `svc4 -> logs` rode the app frame's border for
+            // 99 px because the first candidate crossed one more edge at
+            // its arrowhead, and the search stopped there).
+            let beats = class == 0
+                || mode == Mode::Routed
+                || &s
+                    < base_acc.get_or_insert_with(|| {
+                        w.against(info, i, &simplify(&polys[i]), &mut accepted, base0, true)
+                    });
+            if s.hard() == 0 && s.wiggle == 0 && lone && beats {
                 break;
             }
         }
@@ -5696,5 +5708,23 @@ mod tests {
             assert_eq!(rep.statik.edge_node_pairs, 0, "{name} static");
             assert_eq!(rep.routed.edge_node_pairs, 0, "{name} routed");
         }
+    }
+
+    #[test]
+    fn a_static_edge_riding_a_border_searches_past_a_first_candidate_that_loses() {
+        // bench-75's `svc4 -> logs`: its layout channel rides the app
+        // frame's right border for 99 px; the first (narrow) candidate
+        // crossed one more edge at its arrowhead than the original, the
+        // search stopped there and the edge kept the border. The wider
+        // lattice finds a channel off it that crosses no more heads.
+        let src = include_str!("../tests/fixtures/quality/bench-75.mmd");
+        let rep = measure_source(src, false).unwrap();
+        let rides: Vec<&String> = rep
+            .statik
+            .details
+            .iter()
+            .filter(|d| d.starts_with("svc4->logs border") || d.starts_with("svc4->logs hug"))
+            .collect();
+        assert!(rides.is_empty(), "{rides:?}");
     }
 }

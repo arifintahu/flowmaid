@@ -142,7 +142,10 @@ Minor, not patch: several class structs gain public fields (see
   border instead of along it. When another edge fans out of (or into) an
   end toward the lane — a hub — the lane meets that end on its side
   facing the lane, the lanes meeting one side one after the other. The
-  router takes the lanes first, so the forward edges route round them.
+  router takes the lanes first, so the forward edges route round them,
+  and in `scene()` an edge it searches for riding a frame border or
+  cramped searches on past a first candidate that does not beat it
+  (bench-75's `svc4 -> logs` rode the app frame's border for 99 px).
   demo is 321 px wide (was 383), back-edge 290 (351), fanout's `no` loop
   goes round the outside, and the flow corpus crosses fewer edges (524 ->
   505 static, 519 -> 508 in `route()`). The same rule runs in `scene()`,
