@@ -125,10 +125,22 @@ Minor, not patch: several class structs gain public fields (see
   the tip and the tip no longer overshoots into the node. Over a stroke so
   wide the head would no longer hold its cut, the corner onto the straight
   run past it and half the stroke there, the head grows to just that
-  (`width + 1.5 + width / 2` px: 13.5 px for 8 px, 22.5 px for 14 px; a
-  14 px stroke used to end in a butt wider than its 11 px head, notched
-  where it met a 1.5 px run), its stroke runs straight through it, bending
-  into the run within half its width of the curve. On a curve too short
+  (`width + run + width / 2` px, the run past the cut a quarter of the
+  width: 14 px for 8 px, 24.5 px for 14 px, 42 px for 24 px; a 14 px
+  stroke used to end in a butt wider than its 11 px head, notched where it
+  met a 1.5 px run), its stroke runs straight through it, bending into the
+  run within half its width of the curve. Where a curve turns too hard
+  over its last stretch for such a run along its end tangent (a back-edge
+  bow turning into its node a few px out, a routed lane turning up just
+  short of the end, a tight S, a self-loop under a very wide stroke), the
+  head turns with it: the stroke runs straight into the end along the
+  chord from where the curve first lies a run's length away, so the tip
+  stays on the border — a 24 px stroke's head used to face along the
+  curve's tangent at its cut, its tip up to 19 px off the node (37 px
+  mid-drag), beside it instead of on it, with ink picking did not reach.
+  A curve too short or too curled even for that (nodes all but touching
+  mid-drag) is cut no deeper than the straight run it ends in, so its tip
+  still lands on the end. On a curve too short
   to lose its cut (nodes a few px apart mid-drag, stroked whole) a head
   is cut nowhere, its tip on the curve's end, and shrinks onto its share
   of the curve (left out under 1 px), instead of reaching its usual cut
