@@ -89,6 +89,26 @@ Minor, not patch: several class structs gain public fields (see
   [--runs N] <paths...>` times `render_svg` (parse + layout + SVG) on real
   `.mmd` files and prints TSV: name, diagram type, median and min ms of `N`
   runs (default 30, after 3 warm-ups) and SVG bytes, sorted by path.
+- **The quality yardstick sees the defects it used to miss.** New
+  `quality::Metrics::tail_fields`, printed by `examples/quality.rs` after
+  the timing columns (every earlier column keeps its number and value):
+  `end_tilt` / `end_tilt_max` (end glyphs whose drawn heading is more than
+  10° off square to the side they land on, the radius on round nodes),
+  `end_gaps` / `end_gap_max` (edge ends more than 1px off the outline
+  their node is painted with: slanted, capped and rounded sides measured
+  as drawn, not as their box), `lat_wiggles` / `lat_backtrack` (hooks,
+  hairpins and dips across the flow, which `wiggles` only counts along
+  it; a back-edge may overshoot once to get round), `own_frame_x` /
+  `own_frame_len` (edges leaving the innermost frame holding both their
+  ends), `band_pairs` / `band_len` (edges side by side 6–26px apart for
+  more than 100px), `ink` (the painted share of the canvas), the idiom
+  counts `idiom_ortho` / `idiom_scubic` / `idiom_spline` / `idiom_bow`
+  (how each edge is drawn: orthogonal, one S-cubic, a waypoint spline, a
+  bow) and `x_drawn` (every drawn crossing: `edge_edge_x` keeps its pair
+  prune, which skips an exactly level or plumb edge — 8 crossings of
+  `dense-td` static). `tests/quality.rs` gates them at today's fixture
+  values (`DEFECT_BASELINE`, `INK_MEAN_MIN`), to be lowered as the
+  defects are fixed. No rendering change.
 
 ### Changed
 
