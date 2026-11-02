@@ -18,7 +18,10 @@
 //! drawing's diagonal and nudged each way (`quality::drag_frames`),
 //! `route()` timed per frame: `drag_ms` the worst frame, `drag_mean`
 //! the mean, `drag_over` how many frames exceed
-//! `quality::DRAG_FRAME_MS` (all 0 without `--drag`).
+//! `quality::DRAG_FRAME_MS` (all 0 without `--drag`). After the
+//! timings come `Metrics::tail_fields` (end tilt and outline gaps,
+//! sideways wiggles, own-frame escapes, parallel cables, ink, the
+//! idiom counts), last so every earlier column keeps its number.
 
 use flowmaid::model::Graph;
 use flowmaid::quality::{self, Agg, Metrics};
@@ -68,6 +71,7 @@ fn row(name: &str, mode: &str, m: &Metrics, extra: &[f64], timing: &[f64]) -> St
     cols.extend(extra.iter().map(|&v| num(v)));
     cols.extend(m.late_fields().iter().map(|&(_, v, _)| num(v)));
     cols.extend(timing.iter().map(|&v| num(v)));
+    cols.extend(m.tail_fields().iter().map(|&(_, v, _)| num(v)));
     cols.join("\t")
 }
 
@@ -126,11 +130,17 @@ fn main() {
         .map(|f| f.0)
         .collect();
     let timing: Vec<&str> = TIMINGS.iter().map(|t| t.0).collect();
+    let tail: Vec<&str> = Metrics::default()
+        .tail_fields()
+        .iter()
+        .map(|f| f.0)
+        .collect();
     println!(
-        "file\tmode\t{}\tdefects\troute_ms\tdeterministic\t{}\t{}",
+        "file\tmode\t{}\tdefects\troute_ms\tdeterministic\t{}\t{}\t{}",
         header.join("\t"),
         late.join("\t"),
-        timing.join("\t")
+        timing.join("\t"),
+        tail.join("\t")
     );
     let mut per_mode: [Vec<Row>; 2] = [Vec::new(), Vec::new()];
     for path in &files {
@@ -212,6 +222,11 @@ fn main() {
         for (c, &(_, agg)) in TIMINGS.iter().enumerate() {
             let vals: Vec<f64> = rows.iter().map(|r| r.3[c]).collect();
             cols.push(num(fold(&vals, agg)));
+        }
+        let tail: Vec<Vec<(&str, f64, Agg)>> = rows.iter().map(|r| r.0.tail_fields()).collect();
+        for c in 0..tail[0].len() {
+            let vals: Vec<f64> = tail.iter().map(|f| f[c].1).collect();
+            cols.push(num(fold(&vals, tail[0][c].2)));
         }
         println!("{}", cols.join("\t"));
     }
