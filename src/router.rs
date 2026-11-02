@@ -77,7 +77,9 @@ use crate::clearance::{
     EDGE_SPACING, FRAME_INSET, FRAME_SEP, MIN_OVERLAP_RUN, NODE_CLEARANCE, NODE_SEP, PARALLEL_COS,
     PORT_ZONE, SAMPLE_STEP, TIGHT_RUN_MIN, WIGGLE_TOL,
 };
-use crate::scene::{edge_polyline, grow_scene, title_head, Bbox, Scene, ARROW_MARKER_PX, MARGIN};
+use crate::scene::{
+    edge_drawn, edge_polyline, grow_scene, title_head, Bbox, Scene, ARROW_MARKER_PX, MARGIN,
+};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -504,7 +506,13 @@ struct World {
     /// ([`NODE_CLEARANCE`]), as the wider rule costs a drag frame
     /// reroutes that lie on other edges instead (G1, G13).
     chip_reach: f64,
+    /// Every node's box, index-parallel with `sc.nodes`, then the box of
+    /// every self-loop (report P0 #13): a loop is drawn beside its node,
+    /// and a path through it reads as running through the node.
     nodes: Vec<(R, Shape)>,
+    /// Per entry of `nodes`: the node it belongs to (itself, or the
+    /// looped node), so an edge of that node is never its obstacle.
+    owner: Vec<usize>,
     frames: Vec<R>,
     chips: Vec<R>,
     /// (edge, label box) of every labelled edge, as placed so far.
@@ -648,7 +656,7 @@ fn end_node(e: EndRef) -> Option<usize> {
 
 impl World {
     fn new(g: &Graph, sc: &Scene) -> World {
-        let nodes = sc
+        let mut nodes: Vec<(R, Shape)> = sc
             .nodes
             .iter()
             .map(|n| {
@@ -663,6 +671,18 @@ impl World {
                 )
             })
             .collect();
+        let mut owner: Vec<usize> = (0..nodes.len()).collect();
+        // Self-loops: the box of each as drawn.
+        for e in sc.edges.iter().filter(|e| e.from == e.to && edge_drawn(e)) {
+            let Some(v) = sc.nodes.iter().position(|n| n.id == e.from) else {
+                continue;
+            };
+            let r = bounds(&edge_polyline(e));
+            if [r.0, r.1, r.2, r.3].iter().all(|c| c.is_finite()) {
+                nodes.push((r, Shape::Rect));
+                owner.push(v);
+            }
+        }
         let frames: Vec<R> = sc
             .clusters
             .iter()
@@ -695,6 +715,7 @@ impl World {
             dir: g.direction,
             chip_reach: CHIP_SEP,
             nodes,
+            owner,
             frames,
             chips,
             labels,
@@ -737,7 +758,13 @@ impl World {
     /// Whether a stub at `p` of an edge `info` stands in the open: off
     /// every node and chip, and out of every frame it must avoid.
     fn stub_free(&self, info: &Info, p: Pt) -> bool {
-        self.nodes.iter().all(|&(r, _)| !inside(r, p))
+        // An end's own self-loop is no obstacle to its stub; its own box is.
+        let ends = [end_node(info.ends.0), end_node(info.ends.1)];
+        let own_loop = |v: usize| self.owner[v] != v && ends.contains(&Some(self.owner[v]));
+        self.nodes
+            .iter()
+            .enumerate()
+            .all(|(v, &(r, _))| own_loop(v) || !inside(r, p))
             && self.chips.iter().all(|&r| !inside(r, p))
             && info
                 .blocked_frames
@@ -762,7 +789,7 @@ impl World {
         let bb = bounds(pts);
         let ends = [end_node(info.ends.0), end_node(info.ends.1)];
         for (v, &(r, shape)) in self.nodes.iter().enumerate() {
-            if ends.contains(&Some(v)) || !overlaps(grow(bb, CRAMP_NODE_GAP), r) {
+            if ends.contains(&Some(self.owner[v])) || !overlaps(grow(bb, CRAMP_NODE_GAP), r) {
                 continue;
             }
             // Only the part of each segment near the node is sampled, so
@@ -867,7 +894,7 @@ impl World {
                 self.nodes
                     .iter()
                     .enumerate()
-                    .filter(|(v, _)| !ends.contains(&Some(*v)))
+                    .filter(|(v, _)| !ends.contains(&Some(self.owner[*v])))
                     .map(|(_, n)| n.0),
             );
         for r in sides.filter(|_| s.node == 0) {
@@ -3299,7 +3326,7 @@ fn place_group(f: &Fences, routes: &mut [Option<Vec<Pt>>], segs: &[Seg], grp: &[
     let scene_slab_at = |c: (f64, f64, f64), at: (f64, f64, f64)| {
         let mut slab = open;
         for (v, &(r, _)) in w.nodes.iter().enumerate() {
-            if own.contains(&EndRef::Node(v)) {
+            if own.contains(&EndRef::Node(w.owner[v])) {
                 continue;
             }
             let (a, b, lo, hi) = rect(grow(r, c.0));
@@ -4133,7 +4160,7 @@ fn narrow_px(w: &World, info: &Info, pts: &[Pt]) -> f64 {
             w.nodes
                 .iter()
                 .enumerate()
-                .filter(|(v, _)| !ends.contains(&Some(*v)))
+                .filter(|(v, _)| !ends.contains(&Some(w.owner[*v])))
                 .map(|(_, n)| n.0),
         )
         .filter(|&r| overlaps(probe, r))
@@ -5270,6 +5297,7 @@ mod tests {
             dir: crate::model::Direction::LR,
             chip_reach: CHIP_SEP,
             nodes: nodes.iter().map(|&r| (r, Shape::Rect)).collect(),
+            owner: (0..nodes.len()).collect(),
             frames: frames.to_vec(),
             chips: Vec::new(),
             labels: Vec::new(),

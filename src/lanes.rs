@@ -193,8 +193,21 @@ pub(crate) fn corners(
     let ((pa, sa), (pb, sb)) = (a, b);
     let x = lane.x;
     let (s0, s3) = legs(pa, pb, &lane);
-    let xa = clamp_to(x, port_span(sa, pa));
-    let xb = clamp_to(x, port_span(sb, pb));
+    // An end's port: as near the lane as its side allows — one
+    // LANE_STAGGER further in per twin lane (between the same two ends)
+    // nested round it, so twins leave and enter in their nesting order,
+    // the outermost nearest the lane, and their legs never cross.
+    let port = |p: &Placed, shape: Shape| {
+        let span = port_span(shape, p);
+        let near = clamp_to(x, span);
+        let inward = if x > span.1 { -1.0 } else { 1.0 };
+        if (near - x).abs() > LANE_EPS {
+            clamp_to(near + inward * lane.twins as f64 * LANE_STAGGER, span)
+        } else {
+            near
+        }
+    };
+    let (xa, xb) = (port(pa, sa), port(pb, sb));
     // Met on its side, an end is entered level with its centre, moved
     // one LANE_STAGGER toward the other end per lane nested round it
     // there (within the side's straight run): the lanes meeting one side
@@ -547,6 +560,11 @@ pub(crate) struct Lane {
     /// run along the border); set by the caller that draws the lane (0
     /// from [`plan`]).
     pub out: [f64; 2],
+    /// How many lanes of edges between the same two ends run farther out
+    /// on its side: its ports sit that many [`LANE_STAGGER`]s further in
+    /// at both ends ([`corners`]), so twins leave and enter in their
+    /// nesting order.
+    pub twins: usize,
 }
 
 impl Lane {
@@ -558,6 +576,7 @@ impl Lane {
             stagger: [0, 0],
             room: [f64::INFINITY; 2],
             out: [0.0; 2],
+            twins: 0,
         }
     }
 }
@@ -695,6 +714,7 @@ pub(crate) fn plan(
             stagger: [0, 0],
             room: [f64::INFINITY; 2],
             out: [0.0; 2],
+            twins: 0,
         });
         placed.push((i, x));
     }
@@ -760,6 +780,15 @@ pub(crate) fn plan(
         .collect();
     for &(i, xi) in &laid {
         let mut stagger = [0usize; 2];
+        let twins = laid
+            .iter()
+            .filter(|&&(j, xj)| {
+                j != i
+                    && wants[j].ends == wants[i].ends
+                    && side(j, xj) == side(i, xi)
+                    && (xj - xi) * side(i, xi) > LANE_EPS
+            })
+            .count();
         for (k, layer) in [(0, wants[i].band.1), (1, wants[i].band.0)] {
             let out_dir = |j: usize, x: f64| {
                 let d = x - centre(wants[j].spans[k]);
@@ -784,6 +813,7 @@ pub(crate) fn plan(
         }
         if let Some(l) = out[i].as_mut() {
             l.stagger = stagger;
+            l.twins = twins;
         }
     }
     out

@@ -128,7 +128,10 @@ Minor, not patch: several class structs gain public fields (see
   crossing their legs: lanes from ends stacked on one layer into one node
   run side by side straight out of their ends and turn in one after the
   other, and lanes nested round each other are dealt out so the end
-  nearest their side takes the outermost lane and the shortest stub.
+  nearest their side takes the outermost lane and the shortest stub;
+  lanes of edges between the same two ends leave and enter in that order
+  too, the outermost nearest the lane (x6: two `Gamma -> Alpha` lanes
+  crossed twice in `route()`).
   Where it meets an end another edge also uses, the lane is judged by
   where that edge heads, so it never turns across an edge arriving beside
   it: the state `retry` loop runs straight up out of `Rejected` round the
@@ -172,7 +175,13 @@ Minor, not patch: several class structs gain public fields (see
 - **Self-loops keep their room** (report P0 #13): the layout keeps a
   looped node's loop (and 12 px) clear of its high-side neighbour, so a
   long edge's channel beside it no longer runs through the loop's apex
-  (stress: `A ==> D`), and a back-edge's lane clears the loop too.
+  (stress: `A ==> D`), and a back-edge's lane clears the loop too. The
+  router treats every self-loop as an obstacle, so `route()` keeps other
+  edges off it as well (stress's `A ==> D` ran 5 px from `B`'s loop on a
+  drag). `route()` draws a loop on the side `scene()` does — in LR / RL
+  below its node, not on the screen's right, where its node's edges
+  leave (x6: a loop hidden under three parallel edges) — and a drag that
+  crowds that side moves it to the free one.
 - **A labelled parallel edge keeps its label off its twin** (report
   P0 #13): in TD / BT, parallel edges next to a labelled one leave
   half the label's width plus 15 px between their lines (a 16 px gap put

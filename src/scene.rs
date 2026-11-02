@@ -4193,6 +4193,8 @@ fn route_built(
     } else {
         flow_frame_spans(g, &flow_at, g.direction)
     };
+    // How far each node's self-loop reaches past its side.
+    let loops_at = loop_reach(g);
     // A labelled 2-cycle across one gap bows apart as in the static
     // layout ([`twin_bows`]).
     let bows = twin_bows(g, &offs, |ei| {
@@ -4269,7 +4271,15 @@ fn route_built(
                     Some(g.direction),
                     lone_ends(g, &bars, e),
                 );
-                if bows[ei] == 0.0 {
+                if e.from == e.to && loop_on_low_side(&flow_at, e.from, &loops_at) {
+                    // Its high side crowded by a drag: the loop goes on
+                    // the free low side, mirrored across its node.
+                    let c = flow_at[e.from].b;
+                    pts.map(|p| {
+                        let (b, l) = to_flow(g.direction, p);
+                        from_flow(g.direction, (2.0 * c - b, l))
+                    })
+                } else if bows[ei] == 0.0 {
                     pts
                 } else {
                     bowed(pts.map(|p| to_flow(g.direction, p)), bows[ei])
@@ -7008,13 +7018,10 @@ fn route_backs(g: &Graph, flow: &[Placed]) -> Vec<Back> {
         node_cluster_paths(g)
     };
     let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
-    // A self-loop beside a node is in a lane's way too (on screen right:
-    // the high breadth side in TD / BT).
-    let loops = if horizontal {
-        vec![0.0; g.nodes.len()]
-    } else {
-        loop_reach(g)
-    };
+    // A self-loop beside a node is in a lane's way too (on its high
+    // breadth side, as `free_edge` draws it with the static layout's
+    // room there; the low side when a drag crowded that, [`loop_side`]).
+    let loops = loop_reach(g);
     let wants: Vec<Want> = backs
         .iter()
         .map(|&ei| {
@@ -7265,12 +7272,18 @@ fn free_edge(
     dir: Option<Direction>,
     lone: (bool, bool),
 ) -> [(f64, f64); 4] {
-    if self_loop {
-        return loop_points(a, off);
-    }
     let Some(dir) = dir else {
+        if self_loop {
+            return loop_points(a, off);
+        }
         return axis_edge(a, b, sa, sb, off);
     };
+    if self_loop {
+        // On the high breadth side, as the static layout draws it (and
+        // keeps the room for it): on screen right only in TD / BT — in
+        // LR / RL, below the node, not in the gap its edges leave by.
+        return loop_points(&flow_placed(dir, a), off).map(|p| from_flow(dir, p));
+    }
     let (fa, fb) = (flow_placed(dir, a), flow_placed(dir, b));
     if let Some(pts) = nested_edge(&fa, &fb, sa, sb, off) {
         return pts.map(|p| from_flow(dir, p));
@@ -7422,6 +7435,36 @@ pub(crate) fn loop_reach(g: &Graph) -> Vec<f64> {
         }
     }
     reach
+}
+
+/// Whether the self-loop of node `v` goes on its low breadth side in
+/// [`route`]: when a node level with it along the flow (`at`, flow
+/// coordinates) lies within its loop's reach (`reach`, [`loop_reach`])
+/// plus [`crate::clearance::NODE_SEP`] of its high side and none that
+/// close to its low side. The static layout keeps that room on the high
+/// side (`layout` keeps a looped node's high-side neighbour off), so
+/// over the scene's own centres the loop stays where `scene()` draws
+/// it; only a drag that crowds it there sends it to the free side.
+fn loop_on_low_side(at: &[Placed], v: usize, reach: &[f64]) -> bool {
+    let p = &at[v];
+    let room = reach.get(v).copied().unwrap_or(0.0) + crate::clearance::NODE_SEP;
+    let level = |q: &Placed| {
+        q.l - q.lsize / 2.0 < p.l + p.lsize / 2.0 && q.l + q.lsize / 2.0 > p.l - p.lsize / 2.0
+    };
+    let crowded = |high: bool| {
+        at.iter().enumerate().any(|(w, q)| {
+            if w == v || !level(q) {
+                return false;
+            }
+            let gap = if high {
+                (q.b - q.bsize / 2.0) - (p.b + p.bsize / 2.0)
+            } else {
+                (p.b - p.bsize / 2.0) - (q.b + q.bsize / 2.0)
+            };
+            (0.0..room).contains(&gap) || (gap < 0.0 && if high { q.b > p.b } else { q.b < p.b })
+        })
+    };
+    crowded(true) && !crowded(false)
 }
 
 /// Small self-loop on the node's right side; parallel loops stack
@@ -12984,6 +13027,88 @@ mod tests {
         // The dashed back-edge enters Source square, crossing nothing.
         let back = the_edge(&sc, "C", "A");
         assert!(end_skew(back, false) < 10.0, "{back:?}");
+    }
+
+    #[test]
+    fn twin_lanes_leave_and_enter_in_their_nesting_order() {
+        // x6-rl-loops: two back-edges Gamma -> Alpha in lanes on one side
+        // left Gamma from ports in the wrong order in route() (which does
+        // not re-sort its ports): the outer lane's leg crossed the inner
+        // one twice. The outer lane now takes the port nearest its side.
+        let src =
+            "flowchart RL\n  A[Alpha] -->|forward| B[Beta]\n  A -->|parallel| B\n  A --> B\n  \
+                   B --> C[Gamma]\n  C --> A\n  B --> B\n  C -.->|long back label here| A\n  \
+                   C --> D[Delta] --> E[Epsilon]\n  E --> C";
+        for sc in static_and_routed(src) {
+            let lanes: Vec<Vec<(f64, f64)>> = sc
+                .edges
+                .iter()
+                .filter(|e| e.from == "C" && e.to == "A")
+                .map(edge_polyline)
+                .collect();
+            assert_eq!(lanes.len(), 2);
+            let crosses = lanes[0].windows(2).any(|w| {
+                lanes[1]
+                    .windows(2)
+                    .any(|v| crate::lanes::tests_seg_cross(w[0], w[1], v[0], v[1]))
+            });
+            assert!(!crosses, "{lanes:?}");
+        }
+    }
+
+    #[test]
+    fn a_self_loop_sits_where_scene_draws_it_and_moves_to_a_free_side() {
+        // route() drew every loop on the screen's right — in LR / RL the
+        // side its node's edges leave by, where the static layout draws
+        // none (x6-rl-loops: Beta's loop hid under the A -> B edges). It
+        // now sits on the flow's high breadth side as in scene(), the
+        // router keeps other edges off it (stress: A ==> D ran 5 px from
+        // B's loop in route()), and a drag that crowds that side sends it
+        // to the free one.
+        let loop_box = |sc: &Scene, id: &str| {
+            let p = edge_polyline(the_edge(sc, id, id));
+            p.iter().fold(
+                (
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ),
+                |r, q| (r.0.min(q.0), r.1.min(q.1), r.2.max(q.0), r.3.max(q.1)),
+            )
+        };
+        let src = "flowchart LR\nA --> B\nB --> B\nB --> C";
+        for sc in static_and_routed(src) {
+            let (_, by, _, bh) = node_box(&sc, "B");
+            let r = loop_box(&sc, "B");
+            assert!(r.1 >= by + bh - 1.0, "below B: {r:?}");
+        }
+        let src = include_str!("../examples/stress.mmd");
+        let [_, r] = static_and_routed(src);
+        let lb = loop_box(&r, "B");
+        let gap = edge_polyline(the_edge(&r, "A", "D"))
+            .iter()
+            .map(|&(x, y)| (lb.0 - x).max(x - lb.2).max(lb.1 - y).max(y - lb.3))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            gap >= crate::clearance::CRAMP_NODE_GAP,
+            "A ==> D {gap:.1} px off the loop"
+        );
+        // A node dragged up beside B's loop: the loop moves to B's left.
+        let g = parse("flowchart TD\nA --> B\nB --> B\nB --> C\nA --> D").unwrap();
+        let s = scene(&g);
+        let mut c: Vec<(f64, f64)> = s.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let (b, d) = (g.node_index("B").unwrap(), g.node_index("D").unwrap());
+        c[d] = (
+            c[b].0 + s.nodes[b].w / 2.0 + s.nodes[d].w / 2.0 + 20.0,
+            c[b].1,
+        );
+        let r = route(&g, &c);
+        let lb = loop_box(&r, "B");
+        assert!(
+            lb.2 <= c[b].0 - s.nodes[b].w / 2.0 + 1.0,
+            "left of B: {lb:?}"
+        );
     }
 
     #[test]
