@@ -209,6 +209,16 @@ mod tests {
             Some(g.subgraphs.iter().position(|s| s.id == "Platform").unwrap())
         );
         assert_eq!(workers.direction, Some(crate::model::Direction::LR));
+        // Mentioning Q / W1 / W2 in `Platform` after `Workers` closed
+        // leaves them in `Workers` (mermaid: the first block to close
+        // keeps a node); re-claiming them used to empty the nested box,
+        // which then was not drawn at all.
+        let ids: Vec<&str> = workers
+            .nodes
+            .iter()
+            .map(|&v| g.nodes[v].id.as_str())
+            .collect();
+        assert_eq!(ids, ["Q", "W1", "W2"]);
         // Edges targeting a subgraph landed in sub_edges (Dev->CI,
         // Reg->Platform, Platform->Mon, Rollback->Platform).
         assert!(
@@ -260,6 +270,13 @@ mod tests {
         assert!(svg.contains("<polygon"), "hexagon/parallelogram polygons");
         assert!(svg.matches("<circle").count() >= 2, "double circle");
         assert!(svg.contains("CI/CD Pipeline") && svg.contains("Production Platform"));
+        assert!(
+            svg.contains(">Async Workers</text>"),
+            "the nested box's title"
+        );
+        // One frame per subgraph, the nested one inside its parent.
+        let frames = svg.matches("fill=\"#f7f8fd\" stroke=\"#c9cfe8\"").count();
+        assert_eq!(frames, 3, "3 cluster rects for 3 subgraphs");
 
         // Interactive path stays consistent: route() over the auto
         // positions yields the same node/edge/cluster counts.

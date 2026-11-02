@@ -362,6 +362,16 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Fixed
 
+- **A nested subgraph keeps its nodes when the outer block mentions them
+  again.** In `subgraph Platform … subgraph Workers … end … W1 --> Users
+  … end`, the mention of `W1` after `Workers` closed moved it back into
+  `Platform`; `Workers` was left empty and was not drawn at all (the
+  advanced showcase drew 2 frames for its 3 subgraphs). As in mermaid, the
+  first block to close keeps a node: a later mention, in the enclosing
+  block or in a sibling opened afterwards, leaves it where it is. A block
+  that is still open (an enclosing one) still gives a node up to the
+  nested block mentioning it, and a top-level node still joins the first
+  block that mentions it.
 - **Nothing drawn is cut off at the canvas edge.** The canvas (`to_svg`'s
   view box, a laid-out scene's `width` / `height`, the quality yardstick's
   `width` / `height`) was the bounds of the nodes, frames, labels and each

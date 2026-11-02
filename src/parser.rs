@@ -2630,13 +2630,22 @@ fn parse_node(
     // block claims it for that block (the canonical docs example
     // relies on this: `c1-->a2` at top level, then `a2` inside
     // `subgraph one` puts a2 in the box). Top-level mentions never
-    // un-claim.
+    // un-claim, and neither does a mention after the block that owns
+    // the node has closed: mermaid's first block to CLOSE keeps it
+    // (`makeUniq`), so `W1 --> Users` in `Platform`, after the nested
+    // `Workers` block that holds W1 ended, leaves W1 in `Workers` —
+    // re-claiming it emptied the nested box, which then vanished.
+    // An open owner (an enclosing block) still gives the node up to
+    // the inner block mentioning it, which closes first.
     if let Some(&owner) = subs.last() {
         if !g.subgraphs[owner].nodes.contains(&n) {
-            for s in g.subgraphs.iter_mut() {
-                s.nodes.retain(|&m| m != n);
+            let held = g.subgraphs.iter().position(|s| s.nodes.contains(&n));
+            if held.map_or(true, |s| subs.contains(&s)) {
+                for s in g.subgraphs.iter_mut() {
+                    s.nodes.retain(|&m| m != n);
+                }
+                g.subgraphs[owner].nodes.push(n);
             }
-            g.subgraphs[owner].nodes.push(n);
         }
     }
 
@@ -7548,6 +7557,48 @@ mod tests {
         let g2 = parse("flowchart TD\nsubgraph one\nA\nend\nB --> one\n").unwrap();
         assert_eq!(g2.sub_edges.len(), 1);
         assert_eq!(g2.sub_edges[0].to, crate::model::End::Sub(0));
+    }
+
+    #[test]
+    fn a_closed_block_keeps_its_nodes_from_later_blocks() {
+        // mermaid's first block to CLOSE keeps a node: mentioning W1 in
+        // the outer block after the nested one ended (the advanced
+        // showcase's `W1 & W2 --> Users`, `Gate ==> Q`) leaves it in
+        // `workers`, which used to be emptied and then not drawn.
+        let g = parse(
+            "flowchart TD\n\
+             subgraph outer\n\
+             G --> Users\n\
+             subgraph workers\n\
+             Q --> W1\n\
+             Q --> W2\n\
+             end\n\
+             G ==> Q\n\
+             W1 & W2 --> Users\n\
+             end\n\
+             subgraph later\n\
+             W1 --> X\n\
+             end\n",
+        )
+        .unwrap();
+        let sub = |id: &str| g.subgraphs.iter().find(|s| s.id == id).unwrap();
+        let ids = |id: &str| -> Vec<&str> {
+            sub(id)
+                .nodes
+                .iter()
+                .map(|&v| g.nodes[v].id.as_str())
+                .collect()
+        };
+        assert_eq!(ids("workers"), ["Q", "W1", "W2"]);
+        assert_eq!(ids("outer"), ["G", "Users"]);
+        // A sibling block opened later cannot take it either.
+        assert_eq!(ids("later"), ["X"]);
+        // An enclosing block that is still open gives a node up to the
+        // nested block mentioning it (that one closes first).
+        let g = parse("flowchart TD\nsubgraph o\nA --> B\nsubgraph i\nB\nend\nend\n").unwrap();
+        let b = g.node_index("B").unwrap();
+        assert_eq!(g.subgraphs[1].nodes, [b]);
+        assert!(!g.subgraphs[0].nodes.contains(&b));
     }
 
     #[test]
