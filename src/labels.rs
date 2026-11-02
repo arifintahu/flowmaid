@@ -1999,18 +1999,38 @@ fn stack_fans(
         // (its siblings aside) and crossed by no other stroke. With none
         // (a sibling runs within a box of it all the way: two
         // transitions to one state, their lines PARALLEL_GAP apart), its
-        // spots beside it.
+        // spots beside it — in its rows, else, for such a twin, anywhere
+        // along the far half of its line (a steep sibling still crossing
+        // the box at the row can be clear of it a little further along).
         let mut lined = Vec::with_capacity(rows.len());
         let mut cands: Vec<(usize, f64, Vec<Pt>)> = rows
             .iter()
-            .map(|row @ &(ei, w, ref spots)| {
+            .zip(&walks)
+            .map(|(row @ &(ei, w, ref spots), (_, _, walk))| {
                 let on: Vec<Pt> = spots
                     .iter()
                     .copied()
                     .filter(|&p| free(ei, label_rect(p, w)))
                     .collect();
                 lined.push(!on.is_empty());
-                (ei, w, if on.is_empty() { beside(row) } else { on })
+                if !on.is_empty() {
+                    return (ei, w, on);
+                }
+                let mut by = beside(row);
+                // Its far end's node, which a twin shares.
+                let far = |k: usize| {
+                    let e = &edges[k];
+                    if fan[k] == Some(true) {
+                        &e.to
+                    } else {
+                        &e.from
+                    }
+                };
+                let twin = group.iter().any(|&(k, _)| k != ei && far(k) == far(ei));
+                if by.is_empty() && twin {
+                    by = beside(&(ei, w, walk.iter().map(|&(p, _)| p).collect()));
+                }
+                (ei, w, by)
             })
             .collect();
         if field.spent(&placed) {

@@ -112,6 +112,95 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Changed
 
+- **One arrowhead size for every flowchart edge, sharper and square onto
+  the node** (report §2.3, Q1 + M1). Every end glyph — the arrowhead at
+  either end, the cross and the circle — is now 11 px in user space
+  (`markerUnits="userSpaceOnUse"`), so a thick `==>` edge no longer draws
+  a head twice the size (about 22 px) and a `linkStyle stroke-width` edge
+  up to about 6 px shares the head too. The head is the wider
+  `M 0 0 L 10 5 L 0 10 z` triangle. The SVG painter stops the stroke half
+  a head short under an arrowhead — a `linkStyle` stroke wider than that
+  its own width short — with `refX` putting the tip back exactly on the
+  node border, so the butt end of the stroke no longer pokes out beside
+  the tip and the tip no longer overshoots into the node. Over a stroke so
+  wide the head would no longer hold its cut, the corner onto the straight
+  run past it and half the stroke there, the head grows to just that
+  (`width + run + width / 2` px, the run past the cut a quarter of the
+  width: 14 px for 8 px, 24.5 px for 14 px, 42 px for 24 px; a 14 px
+  stroke used to end in a butt wider than its 11 px head, notched where it
+  met a 1.5 px run), its stroke runs straight through it, bending into the
+  run within half its width of the curve. Where a curve turns too hard
+  over its last stretch for such a run along its end tangent (a back-edge
+  bow turning into its node a few px out, a routed lane turning up just
+  short of the end, a tight S, a self-loop under a very wide stroke), the
+  head turns with it: the stroke runs straight into the end along the
+  chord from where the curve first lies a run's length away, so the tip
+  stays on the border — a 24 px stroke's head used to face along the
+  curve's tangent at its cut, its tip up to 19 px off the node (37 px
+  mid-drag), beside it instead of on it, with ink picking did not reach.
+  A curve too short or too curled even for that (nodes all but touching
+  mid-drag) is cut no deeper than the straight run it ends in, so its tip
+  still lands on the end. The same holds for mermaid's `step`,
+  `stepBefore` and `stepAfter` curves (`e1@{ curve: step }`, `linkStyle …
+  interpolate step`), whose last leg ends at a corner: a head faces along
+  that leg, or turns with the step where the leg is shorter than the head
+  needs, with its tip on the border in `scene()`, `route()` and every drag
+  frame, and picking reaches its ink. On a curve too short
+  to lose its cut (nodes a few px apart mid-drag, stroked whole) a head
+  is cut nowhere, its tip on the curve's end, and shrinks onto its share
+  of the curve (left out under 1 px), instead of reaching its usual cut
+  past the curve's end into the node, where picking did not see it. Every glyph faces along
+  its curve's own end tangent (square to the side wherever the curve
+  arrives square): the painter ends a curve that still turns there in a
+  straight run along that tangent, bending into it within a pixel of the
+  curve, so the stroke reaches the head's base already heading its way;
+  a curve that swings in from the side too hard for that (a wide fan's
+  outer branches, an S-curve whose short end handle only turns square in
+  its last pixels) leaves its curve where the line to the head touches it
+  and runs on straight into the head — no S where it leaves the curve, no
+  hump before the head — its head still square with the tip on the
+  border, and one that slips in under the head first keeps its own curve
+  up to there. A long edge's spline whose
+  last channel leg slanted into its node gets a straight stub along the
+  side's normal in `SceneEdge::waypoints` (so hosts draw it too), unless
+  the stub would bring it nearer a node or along another edge than the
+  routing left it. The squared ends and the cut are the SVG painter's:
+  `SceneEdge::bezier` is unchanged and still ends on the border (hosts draw
+  their own heads along its end tangent), the painted curve stays within a
+  pixel of it outside the head beyond two head lengths of the tip, and
+  `Scene::edge_at` / `hits_in_rect` follow the painted stroke — at their
+  old speed: `to_svg` squares each end once (the crossing casing reuses
+  the strokes it paints), and picking squares an end only where that can
+  change the answer (near its tip, close to the curve), so a marquee or a
+  pointer away from the arrowheads costs what it did. Marker ids:
+  a `linkStyle` width no longer needs a size variant, so the `-u` ids
+  (`arrow-u`, `arrow-u__<colour>`) are gone — a coloured end is
+  `<base id>_<colour>` (`arrow__ff3`), a stroke wider than 5.5 px gets
+  `<base id>-t<width>` (the head set further ahead), a head not 11 px long
+  adds `-s<length>` (`arrow-t8-s13_5`; a shrunk one `arrow-t0-s4_1`), and
+  an unstyled one keeps its base id. Arrowheads standing side by side
+  closer than a head and 1.5 px apart (an over-full side's ports, about
+  10 px apart) are drawn narrower, `<base id>-w<width>` (`arrow-w8_5`,
+  never under 6 px nor too narrow to cover the stroke's end), so they
+  keep a gap instead of running together into one saw-tooth band. The
+  advance painter draws the same head and cut, its last stretch along
+  the route's last leg however short that leg. A crossing gap is no longer cut within a head and a gap's
+  radius of an edge end, where it could bite the arrowhead.
+- **Stroke tokens** (report Q10): edges are 2 px (thick 3.5 px, from
+  1.7 / 3.4) and node outlines 1.8 px (from 1.6, the cylinder's lid, the
+  subroutine's bars and a final state's ring included). The canvas keeps
+  its 28 px padding — the scene's own gutter — rather than Q10's 16 px:
+  `to_svg` pads exactly as `Scene` coordinates, `width` and `height` do,
+  so a host drawing the scene sees the SVG's canvas, and moving every
+  laid-out coordinate by 12 px would flip the router's float-exact
+  tie-breaks (a sixth of the test graphs reroute).
+- **Quality yardstick** (`quality::Metrics`): `end_tilt` judges each end
+  glyph's heading as painted (along the stroke cut short under it) and
+  reads frame ends either way across the border; new `end_kink` (appended
+  after `x_drawn`) counts glyph ends whose stroke meets the head's base
+  more than 10° off square. The yardstick measures the painted strokes
+  (squared glyph ends included), as the crossing casing cuts its gaps in
+  them; `quality::ARROW_LEN` follows the head size (11 px).
 - **Class hierarchies read top-down, like mermaid and UML.** Relations are
   laid out in source order (left operand first), so in `Animal <|-- Dog`
   the parent sits above the child. Before, parents, interfaces and wholes
@@ -264,9 +353,93 @@ Minor, not patch: several class structs gain public fields (see
     `class::rel_tail` too. A lollipop interface is a class
     (`Class::lollipop`, `ClassBox::lollipop`) whose box is not drawn, only
     its name; a host that paints every `ClassBox` as a box should skip it.
+  - **`quality::Metrics` gains columns and becomes `#[non_exhaustive]`:**
+    the phase-B yardsticks (`end_tilt` … `x_drawn`), `end_kink` and `ink_out` are new
+    fields, so a struct literal of it no longer compiles outside the crate
+    (it already broke with the first new field). It is what
+    `quality::measure` returns: read its fields, or start from
+    `Metrics::default()` and assign them. New columns no longer break it.
 
 ### Fixed
 
+- **A nested subgraph keeps its nodes when the outer block mentions them
+  again.** In `subgraph Platform … subgraph Workers … end … W1 --> Users
+  … end`, the mention of `W1` after `Workers` closed moved it back into
+  `Platform`; `Workers` was left empty and was not drawn at all (the
+  advanced showcase drew 2 frames for its 3 subgraphs). As in mermaid, the
+  first block to close keeps a node: a later mention, in the enclosing
+  block or in a sibling opened afterwards, leaves it where it is. A block
+  that is still open (an enclosing one) still gives a node up to the
+  nested block mentioning it, and a top-level node still joins the first
+  block that mentions it.
+- **An edge into (or out of) a subgraph ranks it even when a cycle runs
+  through the box.** `A --> box` lays the box out after `A` by standing
+  for the box's entry members — those without an in-edge from inside it.
+  A cycle inside the box (`Cache --> Gate` in the advanced showcase's
+  Platform) left every member an internal in-edge, so the edge shaped no
+  rank at all: the CI box sat beside Platform instead of above it, and
+  `Reg --> Platform` ran sideways into Platform's flank. The edges that
+  close such a cycle are now set aside (a depth-first walk over the box's
+  own edges, in declaration order), so `Gate` enters Platform, CI stacks
+  above it and `Reg --> Platform` drops straight onto its top. An edge
+  meeting a box against the flow (`Rollback --> Platform` from below) now
+  runs straight across the gap into the facing side instead of bending
+  towards the box's entry member at its far side.
+- **An edge from a member to its own box leads to the box's entry
+  member.** `Dev --> CI` with `Dev` inside `CI` was ranked as an edge to
+  `Build` (CI's entry member) but drawn as a short arrow up to CI's top
+  border, beside the title and against the flow, leaving an empty band
+  where the ranked edge ran. It is now drawn — and routed, labelled and
+  picked — as that edge, from `Dev` onto `Build`, in `scene`, `route` and
+  drag frames (`route_partial`, which redraws it when the entry member
+  moves) alike; the scene edge keeps its ids (`Dev` → `CI`) and its index.
+  The entry member is the box's first member nothing inside the box leads
+  to, other than the node and anything it already links to; without one
+  (or for a box drawn to its own member) the stub to the frame stays. A
+  box drawn to its own member no longer ranks the member below the box's
+  exit members through a stand-in nobody saw.
+- **The canvas fits the drawing, with even margins.** The canvas was
+  bounded by each edge's bezier control points, which reach far past the
+  curve of a back-edge's bow: the demo had 65 px of empty canvas right of
+  its loop against 27 px on the left (now 28 px on both sides, 383 ->
+  346 px wide), back-edge's canvas was 351 px wide (now 315), stress's
+  251 (now 221), and state, lr, wide-labels, bench-75 and advanced were
+  padded the same way. The canvas (`to_svg`'s
+  view box, a scene's `width` / `height`, the quality yardstick's) is now
+  the drawing itself — each curve to its exact extremes, every stroke's
+  width and end glyph, every label — and the same 28 px margin on every
+  side: a static scene is shifted and sized to fit it exactly (room the
+  layout left before the drawing is dropped too: dense-td's scene had
+  315 px of it on the left), and `route` / `route_sized` / drag frames
+  size their canvas the same way (their node positions stay the host's).
+- **`scene()` of an LR / RL flowchart with wide edge labels has the
+  SVG's geometry.** The layout laid an edge label's width across the flow
+  in every direction, so in LR it inflated the scene's height: wide-labels
+  reported a 624 px tall scene for a 413 px SVG (now 345 px, both), every
+  node 119 px lower than drawn, so a host painting the `Scene` saw a
+  different picture than the SVG. A label's width now runs along the flow
+  in LR / RL, and a static scene's node centres are exactly where the SVG
+  draws them.
+- **Nothing drawn is cut off at the canvas edge.** The canvas (`to_svg`'s
+  view box, a laid-out scene's `width` / `height`, the quality yardstick's
+  `width` / `height`) was the bounds of the nodes, frames, labels and each
+  edge's bezier points, so a route the router took round the outermost
+  node or frame could run off it (a detour leg past the last column,
+  clipped by up to 34 px), and so could a stroke's width or an end glyph
+  at the edge of the drawing. It now covers every drawn edge — the routed
+  spline to its exact extremes, half the stroke width out, and each end
+  glyph's box — in the static scene, `route` / `route_sized` and drag
+  frames (`route_partial`) alike, the padding round it as before. A
+  static scene whose drawing reached into its 28 px gutter is shifted
+  right/down so it starts 28 px in, exactly where the SVG puts it (only a
+  translation after every stage: no route moves). New
+  `quality::Metrics::ink_out` counts edges with ink off the canvas, gated
+  at 0.
+- **A twin's label in a `<<choice>>` fan finds a spot beside its line**
+  when its row is crossed by its twin's steeper line: it may now step
+  beside its line anywhere along the line's far half, so it is stacked
+  `FAN_SIBLING_GAP` clear of its siblings instead of being left to the
+  general placer.
 - **Class names with hyphens or backticks parse, as in mermaid.** A
   hyphenated name used in a relation or a `note for` (`Animal-Name --> Dog`,
   `A-B --> C-D`, `A- --> B`) was a parse error, though `class Animal-Name`

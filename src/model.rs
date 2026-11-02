@@ -421,6 +421,13 @@ pub struct Graph {
     /// dagre ranks it just ahead of X; longest-path layering would park
     /// it at the top however deep X sits).
     pub(crate) lead_nodes: Vec<usize>,
+    /// The stroke width a synthetic graph's own painter strokes every
+    /// edge with (class and ER diagrams), carried onto each scene edge
+    /// from the start ([`crate::scene::SceneEdge`]'s `paint_width`) so
+    /// the layout and routing stages already see edges the flowchart
+    /// painter will not draw: no straight glyph stubs, no arrow trims.
+    /// `None` = a flowchart (or state) graph.
+    pub(crate) edge_paint_width: Option<f64>,
     index: HashMap<String, usize>,
 }
 

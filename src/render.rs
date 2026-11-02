@@ -209,6 +209,16 @@ mod tests {
             Some(g.subgraphs.iter().position(|s| s.id == "Platform").unwrap())
         );
         assert_eq!(workers.direction, Some(crate::model::Direction::LR));
+        // Mentioning Q / W1 / W2 in `Platform` after `Workers` closed
+        // leaves them in `Workers` (mermaid: the first block to close
+        // keeps a node); re-claiming them used to empty the nested box,
+        // which then was not drawn at all.
+        let ids: Vec<&str> = workers
+            .nodes
+            .iter()
+            .map(|&v| g.nodes[v].id.as_str())
+            .collect();
+        assert_eq!(ids, ["Q", "W1", "W2"]);
         // Edges targeting a subgraph landed in sub_edges (Dev->CI,
         // Reg->Platform, Platform->Mon, Rollback->Platform).
         assert!(
@@ -260,6 +270,13 @@ mod tests {
         assert!(svg.contains("<polygon"), "hexagon/parallelogram polygons");
         assert!(svg.matches("<circle").count() >= 2, "double circle");
         assert!(svg.contains("CI/CD Pipeline") && svg.contains("Production Platform"));
+        assert!(
+            svg.contains(">Async Workers</text>"),
+            "the nested box's title"
+        );
+        // One frame per subgraph, the nested one inside its parent.
+        let frames = svg.matches("fill=\"#f7f8fd\" stroke=\"#c9cfe8\"").count();
+        assert_eq!(frames, 3, "3 cluster rects for 3 subgraphs");
 
         // Interactive path stays consistent: route() over the auto
         // positions yields the same node/edge/cluster counts.
@@ -269,6 +286,67 @@ mod tests {
         assert_eq!(s0.nodes.len(), s1.nodes.len());
         assert_eq!(s0.edges.len(), s1.edges.len());
         assert_eq!(s0.clusters.len(), s1.clusters.len());
+
+        // `Reg --> Platform` ranks the CI box above Platform, though a
+        // cycle (`Cache --> Gate`) gives every Platform member an
+        // internal in-edge; the boxes used to sit side by side.
+        let frame = |id: &str| s0.clusters.iter().find(|c| c.id == id).unwrap();
+        let (ci, pf) = (frame("CI"), frame("Platform"));
+        assert!(
+            ci.y + ci.h < pf.y,
+            "CI bottom {} must be above Platform top {}",
+            ci.y + ci.h,
+            pf.y
+        );
+        let ends = |from: &str, to: &str| {
+            let e = s0
+                .edges
+                .iter()
+                .find(|e| e.from == from && e.to == to)
+                .unwrap();
+            let pl = crate::scene::edge_polyline(e);
+            (pl[0], pl[pl.len() - 1])
+        };
+        // It drops onto Platform's top side from above ...
+        let (p0, p3) = ends("Reg", "Platform");
+        assert!((p3.1 - pf.y).abs() < 0.5 && p0.1 < p3.1, "{p0:?} -> {p3:?}");
+        assert!(p3.0 > pf.x && p3.0 < pf.x + pf.w);
+        // ... and `Rollback --> Platform` runs straight up into its
+        // bottom side: no S towards the box's entry member at its top.
+        let (p0, p3) = ends("Rollback", "Platform");
+        assert!((p3.1 - (pf.y + pf.h)).abs() < 0.5, "{p3:?}");
+        assert!((p0.0 - p3.0).abs() < 0.5, "straight: {p0:?} -> {p3:?}");
+
+        // No edge ends on its own frame's border: `Dev --> CI`, Dev
+        // inside CI, leads down onto Build (CI's entry member), in the
+        // static scene and in route() alike — it was an arrow up to CI's
+        // top border beside the title, against the flow.
+        for sc in [&s0, &s1] {
+            let e = sc
+                .edges
+                .iter()
+                .find(|e| e.from == "Dev" && e.to == "CI")
+                .unwrap();
+            let pl = crate::scene::edge_polyline(e);
+            let (p0, p3) = (pl[0], pl[pl.len() - 1]);
+            let node = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+            let (dev, build) = (node("Dev"), node("Build"));
+            assert!(
+                (p0.1 - (dev.y + dev.h / 2.0)).abs() < 1.0,
+                "leaves Dev's bottom"
+            );
+            assert!(
+                (p3.1 - (build.y - build.h / 2.0)).abs() < 1.0,
+                "enters Build's top"
+            );
+            let f = sc.clusters.iter().find(|c| c.id == "CI").unwrap();
+            for q in [p0, p3] {
+                assert!(
+                    (q.1 - f.y).abs() > 1.0 && (q.1 - f.y - f.h).abs() > 1.0,
+                    "an end on CI's frame: {q:?}"
+                );
+            }
+        }
     }
 
     /// End-to-end showcase for stateDiagram-v2 riding the flowchart

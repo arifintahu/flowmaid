@@ -23,7 +23,7 @@
 use crate::layout::{intrinsic_size, GAP_L};
 use crate::model::{Direction, Edge, EdgeKind, Graph};
 use crate::scene::{
-    flip_scene, grow_scene, parallel_offsets, scene_sized, shift_scene, Bbox, Scene, SceneEdge,
+    flip_scene, grow_canvas, parallel_offsets, scene_sized, shift_scene, Bbox, Scene, SceneEdge,
     MARGIN,
 };
 
@@ -497,7 +497,7 @@ fn compose(
     sc.nodes = nodes;
     sc.edges = edges;
     let mut bb = Bbox::new();
-    grow_scene(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+    grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
     let (minx, maxx, miny, maxy) = bb.finish();
     shift_scene(&mut sc, MARGIN - minx, MARGIN - miny);
     sc.width = (maxx - minx) + 2.0 * MARGIN;

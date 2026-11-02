@@ -323,7 +323,7 @@ fn assemble(d: &ClassDiagram, b: Built, mut scene: Scene, mode: Mode) -> ClassSc
         Mode::Routed => LABEL_ROUTE_WORK,
     };
     avoid_label_overlaps(&scene.nodes, &scene.clusters, &mut scene.edges, budget);
-    refit(&mut scene, mode);
+    refit(&mut scene, mode, false);
     for (e, r) in scene.edges.iter_mut().zip(&d.relations) {
         e.kind = if r.dashed {
             EdgeKind::Dotted
@@ -2933,6 +2933,9 @@ fn build(d: &ClassDiagram) -> Built {
     g.direction = d.direction;
     g.flat_leaves = true;
     g.tight_sources = true;
+    // The class painter strokes the edges and draws their ends itself
+    // (a note link's width is set apart in `assemble`).
+    g.edge_paint_width = Some(REL_W);
     let annotated = d
         .relations
         .iter()

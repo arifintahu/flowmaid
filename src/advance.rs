@@ -32,6 +32,15 @@ fn scene_key(sc: &AdvanceScene) -> String {
     k.finish()
 }
 
+/// Stroke width an advance edge is painted with: its style's, else its
+/// kind's (the flowchart's widths).
+fn advance_edge_width(e: &AdvanceSceneEdge) -> f64 {
+    e.style.stroke_width.unwrap_or(match e.kind {
+        EdgeKind::Thick | EdgeKind::ThickOpen => crate::scene::EDGE_WIDTH_THICK,
+        _ => crate::scene::EDGE_WIDTH,
+    })
+}
+
 // ------------------------------------------------------------------
 // Public error type
 // ------------------------------------------------------------------
@@ -5753,25 +5762,26 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
     // page both emitted `advance-arrow-1` and the second one's arrows
     // took the first one's colours.
     let key = scene_key(sc);
-    let mut markers: Vec<(String, String)> = Vec::new();
+    // (colour, how far the stroke stops short of the tip, id): a stroke
+    // wider than the usual cut stops further back, its head set further
+    // ahead to keep the tip on the route's end.
+    let mut markers: Vec<(String, f64, String)> = Vec::new();
     for e in &sc.edges {
         if matches!(e.kind, EdgeKind::Invisible) || !e.kind.has_arrow() {
             continue;
         }
         let color = crate::scene::style_attr(e.style.color.as_deref(), &sc.style.edge_color);
-        if !markers.iter().any(|(c, _)| *c == color) {
+        let trim = crate::scene::arrow_trim(advance_edge_width(e));
+        if !markers.iter().any(|(c, t, _)| *c == color && *t == trim) {
             let id = format!("advance-arrow-{}-{}", key, markers.len() + 1);
-            markers.push((color, id));
+            markers.push((color, trim, id));
         }
     }
+    // The flowchart's own head (one size, in user space), so both
+    // painters draw the same glyph.
     let mut defs = String::new();
-    for (color, id) in &markers {
-        defs.push_str(&format!(
-            "<marker id=\"{}\" viewBox=\"0 0 10 10\" refX=\"8.5\" refY=\"5\" \
-             markerWidth=\"7\" markerHeight=\"7\" orient=\"auto\">\
-             <path d=\"M 0 1 L 9 5 L 0 9 z\" fill=\"{}\"/></marker>",
-            id, color
-        ));
+    for (color, trim, id) in &markers {
+        defs.push_str(&crate::scene::arrow_marker_def(id, color, *trim));
     }
     if !defs.is_empty() {
         s.push_str(&format!("<defs>{}</defs>\n", defs));
@@ -5825,28 +5835,21 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
             Some(d) => format!(" stroke-dasharray=\"{}\"", d),
             None => String::new(),
         };
-        let sw = e.style.stroke_width.unwrap_or(match e.kind {
-            EdgeKind::Thick | EdgeKind::ThickOpen => 3.4,
-            _ => 1.7,
-        });
+        let sw = advance_edge_width(e);
+        let head_trim = crate::scene::arrow_trim(sw);
         let marker = if e.kind.has_arrow() {
             markers
                 .iter()
-                .find(|(c, _)| *c == color)
-                .map(|(_, id)| format!(" marker-end=\"url(#{})\"", id))
+                .find(|(c, t, _)| *c == color && *t == head_trim)
+                .map(|(_, _, id)| format!(" marker-end=\"url(#{})\"", id))
                 .unwrap_or_default()
         } else {
             String::new()
         };
-        let d = if e.points.len() >= 2 {
-            let mut d = format!("M {:.1} {:.1}", e.points[0].0, e.points[0].1);
-            for i in 1..e.points.len() {
-                d.push_str(&format!(" L {:.1} {:.1}", e.points[i].0, e.points[i].1));
-            }
-            d
-        } else {
-            String::new()
-        };
+        // The stroke stops short under the head, whose tip the marker
+        // puts back on the route's end.
+        let trim = if marker.is_empty() { 0.0 } else { head_trim };
+        let d = crate::scene::polyline_d_painted(&e.points, trim);
         s.push_str(&format!(
             "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.1}\"{}{}/>\n",
             d, color, sw, dash_attr, marker
@@ -7107,6 +7110,57 @@ mod tests {
         );
         // The unstyled node keeps the shape theme.
         assert!(svg.contains(r##"fill="#fafafa""##) || svg.contains(r##"fill="#ffffff""##));
+    }
+
+    /// The advance painter draws the flowchart's own head (one size, in
+    /// user space) and stops its route [`crate::scene::ARROW_TRIM`]
+    /// short under it, the tip back on the route's end (report Q1 + M1);
+    /// a thick edge strokes the flowchart's thick width.
+    #[test]
+    fn advance_heads_match_the_flowchart_and_cut_the_route() {
+        let d = text_diagram(
+            "lane l\n\
+             \x20 a\n\
+             \x20 b\n\
+             \x20 c\n\
+             a --> b\n\
+             b ==> c\n",
+        );
+        let scene = layout(&d);
+        let svg = to_svg(&scene);
+        let id = svg
+            .split("<marker id=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .expect("a marker");
+        let color = scene.style.edge_color.clone();
+        assert!(
+            svg.contains(&crate::scene::arrow_marker_def(
+                id,
+                &color,
+                crate::scene::ARROW_TRIM
+            )),
+            "{svg}"
+        );
+        assert!(svg.contains("stroke-width=\"3.5\""), "{svg}");
+        for e in scene.edges.iter().filter(|e| e.kind.has_arrow()) {
+            let d = crate::scene::polyline_d_painted(&e.points, crate::scene::ARROW_TRIM);
+            assert!(svg.contains(&format!("<path d=\"{d}\"")), "{d}\n{svg}");
+            let n = e.points.len();
+            let (a, b) = (e.points[n - 2], e.points[n - 1]);
+            let last: Vec<f64> = d
+                .rsplit(" L ")
+                .next()
+                .unwrap()
+                .split(' ')
+                .map(|v| v.parse().unwrap())
+                .collect();
+            let gap = (b.0 - last[0]).hypot(b.1 - last[1]);
+            let leg = (b.0 - a.0).hypot(b.1 - a.1);
+            if leg > crate::scene::ARROW_TRIM + 1.0 {
+                assert!((gap - crate::scene::ARROW_TRIM).abs() < 0.1, "{d}");
+            }
+        }
     }
 
     #[test]

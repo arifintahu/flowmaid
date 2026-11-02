@@ -30,8 +30,14 @@
 //! [`scene`]: crate::scene::scene
 //! [`route`]: crate::scene::route
 
+use crate::clearance::{CLEAR_GAP, CRAMP_NODE_GAP, EDGE_SPACING};
 use crate::model::{Direction, End, Graph};
-use crate::scene::{edge_drawn, grow_scene, shift_scene, Bbox, Scene, MARGIN};
+use crate::scene::{
+    basis_sample, edge_drawn, edge_polyline, grow_canvas, own_box_targets, sample_cubic,
+    shift_scene, Bbox, Scene, ARROW_MARKER_PX, MARGIN,
+};
+
+type Pt = (f64, f64);
 
 /// Which builder produced the scene. `Routed` scenes keep their node
 /// positions exactly as the host gave them (no normalisation), so the
@@ -88,7 +94,9 @@ pub(crate) struct Ctx {
 
 /// Build the shared context. `sc.edges` holds `g.edges` first, then the
 /// resolvable `g.sub_edges` in order; a sub-edge the builder dropped
-/// (its subgraph has no frame) is skipped by matching ids in order.
+/// (its subgraph has no frame) is skipped by matching ids in order. A
+/// member's edge to its own enclosing box ends on the member it is
+/// drawn to ([`own_box_targets`]), not on the frame.
 pub(crate) fn ctx(g: &Graph, sc: &Scene) -> Ctx {
     let ns = g.subgraphs.len();
     // Subgraph <-> cluster, matched by id (first match wins).
@@ -165,13 +173,20 @@ pub(crate) fn ctx(g: &Graph, sc: &Scene) -> Ctx {
             }
         }
     };
+    // A member's edge to its own box is drawn to the box's entry member
+    // (`own_box_targets`): its stages treat it as an edge between the two.
+    let targets = own_box_targets(g);
     let mut next = g.edges.len();
-    for e in &g.sub_edges {
+    for (e, target) in g.sub_edges.iter().zip(targets) {
         let Some(se) = sc.edges.get(next) else { break };
         let (Some((ra, ia)), Some((rb, ib))) = (end_of(e.from), end_of(e.to)) else {
             continue;
         };
         if se.from == ia && se.to == ib {
+            let rb = match target {
+                Some(m) if node_ok(m, &g.nodes[m].id) => EndRef::Node(m),
+                _ => rb,
+            };
             ends[next] = Some((ra, rb));
             next += 1;
         }
@@ -306,30 +321,398 @@ pub(crate) fn finish_fixed(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool]
     // keeps) the final ends; in the static scene it ends by putting each
     // side's ends in the order their paths now head (G9).
     crate::router::nudge(g, sc, &cx, mode, &mut moved);
+    glyph_stubs(sc, &cx, &mut moved);
     let budget = match mode {
         Mode::Static => crate::labels::LABEL_STATIC_WORK,
         Mode::Routed => crate::labels::LABEL_ROUTE_WORK,
     };
     crate::labels::relabel(g, sc, &cx, &moved, budget);
-    refit(sc, mode);
+    // A scene whose painter strokes its own width (ER, class) is drawn
+    // on its canvas as-is; a flowchart's is fitted like its SVG.
+    refit(sc, mode, g.edge_paint_width.is_none());
 }
 
-/// Grow the canvas over everything drawn; never shrink it.
+/// How far (px) out of its end the straight stub [`glyph_stubs`] gives a
+/// waypoint edge's glyph end reaches: its two waypoints sit this far and
+/// half as far out, so the `curveBasis` spline through them runs
+/// straight for 1.25 heads ((2.5 + 4 × 1.25) / 6 × [`ARROW_MARKER_PX`])
+/// into the end — the head and the stroke entering its base square to
+/// the side.
+pub(crate) const WAYPOINT_STUB: f64 = 2.5 * ARROW_MARKER_PX;
+
+/// Give every glyph end of a waypoint edge the flowchart painter draws
+/// (not an ER or class scene's, see `paint_width`) a straight run into
+/// it along its side's normal, a head long at least (report §2.3): the
+/// spline the painter draws through the waypoints otherwise still turns
+/// under the head — a long edge's last leg runs straight from its last
+/// channel point, slanting into the side, and a port the ports stage
+/// slid along the side leaves its old stub askew. Where the run is
+/// short, the waypoints within [`WAYPOINT_STUB`] of the end along the
+/// normal give way to a stub's two points, when the path beyond reaches
+/// past it by a head (room to turn; a router path's own stub, cut short
+/// by a corner, is left as it is) and the reshaped curve keeps as clear
+/// of the nodes and edges round it as it was ([`stub_keeps_clear`]).
+/// Runs after the ports and the nudge settle the ends, before the
+/// labels; idempotent (a stubbed end is straight enough, a stub left out
+/// is weighed alike again).
+fn glyph_stubs(sc: &mut Scene, cx: &Ctx, moved: &mut [bool]) {
+    for i in 0..sc.edges.len() {
+        let e = &sc.edges[i];
+        let (Some((from, to)), true) = (cx.ends[i], cx.drawn[i]) else {
+            continue;
+        };
+        if e.waypoints.len() < 2 || e.paint_width.is_some() || e.meta.curve.is_some() {
+            continue;
+        }
+        let glyphs = (
+            e.ends.start_marker(e.kind).is_some(),
+            e.ends.end_marker(e.kind).is_some(),
+        );
+        // Each end on its own: its stub is weighed against the curve as
+        // it stands (the other end's stub in, if that one was kept).
+        for (glyph, end, at_start) in [(glyphs.0, from, true), (glyphs.1, to, false)] {
+            if !glyph {
+                continue;
+            }
+            let mut wps = sc.edges[i].waypoints.clone();
+            if at_start {
+                wps.reverse();
+            }
+            let n = wps.len();
+            let p = wps[n - 1];
+            let out = normal(side_of(end_rect(sc, end), p));
+            // How far out along the normal, and how far off its line.
+            let along = |q: (f64, f64)| (q.0 - p.0) * out.0 + (q.1 - p.1) * out.1;
+            let off = |q: (f64, f64)| ((q.0 - p.0) * out.1 - (q.1 - p.1) * out.0).abs();
+            // The run of waypoints on the normal's ray, end first.
+            let mut run = 1;
+            while run < n && off(wps[n - 1 - run]) < STUB_ON_LINE && along(wps[n - 1 - run]) > 0.0 {
+                run += 1;
+            }
+            // The straight stretch the spline draws into the end.
+            let straight = match run {
+                1 => 0.0,
+                2 => along(wps[n - 2]) / 6.0,
+                _ => {
+                    let k = n - run;
+                    (along(wps[k]) + 4.0 * along(wps[k + 1]) + along(wps[k + 2])) / 6.0
+                }
+            };
+            if straight >= ARROW_MARKER_PX - STUB_ON_LINE {
+                continue;
+            }
+            // The points within the stub give way to it, and what lies
+            // beyond must leave a head's length to turn in.
+            let keep = wps[..n - 1]
+                .iter()
+                .rposition(|&q| along(q) > WAYPOINT_STUB || off(q) >= STUB_ON_LINE);
+            let room = keep.is_some_and(|k| along(wps[k]) >= WAYPOINT_STUB + ARROW_MARKER_PX);
+            let (Some(k), true) = (keep, room) else {
+                continue;
+            };
+            let at = |d: f64| (p.0 + out.0 * d, p.1 + out.1 * d);
+            wps.truncate(k + 1);
+            wps.extend([at(WAYPOINT_STUB), at(WAYPOINT_STUB / 2.0), p]);
+            if at_start {
+                wps.reverse();
+            }
+            let node: Vec<usize> = match end {
+                EndRef::Node(v) => vec![v],
+                EndRef::Frame(_) => Vec::new(),
+            };
+            if stub_keeps_clear(sc, cx, i, &wps, &node) {
+                sc.edges[i].waypoints = wps;
+                moved[i] = true;
+            }
+        }
+    }
+}
+
+/// Whether edge `i` drawn through the stubbed waypoints `new`
+/// ([`glyph_stubs`]) stays as clear of the scene as it was: where its
+/// curve changes, it comes no nearer than [`CRAMP_NODE_GAP`] to a node
+/// that is not one of its ends (unless its old curve came nearer
+/// still), and runs no longer within [`CLEAR_GAP`] — nor within
+/// [`EDGE_SPACING`] — of another edge than it did (only the latter for
+/// one ending on the node the stub runs into, `stubbed`: ends
+/// converging on a node run in side by side). The routing and port
+/// stages spaced the old curve; a stub that would undo that is left
+/// out, the painter squaring that end within a px instead
+/// (`scene::square_end`).
+fn stub_keeps_clear(sc: &Scene, cx: &Ctx, i: usize, new: &[Pt], stubbed: &[usize]) -> bool {
+    let old = &edge_polyline(&sc.edges[i]);
+    let fresh = basis_sample(new);
+    // The stubs replace waypoints only near the ends, so the curves share
+    // their samples away from them (the spline is local): the stretch of
+    // each between its shared head and tail (a sample either side).
+    let same = |a: Pt, b: Pt| (a.0 - b.0).abs() <= 1e-9 && (a.1 - b.1).abs() <= 1e-9;
+    let head = fresh
+        .iter()
+        .zip(old)
+        .take_while(|(a, b)| same(**a, **b))
+        .count();
+    let tail = fresh
+        .iter()
+        .rev()
+        .zip(old.iter().rev())
+        .take_while(|(a, b)| same(**a, **b))
+        .count()
+        .min(fresh.len().min(old.len()) - head);
+    if head + tail >= fresh.len() && fresh.len() == old.len() {
+        return true;
+    }
+    let cut = |a: &[Pt]| -> std::ops::RangeInclusive<usize> {
+        head.saturating_sub(1)..=(a.len() - tail).min(a.len() - 1)
+    };
+    let (now, was) = (&fresh[cut(&fresh)], &old[cut(old)]);
+    let mut bb = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for p in now {
+        bb = (bb.0.min(p.0), bb.1.min(p.1), bb.2.max(p.0), bb.3.max(p.1));
+    }
+    let reach = CLEAR_GAP.max(CRAMP_NODE_GAP);
+    let near = |r: (f64, f64, f64, f64)| {
+        r.0 <= bb.2 + reach && r.2 >= bb.0 - reach && r.1 <= bb.3 + reach && r.3 >= bb.1 - reach
+    };
+    let Some((from, to)) = cx.ends[i] else {
+        return true;
+    };
+    let own = |v: usize| {
+        matches!(from, EndRef::Node(a) if a == v) || matches!(to, EndRef::Node(b) if b == v)
+    };
+    for (v, n) in sc.nodes.iter().enumerate() {
+        let r = (
+            n.x - n.w / 2.0,
+            n.y - n.h / 2.0,
+            n.x + n.w / 2.0,
+            n.y + n.h / 2.0,
+        );
+        if own(v) || !near(r) {
+            continue;
+        }
+        let gap = |p: &Pt| {
+            (r.0 - p.0)
+                .max(p.0 - r.2)
+                .max(0.0)
+                .hypot((r.1 - p.1).max(p.1 - r.3).max(0.0))
+        };
+        let g_now = now.iter().map(gap).fold(f64::INFINITY, f64::min);
+        let g_was = was.iter().map(gap).fold(f64::INFINITY, f64::min);
+        if g_now < CRAMP_NODE_GAP && g_now < g_was - STUB_SAME {
+            return false;
+        }
+    }
+    // Length of `run` within `gap` of a line, its points' distances to
+    // it given.
+    let close = |run: &[Pt], dist: &[f64], gap: f64| -> f64 {
+        run.windows(2)
+            .zip(dist.windows(2))
+            .filter(|(_, d)| d[0] < gap && d[1] < gap)
+            .map(|(w, _)| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+            .sum()
+    };
+    for j in 0..sc.edges.len() {
+        if j == i || !cx.drawn[j] {
+            continue;
+        }
+        // Ends converging on the node a stub runs into run in side by
+        // side, as their ports space them: only a run on top of one
+        // (within EDGE_SPACING) counts there.
+        let converging = cx.ends[j].is_some_and(|(a, b)| {
+            [a, b]
+                .iter()
+                .any(|x| matches!(x, EndRef::Node(v) if stubbed.contains(v)))
+        });
+        let gaps: &[f64] = if converging {
+            &[EDGE_SPACING]
+        } else {
+            &[EDGE_SPACING, CLEAR_GAP]
+        };
+        // Only its pieces near the changed stretch can come close.
+        let piece = near_pieces(&sc.edges[j], &near);
+        if piece.is_empty() {
+            continue;
+        }
+        // Each point's distance to the line where it is under CLEAR_GAP
+        // (beyond, any distance as good as far): pieces whose box lies
+        // farther are skipped unmeasured.
+        let gap_to = |p: Pt, r: (f64, f64, f64, f64)| {
+            (r.0 - p.0)
+                .max(p.0 - r.2)
+                .max(0.0)
+                .hypot((r.1 - p.1).max(p.1 - r.3).max(0.0))
+        };
+        let boxes: Vec<(f64, f64, f64, f64)> = piece
+            .chunks(2)
+            .map(|w| {
+                (
+                    w[0].0.min(w[1].0),
+                    w[0].1.min(w[1].1),
+                    w[0].0.max(w[1].0),
+                    w[0].1.max(w[1].1),
+                )
+            })
+            .collect();
+        let pairs = |run: &[Pt]| -> Vec<f64> {
+            run.iter()
+                .map(|&p| {
+                    piece
+                        .chunks(2)
+                        .zip(&boxes)
+                        .filter(|(_, &r)| gap_to(p, r) < CLEAR_GAP)
+                        .map(|(w, _)| seg_dist(p, w[0], w[1]))
+                        .fold(f64::INFINITY, f64::min)
+                })
+                .collect()
+        };
+        let (d_now, d_was) = (pairs(now), pairs(was));
+        if gaps
+            .iter()
+            .any(|&g| close(now, &d_now, g) > close(was, &d_was, g) + STUB_CLOSE_SLACK)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// The pieces (point pairs) of `e`'s curve ([`edge_polyline`]'s, as
+/// sampled there) whose box `near` accepts, sampling only the spans of a
+/// spline whose waypoints' box it accepts (a span lies within its
+/// waypoints' hull): a stub is weighed against the few edges near it,
+/// mid-drag, without sampling every edge.
+fn near_pieces(
+    e: &crate::scene::SceneEdge,
+    near: &dyn Fn((f64, f64, f64, f64)) -> bool,
+) -> Vec<Pt> {
+    let boxed = |pts: &[Pt]| {
+        let mut r = (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for p in pts {
+            r = (r.0.min(p.0), r.1.min(p.1), r.2.max(p.0), r.3.max(p.1));
+        }
+        r
+    };
+    let keep = |line: &[Pt]| -> Vec<Pt> {
+        line.windows(2)
+            .filter(|w| near(boxed(w)))
+            .flat_map(|w| [w[0], w[1]])
+            .collect()
+    };
+    let w = &e.waypoints;
+    if e.meta.curve.is_some() || w.len() < 3 {
+        // A mermaid curve may overshoot its points: sampled whole.
+        if e.meta.curve.is_none() && w.len() < 2 && !near(boxed(&e.bezier)) {
+            return Vec::new();
+        }
+        return keep(&edge_polyline(e));
+    }
+    // The `curveBasis` spline span by span (as basis_sample samples
+    // it), each sampled only when the box of its waypoints is near.
+    let n = w.len();
+    let lerp6 =
+        |a: Pt, b: Pt, c: Pt| ((a.0 + 4.0 * b.0 + c.0) / 6.0, (a.1 + 4.0 * b.1 + c.1) / 6.0);
+    let first = ((5.0 * w[0].0 + w[1].0) / 6.0, (5.0 * w[0].1 + w[1].1) / 6.0);
+    let mut out = keep(&[w[0], first]);
+    let mut cur = first;
+    for i in 2..=n {
+        let (a, b) = (w[i - 2], w[i - 1]);
+        let p = w[i.min(n - 1)];
+        let end = lerp6(a, b, p);
+        if near(boxed(&w[i.saturating_sub(3)..=i.min(n - 1)])) {
+            let bez = [
+                cur,
+                ((2.0 * a.0 + b.0) / 3.0, (2.0 * a.1 + b.1) / 3.0),
+                ((a.0 + 2.0 * b.0) / 3.0, (a.1 + 2.0 * b.1) / 3.0),
+                end,
+            ];
+            out.extend(keep(&sample_cubic(&bez, 6)));
+        }
+        cur = end;
+    }
+    out.extend(keep(&[cur, w[n - 1]]));
+    out
+}
+
+/// How far (px) two curves may lie apart and count as the same there
+/// ([`stub_keeps_clear`]), and the least gap it counts as nearer.
+const STUB_SAME: f64 = 0.5;
+/// How much longer (px) a stub may make an edge's run close beside
+/// another ([`stub_keeps_clear`]): sampling slack.
+const STUB_CLOSE_SLACK: f64 = 2.0;
+
+/// Distance from `p` to the segment `a`–`b`.
+fn seg_dist(p: Pt, a: Pt, b: Pt) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let l2 = dx * dx + dy * dy;
+    let t = if l2 > 0.0 {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / l2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
+}
+
+/// How far (px) a waypoint may lie off an end's normal and still count
+/// as on its stub ([`glyph_stubs`]), and the slack its straight stretch
+/// is judged with: rounding only.
+const STUB_ON_LINE: f64 = 0.01;
+
+/// Grow the canvas over everything painted ([`grow_canvas`]): a route
+/// round the outermost node, every stroke's width, every end glyph.
 ///
-/// A `Static` scene that reaches below zero is shifted so its minimum
-/// becomes [`MARGIN`]. A `Routed` scene is never shifted: its node
-/// positions are the host's, exactly as given (the export handles a
-/// negative origin, see `fit_top_left`).
-pub(crate) fn refit(sc: &mut Scene, mode: Mode) {
+/// A static flowchart (`Static`, `static_fit`) is fitted to its drawing
+/// exactly: shifted so the drawing starts [`MARGIN`] in on both axes —
+/// only a translation after every stage, so no route moves — and its
+/// canvas reaches exactly [`MARGIN`] past the drawing's far side. So the
+/// margins match on all four sides (room the layout left before the
+/// drawing, or past a curve's control points, is dropped: report Q2),
+/// and a host drawing the scene on its `width` × `height` sees the
+/// canvas `to_svg` writes, coordinate for coordinate. A `Routed` scene
+/// is never shifted: its node positions are the host's, exactly as given
+/// (the export handles a negative origin, see `fit_top_left`); its canvas
+/// only grows. `static_fit` is false for an ER or class scene, whose
+/// painter draws `width` × `height` as-is, padded its own way: it is
+/// shifted only out of negative space and its canvas only grows.
+pub(crate) fn refit(sc: &mut Scene, mode: Mode, static_fit: bool) {
     let mut bb = Bbox::new();
-    grow_scene(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+    grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
     if !bb.0.is_finite() {
         return;
     }
     let (minx, mut maxx, miny, mut maxy) = bb.finish();
-    if mode == Mode::Static && (minx < 0.0 || miny < 0.0) {
-        let dx = if minx < 0.0 { MARGIN - minx } else { 0.0 };
-        let dy = if miny < 0.0 { MARGIN - miny } else { 0.0 };
+    if mode == Mode::Static && static_fit {
+        // Float noise from an earlier fit is no shift: the stages are
+        // idempotent, and so is the fit (`finish` run twice).
+        let (dx, dy) = (MARGIN - minx, MARGIN - miny);
+        let (dx, dy) = (
+            if dx.abs() > FIT_EPS { dx } else { 0.0 },
+            if dy.abs() > FIT_EPS { dy } else { 0.0 },
+        );
+        if dx != 0.0 || dy != 0.0 {
+            shift_scene(sc, dx, dy);
+        }
+        let (w, h) = (maxx - minx + 2.0 * MARGIN, maxy - miny + 2.0 * MARGIN);
+        if (sc.width - w).abs() > FIT_EPS {
+            sc.width = w;
+        }
+        if (sc.height - h).abs() > FIT_EPS {
+            sc.height = h;
+        }
+        return;
+    }
+    let floor = if static_fit { MARGIN } else { 0.0 };
+    if mode == Mode::Static && (minx < floor || miny < floor) {
+        let dx = if minx < floor { MARGIN - minx } else { 0.0 };
+        let dy = if miny < floor { MARGIN - miny } else { 0.0 };
         shift_scene(sc, dx, dy);
         sc.width += dx;
         sc.height += dy;
@@ -339,6 +722,10 @@ pub(crate) fn refit(sc: &mut Scene, mode: Mode) {
     sc.width = sc.width.max(maxx + MARGIN);
     sc.height = sc.height.max(maxy + MARGIN);
 }
+
+/// How far (px) [`refit`] lets a static flowchart's drawing sit off its
+/// exact fit before it moves it: float noise, far below a pixel.
+const FIT_EPS: f64 = 1e-6;
 
 #[cfg(test)]
 mod tests {
@@ -359,6 +746,87 @@ mod tests {
         let mut again = rs.clone();
         finish(&g, &mut again, Mode::Routed);
         assert_eq!(format!("{rs:?}"), format!("{again:?}"), "routed: {src}");
+    }
+
+    /// A long edge's spline runs straight into its arrowhead along the
+    /// side's normal for a head's length at least (report M1): its last
+    /// channel leg used to slant straight into the node, the head riding
+    /// the slant; the stub points sit on the normal, the finished scene
+    /// stays a fixed point of `finish`.
+    #[test]
+    fn long_edges_run_straight_into_their_arrowheads() {
+        let src = "flowchart TD\nA --> B --> C --> D\nA --> D";
+        let g = parse(src).unwrap();
+        let sc = scene(&g);
+        let mut seen = 0;
+        // The dummy chain A -> D past B and C (a router path keeps its
+        // own stub, a corner one clearance out).
+        for e in sc
+            .edges
+            .iter()
+            .filter(|e| e.from == "A" && e.to == "D" && e.waypoints.len() >= 3)
+        {
+            let w = &e.waypoints;
+            let n = w.len();
+            let p = w[n - 1];
+            // Plumb into the top side: the two stub points right above.
+            assert_eq!((w[n - 2].0, w[n - 3].0), (p.0, p.0), "{w:?}");
+            let up = |q: (f64, f64)| p.1 - q.1;
+            assert!((up(w[n - 2]) - WAYPOINT_STUB / 2.0).abs() < 1e-9, "{w:?}");
+            assert!((up(w[n - 3]) - WAYPOINT_STUB).abs() < 1e-9, "{w:?}");
+            // The curveBasis spline's straight run into the end.
+            let straight = (up(w[n - 3]) + 4.0 * up(w[n - 2])) / 6.0;
+            assert!(straight >= ARROW_MARKER_PX, "{straight}");
+            seen += 1;
+        }
+        assert!(seen > 0, "a long edge");
+        assert_idempotent(src);
+    }
+
+    /// A stub that would bend a long edge's curve towards a node beside
+    /// it, or along another edge, is left out (B1 review #3: a stubbed
+    /// `gw -> svc5` passed 6.5 px from `lb` in bench-75, against 16.6):
+    /// the routing and port stages spaced the curve as it was.
+    #[test]
+    fn a_stub_never_crowds_a_node_or_an_edge_its_curve_kept_clear_of() {
+        let g = parse("flowchart TD\nA --> B --> C --> D\nA --> D").unwrap();
+        let sc = scene(&g);
+        let cx = ctx(&g, &sc);
+        let i = (0..sc.edges.len())
+            .find(|&i| sc.edges[i].from == "A" && sc.edges[i].to == "D")
+            .unwrap();
+        let node = |id: &str| sc.nodes.iter().position(|n| n.id == id).unwrap();
+        let d = node("D");
+        let old = sc.edges[i].waypoints.clone();
+        // A's curve runs down beside B and C to its stub into D's top.
+        let n = old.len();
+        assert!(n >= 5, "{old:?}");
+        // As it is: nothing changes, nothing crowds.
+        assert!(stub_keeps_clear(&sc, &cx, i, &old, &[d]));
+        // Its last channel point swung onto C: the curve (which only
+        // approaches its waypoints) crowds C.
+        let c = &sc.nodes[node("C")];
+        let mut onto = old.clone();
+        onto[n - 4] = (c.x, c.y);
+        assert!(!stub_keeps_clear(&sc, &cx, i, &onto, &[d]));
+        // ... swung onto the line C -> D, clear of the nodes: it runs along
+        // that line (which ends on D, the node the stub runs into: only
+        // running on top of it, within EDGE_SPACING, counts).
+        let cd = (0..sc.edges.len())
+            .find(|&j| sc.edges[j].from == "C" && sc.edges[j].to == "D")
+            .unwrap();
+        let line = edge_polyline(&sc.edges[cd]);
+        let at = |f: f64| {
+            let q = line[((line.len() - 1) as f64 * f) as usize];
+            (q.0 + 2.0, q.1)
+        };
+        let mut along = old.clone();
+        along.splice(n - 4..n - 1, [at(0.3), at(0.5), at(0.7)]);
+        assert!(!stub_keeps_clear(&sc, &cx, i, &along, &[d]));
+        // A stub moving the curve in open air is kept.
+        let mut aside = old.clone();
+        aside[n - 4].0 += 6.0;
+        assert!(stub_keeps_clear(&sc, &cx, i, &aside, &[d]));
     }
 
     #[test]
@@ -433,7 +901,7 @@ mod tests {
         for mode in [Mode::Static, Mode::Routed] {
             let mut sc = base.clone();
             shift_scene(&mut sc, -500.0, 0.0);
-            refit(&mut sc, mode);
+            refit(&mut sc, mode, true);
             let minx = sc
                 .nodes
                 .iter()

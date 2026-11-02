@@ -14,7 +14,8 @@
 
 use crate::labels::seg_cells;
 use crate::scene::{
-    edge_drawn, edge_polyline, edge_stroke_width as stroke_width, DefsKey, Scene, ARROW_MARKER_PX,
+    edge_drawn, edge_head_len, edge_painted_polyline, edge_stroke_width as stroke_width, DefsKey,
+    Scene, ARROW_MARKER_PX,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -88,10 +89,25 @@ fn dist(a: Pt, b: Pt) -> f64 {
 /// no cut, and left out (see [`cut_kinds`]). The quality yardstick reads
 /// this too, to count the cuts each edge collects (G1).
 pub(crate) fn crossings(sc: &Scene) -> Vec<(usize, usize, Pt, bool)> {
-    crossings_with(sc, true)
-        .into_iter()
+    gapped(crossings_with(sc, true))
+}
+
+/// The crossings of [`crossings_in`] that get a cut, as [`crossings`]
+/// lists them.
+fn gapped(xs: Vec<(usize, usize, Pt, Cut)>) -> Vec<(usize, usize, Pt, bool)> {
+    xs.into_iter()
         .filter(|x| x.3 != Cut::Plain)
         .map(|(u, o, p, c)| (u, o, p, c == Cut::Notch))
+        .collect()
+}
+
+/// Every edge's stroke as painted ([`edge_painted_polyline`]) where
+/// [`crossings_in`] looks for crossings (a drawn edge between two
+/// nodes), else `None`.
+fn painted_lines(sc: &Scene) -> Vec<Option<Vec<Pt>>> {
+    sc.edges
+        .iter()
+        .map(|e| (edge_drawn(e) && e.from != e.to).then(|| edge_painted_polyline(e)))
         .collect()
 }
 
@@ -157,16 +173,23 @@ fn cut_kinds(gaps: &[(usize, f64)]) -> Vec<Cut> {
 /// [`crossings`], optionally keeping those next to an edge end too (the
 /// set the quality yardstick counts as `edge_edge_x`).
 fn crossings_with(sc: &Scene, skip_ends: bool) -> Vec<(usize, usize, Pt, Cut)> {
-    let idx: Vec<usize> = (0..sc.edges.len())
-        .filter(|&i| {
-            let e = &sc.edges[i];
-            edge_drawn(e) && e.from != e.to
-        })
-        .collect();
+    crossings_in(sc, &painted_lines(sc), skip_ends)
+}
+
+/// [`crossings_with`] of the strokes `all` ([`painted_lines`]: edge
+/// `i`'s painted polyline, `None` for one never crossed), so a painter
+/// that already holds them works none out twice.
+fn crossings_in(
+    sc: &Scene,
+    all: &[Option<Vec<Pt>>],
+    skip_ends: bool,
+) -> Vec<(usize, usize, Pt, Cut)> {
+    let idx: Vec<usize> = (0..sc.edges.len()).filter(|&i| all[i].is_some()).collect();
     if idx.len() < 2 {
         return Vec::new();
     }
-    let lines: Vec<Vec<Pt>> = idx.iter().map(|&i| edge_polyline(&sc.edges[i])).collect();
+    // The strokes as painted (their squared glyph ends included).
+    let lines: Vec<&[Pt]> = idx.iter().filter_map(|&i| all[i].as_deref()).collect();
 
     // Segment grid: cell -> (line, segment). A segment too long to
     // bucket (a node dragged far away) is checked against every other
@@ -244,11 +267,18 @@ fn crossings_with(sc: &Scene, skip_ends: bool) -> Vec<(usize, usize, Pt, Cut)> {
                     continue;
                 };
                 // Counted up to an end the two share (the yardstick's
-                // rule): ends crossing on their port legs cross too.
-                let near_end = skip_ends
-                    && [pa[0], pa[pa.len() - 1], pb[0], pb[pb.len() - 1]]
+                // rule): ends crossing on their port legs cross too. A
+                // gap masks a disc of the under-line, end glyph and all:
+                // none within a glyph and the disc's radius of an end, so
+                // a gap never bites a head.
+                let near_end = skip_ends && {
+                    let (ea, eb) = (&sc.edges[idx[ka]], &sc.edges[idx[kb]]);
+                    let head = edge_head_len(ea).max(edge_head_len(eb));
+                    let reach = head + gap_reach(ea, eb);
+                    [pa[0], pa[pa.len() - 1], pb[0], pb[pb.len() - 1]]
                         .iter()
-                        .any(|&q| dist(p, q) < ARROW_MARKER_PX);
+                        .any(|&q| dist(p, q) < reach)
+                };
                 if near_end {
                     continue;
                 }
@@ -284,6 +314,15 @@ fn crossings_with(sc: &Scene, skip_ends: bool) -> Vec<(usize, usize, Pt, Cut)> {
         x.3 = kind;
     }
     out
+}
+
+/// Radius (px) of the widest gap [`masks`] can cut where edges `a` and
+/// `b` cross, whichever passes under: the over-line's half stroke, the
+/// air and the halo.
+fn gap_reach(a: &crate::scene::SceneEdge, b: &crate::scene::SceneEdge) -> f64 {
+    let (wa, wb) = (stroke_width(a), stroke_width(b));
+    let hole = |under: f64, over: f64| over / 2.0 + CASING_GAP_STROKES * under + CASING_HALO;
+    hole(wa, wb).max(hole(wb, wa))
 }
 
 /// One crossing of a line pair `(a, b)`, `a < b`: the point, and how
@@ -885,9 +924,9 @@ fn add_gap(gaps: &mut Vec<f64>, s: f64) {
 /// count of lines, and of where they head off rather than where they
 /// land, so a wide fan-out across the flow never outvotes it. A tie
 /// goes to top-down, mermaid's default.
-fn back_edges(lines: &[Vec<Pt>]) -> Vec<bool> {
-    let delta = |p: &Vec<Pt>| (p[p.len() - 1].0 - p[0].0, p[p.len() - 1].1 - p[0].1);
-    let first_step = |p: &Vec<Pt>| {
+fn back_edges(lines: &[&[Pt]]) -> Vec<bool> {
+    let delta = |p: &&[Pt]| (p[p.len() - 1].0 - p[0].0, p[p.len() - 1].1 - p[0].1);
+    let first_step = |p: &&[Pt]| {
         p.iter()
             .map(|q| (q.0 - p[0].0, q.1 - p[0].1))
             .find(|d| d.0 != 0.0 || d.1 != 0.0)
@@ -920,13 +959,31 @@ fn back_edges(lines: &[Vec<Pt>]) -> Vec<bool> {
 /// `t` maps scene to SVG coordinates (as `to_svg` draws); ids are
 /// `{dom}-x{edge}`, `dom` being the diagram's dom id or, when it has
 /// none, a hash of the scene's geometry, so several SVGs on one page
-/// never share an id unless they draw the same thing.
-pub(crate) fn masks(sc: &Scene, t: &dyn Fn(Pt) -> Pt, dom_id: Option<&str>) -> Masks {
+/// never share an id unless they draw the same thing. `line_of(i)` is
+/// edge `i`'s stroke as painted ([`edge_painted_polyline`]), asked once
+/// per edge that can cross and only when the scene gets masks at all:
+/// the painter hands over the strokes it draws, worked out once.
+pub(crate) fn masks(
+    sc: &Scene,
+    line_of: &dyn Fn(usize) -> Vec<Pt>,
+    t: &dyn Fn(Pt) -> Pt,
+    dom_id: Option<&str>,
+) -> Masks {
     let mut attr = vec![String::new(); sc.edges.len()];
-    let xs = if sc.edges.len() > CASING_MAX_EDGES {
+    let lines: Vec<Option<Vec<Pt>>> = if sc.edges.len() > CASING_MAX_EDGES {
         Vec::new()
     } else {
-        crossings(sc)
+        (0..sc.edges.len())
+            .map(|i| {
+                let e = &sc.edges[i];
+                (edge_drawn(e) && e.from != e.to).then(|| line_of(i))
+            })
+            .collect()
+    };
+    let xs = if lines.is_empty() {
+        Vec::new()
+    } else {
+        gapped(crossings_in(sc, &lines, true))
     };
     if xs.is_empty() {
         return Masks {
@@ -950,7 +1007,7 @@ pub(crate) fn masks(sc: &Scene, t: &dyn Fn(Pt) -> Pt, dom_id: Option<&str>) -> M
     }
     let mut defs = String::new();
     for (u, holes) in per {
-        let pts = edge_polyline(&sc.edges[u]);
+        let pts = lines[u].as_deref().unwrap_or_default();
         let (mut x0, mut y0, mut x1, mut y1) = (
             f64::INFINITY,
             f64::INFINITY,
@@ -1040,6 +1097,34 @@ mod tests {
         assert!(cut_kinds(&sparse).iter().all(|k| *k == Cut::Gap));
     }
 
+    /// B1 review #6: a gap is a disc on the under-line, its arrowhead
+    /// included; a crossing just over a head's length from a tip still
+    /// bit that head. Crossings within a head and the widest gap's
+    /// radius of an end get no gap.
+    #[test]
+    fn a_crossing_gap_never_bites_an_arrowhead() {
+        let mut sc = scene(&parse("flowchart TD\nA --> B\nC --> D\n").unwrap());
+        let line = |a: Pt, b: Pt| {
+            [
+                a,
+                (a.0 + (b.0 - a.0) / 3.0, a.1 + (b.1 - a.1) / 3.0),
+                (a.0 + (b.0 - a.0) * 2.0 / 3.0, a.1 + (b.1 - a.1) * 2.0 / 3.0),
+                b,
+            ]
+        };
+        let reach = ARROW_MARKER_PX + gap_reach(&sc.edges[0], &sc.edges[1]);
+        assert!(reach > ARROW_MARKER_PX + 4.0, "{reach}");
+        for (y, gapped) in [(-(ARROW_MARKER_PX + 2.0), false), (-(reach + 2.0), true)] {
+            for e in &mut sc.edges {
+                e.waypoints.clear();
+            }
+            // Down into the tip at the origin; across 200 px from either end.
+            sc.edges[0].bezier = line((0.0, -300.0), (0.0, 0.0));
+            sc.edges[1].bezier = line((-200.0, y), (200.0, y));
+            assert_eq!(crossings(&sc).len(), usize::from(gapped), "crossing at {y}");
+        }
+    }
+
     fn fixtures() -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = std::fs::read_dir(FIXTURES)
             .unwrap()
@@ -1064,7 +1149,7 @@ mod tests {
         for x in 0..idx.len() {
             for y in x + 1..idx.len() {
                 let (ea, eb) = (&sc.edges[idx[x]], &sc.edges[idx[y]]);
-                let (a, b) = (edge_polyline(ea), edge_polyline(eb));
+                let (a, b) = (edge_painted_polyline(ea), edge_painted_polyline(eb));
                 let mut hits: Vec<Pt> = Vec::new();
                 for sa in a.windows(2) {
                     for sb in b.windows(2) {
@@ -1114,7 +1199,7 @@ mod tests {
     fn crossing_free_diagrams_get_no_mask() {
         let g = parse("flowchart TD\nA-->B\nA-->C\nB-->D\nC-->D").unwrap();
         let sc = scene(&g);
-        let m = masks(&sc, &|p| p, None);
+        let m = masks(&sc, &|i| edge_painted_polyline(&sc.edges[i]), &|p| p, None);
         assert!(m.defs.is_empty() && m.attr.iter().all(String::is_empty));
         assert!(!to_svg(&sc).contains("<mask"));
     }
@@ -1277,7 +1362,8 @@ mod tests {
             (100.0, 40.0),
             (0.0, 0.0),
         ]);
-        let back = back_edges(&lines);
+        let refs: Vec<&[Pt]> = lines.iter().map(Vec::as_slice).collect();
+        let back = back_edges(&refs);
         assert_eq!(back.iter().filter(|b| **b).count(), 1, "{back:?}");
         assert!(back[lines.len() - 1]);
     }

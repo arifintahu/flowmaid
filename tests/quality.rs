@@ -145,8 +145,12 @@ fn quality_gate() {
 /// fixtures, per mode (static, routed). Before the router priced border
 /// runs: 1826 static, 2387 routed (hand-made dense fixtures). Re-measured
 /// on the generated dense fixtures, whose long edges cross nested
-/// frames: 1069 / 2131.
-const BORDER_LEN_MAX: (f64, f64) = (1_070.0, 2_140.0);
+/// frames: 1069 / 2131. B1 review r3 (#3): 1082 static — two bench-75
+/// ends just inside the `data` frame (svc3 -> db, user -> gw) that swing
+/// in from the side now enter their heads along the line touching their
+/// curve instead of an S hugging it, and that line runs 9 and 3 px
+/// longer within reach of the frame's left border; no route changed.
+const BORDER_LEN_MAX: (f64, f64) = (1_082.0, 2_140.0);
 
 /// Edges keep off frame borders where their channel has room (G4).
 #[test]
@@ -239,8 +243,12 @@ fn labels_cover_nothing_they_must_not() {
 fn layout_shape_gate() {
     /// Most `center_off` of the wide-labels fixture (0.31.1: 0.70).
     const WIDE_LABELS_CENTER_OFF: f64 = 0.35;
-    /// Most aspect ratio of any fixture, static.
-    const MAX_ASPECT: f64 = 5.0;
+    /// Most aspect ratio of any fixture, static. 5.0 -> 5.5 with report
+    /// Q2: the canvas no longer reaches a bow's control points, and
+    /// wide-labels lost the blank 68 px band they added (413 -> 345 px
+    /// tall, 4.47 -> 5.36, the drawing itself unchanged); its bows
+    /// narrow with B3.
+    const MAX_ASPECT: f64 = 5.5;
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/quality");
     for &(name, _, _) in CEILINGS {
         let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");
@@ -331,8 +339,13 @@ const CHANNEL_MAX: [(&str, f64, f64); 4] = [
 /// (`route()` only prices a touch, as the wider rule costs a drag
 /// reroutes that lie on other edges, G1): 2 in `bench-75`, legs into
 /// the frame the chip names passing it within the spacing, never
-/// through it.
-const EDGE_CHIP_MAX: (usize, usize) = (0, 2);
+/// through it. Routed 2 -> 3 with report Q2 / P1: a static scene is now
+/// fitted to its drawing exactly (dense-td's had 315 px of unused room
+/// on the left), so `route()` over its centres sees them translated and
+/// float-exact router ties fall the other way (see `MARGIN`): one leg
+/// into `dense-td`'s g9, running down its border, now passes its chip
+/// within the spacing.
+const EDGE_CHIP_MAX: (usize, usize) = (0, 3);
 
 /// Edges keep their channel (G1/G4) and keep off frames' title chips
 /// (G6), in either mode.
@@ -384,28 +397,64 @@ fn channels_keep_edges_apart_and_off_chips() {
 /// count the edges not yet drawn orthogonally (§2.1: S-cubics, dummy
 /// chain splines, back-edge bows), `x_drawn` the crossings a reader
 /// sees, level and plumb edges included.
-const DEFECT_BASELINE: [(&str, f64, f64); 14] = [
-    ("end_tilt", 24.0, 19.0),
-    ("end_tilt_max", 86.5, 128.4),
+///
+/// B1 (report Q1 + M1): end_tilt 24 -> 14 static — every head faces
+/// along its curve's own end tangent, the stroke cut back to it, and a
+/// long edge whose last channel leg slanted into its node ends in a
+/// straight stub along the side's normal where that keeps the curve as
+/// clear as it was; the routed 19 left are back-edge bows (B3) and ends
+/// the ports stage turned round a corner. `end_kink` (new) lands at
+/// 62 | 81: the painter bends a curve still turning at its end into a
+/// straight run only within a px of the scene's curve, which the
+/// routing, port and label stages spaced; an S-cubic whose handles are
+/// a fraction of its sideways reach (a wide fan's outer branches)
+/// turns far more over its last head than that allows, so its stroke
+/// enters the head from the side (squaring those needs the scene's own
+/// geometry). As painted, the squared ends step sideways by up to that
+/// px: lat_backtrack 674 -> 676 routed (three turned ends in
+/// bench-75), band_len 46 446 -> 46 610 routed. idiom_spline 19 -> 25
+/// static: a long edge whose channel legs were level but whose last leg
+/// slanted into its node counted as orthogonal though it never was; the
+/// slant now sits before its stub, where the count sees it. B1 review r3
+/// (#3): end_kink 62 | 81 -> 60 | 77, band_len 46 610 -> 46 604 and
+/// x_drawn 521 -> 520 routed — a curve swinging in from the side enters
+/// its head along the line touching it (no S where it leaves the curve,
+/// no hump before the head), and one that slips in under the head first
+/// keeps its own curve up to there. The kinks left are those S-cubics:
+/// their stroke meets the head at the angle the scene's curve arrives
+/// at, which only the edge's own shape can change.
+///
+/// B2 (report Q2 / P1): a static scene is fitted to its drawing exactly,
+/// so `route()` over its centres sees translated inputs (dense-td moves
+/// 315 px left, bench-75 4 px up) and float-exact router ties fall the
+/// other way, the static drawings unchanged: routed band_pairs 117 ->
+/// 118 (one more short cable in dense-td), band_len 46 604 -> 46 246 and
+/// x_drawn 520 -> 517 (bench-75).
+const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
+    ("end_tilt", 14.0, 19.0),
+    ("end_tilt_max", 86.3, 128.4),
     ("end_gaps", 11.0, 11.0),
     ("end_gap_max", 4.7, 4.7),
     ("lat_wiggles", 16.0, 19.0),
-    ("lat_backtrack", 1_902.0, 674.0),
+    ("lat_backtrack", 1_902.0, 676.0),
     ("own_frame_x", 1.0, 0.0),
     ("own_frame_len", 32.0, 0.0),
-    ("band_pairs", 93.0, 117.0),
-    ("band_len", 41_640.0, 46_446.0),
+    ("band_pairs", 93.0, 118.0),
+    ("band_len", 41_640.0, 46_246.0),
     ("idiom_scubic", 60.0, 83.0),
-    ("idiom_spline", 19.0, 21.0),
+    ("idiom_spline", 25.0, 21.0),
     ("idiom_bow", 7.0, 8.0),
-    ("x_drawn", 521.0, 521.0),
+    ("x_drawn", 521.0, 517.0),
+    ("end_kink", 60.0, 77.0),
+    ("ink_out", 0.0, 0.0),
 ];
 
 /// Least mean `ink` over the fixtures (static, routed): the painted
 /// share of the canvas (report §6 keeps the compact, text-sized
 /// drawing; B6 judges sparse canvases by it). A floor at the landing
-/// values (0.0889 | 0.1048), raised as canvases tighten.
-const INK_MEAN_MIN: (f64, f64) = (0.088, 0.104);
+/// values (0.0889 | 0.1048), raised as canvases tighten: 0.0960 |
+/// 0.1091 once the canvas stopped reaching control points (report Q2).
+const INK_MEAN_MIN: (f64, f64) = (0.095, 0.108);
 
 /// The defect baseline of report M0 holds in either mode: no package
 /// adds askew ends, gaps at outlines, sideways wiggles, own-frame
