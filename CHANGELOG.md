@@ -117,12 +117,22 @@ Minor, not patch: several class structs gain public fields (see
   either end, the cross and the circle — is now 11 px in user space
   (`markerUnits="userSpaceOnUse"`), so a thick `==>` edge no longer draws
   a head twice the size (about 22 px) and a `linkStyle stroke-width` edge
-  shares the head too. The head is the wider `M 0 0 L 10 5 L 0 10 z`
-  triangle. The SVG painter stops the stroke half a head short under an
-  arrowhead — a `linkStyle` stroke wider than that its own width short, up
-  to a whole head — with `refX` putting the tip back exactly on the node
-  border, so the butt end of the stroke no longer pokes out beside the tip
-  and the tip no longer overshoots into the node. Every glyph faces along
+  up to about 6 px shares the head too. The head is the wider
+  `M 0 0 L 10 5 L 0 10 z` triangle. The SVG painter stops the stroke half
+  a head short under an arrowhead — a `linkStyle` stroke wider than that
+  its own width short — with `refX` putting the tip back exactly on the
+  node border, so the butt end of the stroke no longer pokes out beside
+  the tip and the tip no longer overshoots into the node. Over a stroke so
+  wide the head would no longer hold its cut, the corner onto the straight
+  run past it and half the stroke there, the head grows to just that
+  (`width + 1.5 + width / 2` px: 13.5 px for 8 px, 22.5 px for 14 px; a
+  14 px stroke used to end in a butt wider than its 11 px head, notched
+  where it met a 1.5 px run), its stroke runs straight through it, bending
+  into the run within half its width of the curve. On a curve too short
+  to lose its cut (nodes a few px apart mid-drag, stroked whole) a head
+  is cut nowhere, its tip on the curve's end, and shrinks onto its share
+  of the curve (left out under 1 px), instead of reaching its usual cut
+  past the curve's end into the node, where picking did not see it. Every glyph faces along
   its curve's own end tangent (square to the side wherever the curve
   arrives square): the painter ends a curve that still turns there in a
   straight run along that tangent, bending into it within a pixel of the
@@ -149,7 +159,8 @@ Minor, not patch: several class structs gain public fields (see
   a `linkStyle` width no longer needs a size variant, so the `-u` ids
   (`arrow-u`, `arrow-u__<colour>`) are gone — a coloured end is
   `<base id>_<colour>` (`arrow__ff3`), a stroke wider than 5.5 px gets
-  `<base id>-t<width>` (`arrow-t8`, the same head set further ahead), and
+  `<base id>-t<width>` (the head set further ahead), a head not 11 px long
+  adds `-s<length>` (`arrow-t8-s13_5`; a shrunk one `arrow-t0-s4_1`), and
   an unstyled one keeps its base id. Arrowheads standing side by side
   closer than a head and 1.5 px apart (an over-full side's ports, about
   10 px apart) are drawn narrower, `<base id>-w<width>` (`arrow-w8_5`,

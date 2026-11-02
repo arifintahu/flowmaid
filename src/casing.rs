@@ -14,8 +14,8 @@
 
 use crate::labels::seg_cells;
 use crate::scene::{
-    edge_drawn, edge_painted_polyline, edge_stroke_width as stroke_width, DefsKey, Scene,
-    ARROW_MARKER_PX,
+    edge_drawn, edge_head_len, edge_painted_polyline, edge_stroke_width as stroke_width, DefsKey,
+    Scene, ARROW_MARKER_PX,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -272,7 +272,9 @@ fn crossings_in(
                 // none within a glyph and the disc's radius of an end, so
                 // a gap never bites a head.
                 let near_end = skip_ends && {
-                    let reach = ARROW_MARKER_PX + gap_reach(&sc.edges[idx[ka]], &sc.edges[idx[kb]]);
+                    let (ea, eb) = (&sc.edges[idx[ka]], &sc.edges[idx[kb]]);
+                    let head = edge_head_len(ea).max(edge_head_len(eb));
+                    let reach = head + gap_reach(ea, eb);
                     [pa[0], pa[pa.len() - 1], pb[0], pb[pb.len() - 1]]
                         .iter()
                         .any(|&q| dist(p, q) < reach)
