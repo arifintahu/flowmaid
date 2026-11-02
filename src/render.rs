@@ -286,6 +286,36 @@ mod tests {
         assert_eq!(s0.nodes.len(), s1.nodes.len());
         assert_eq!(s0.edges.len(), s1.edges.len());
         assert_eq!(s0.clusters.len(), s1.clusters.len());
+
+        // `Reg --> Platform` ranks the CI box above Platform, though a
+        // cycle (`Cache --> Gate`) gives every Platform member an
+        // internal in-edge; the boxes used to sit side by side.
+        let frame = |id: &str| s0.clusters.iter().find(|c| c.id == id).unwrap();
+        let (ci, pf) = (frame("CI"), frame("Platform"));
+        assert!(
+            ci.y + ci.h < pf.y,
+            "CI bottom {} must be above Platform top {}",
+            ci.y + ci.h,
+            pf.y
+        );
+        let ends = |from: &str, to: &str| {
+            let e = s0
+                .edges
+                .iter()
+                .find(|e| e.from == from && e.to == to)
+                .unwrap();
+            let pl = crate::scene::edge_polyline(e);
+            (pl[0], pl[pl.len() - 1])
+        };
+        // It drops onto Platform's top side from above ...
+        let (p0, p3) = ends("Reg", "Platform");
+        assert!((p3.1 - pf.y).abs() < 0.5 && p0.1 < p3.1, "{p0:?} -> {p3:?}");
+        assert!(p3.0 > pf.x && p3.0 < pf.x + pf.w);
+        // ... and `Rollback --> Platform` runs straight up into its
+        // bottom side: no S towards the box's entry member at its top.
+        let (p0, p3) = ends("Rollback", "Platform");
+        assert!((p3.1 - (pf.y + pf.h)).abs() < 0.5, "{p3:?}");
+        assert!((p0.0 - p3.0).abs() < 0.5, "straight: {p0:?} -> {p3:?}");
     }
 
     /// End-to-end showcase for stateDiagram-v2 riding the flowchart

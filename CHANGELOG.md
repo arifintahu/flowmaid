@@ -372,6 +372,19 @@ Minor, not patch: several class structs gain public fields (see
   that is still open (an enclosing one) still gives a node up to the
   nested block mentioning it, and a top-level node still joins the first
   block that mentions it.
+- **An edge into (or out of) a subgraph ranks it even when a cycle runs
+  through the box.** `A --> box` lays the box out after `A` by standing
+  for the box's entry members — those without an in-edge from inside it.
+  A cycle inside the box (`Cache --> Gate` in the advanced showcase's
+  Platform) left every member an internal in-edge, so the edge shaped no
+  rank at all: the CI box sat beside Platform instead of above it, and
+  `Reg --> Platform` ran sideways into Platform's flank. The edges that
+  close such a cycle are now set aside (a depth-first walk over the box's
+  own edges, in declaration order), so `Gate` enters Platform, CI stacks
+  above it and `Reg --> Platform` drops straight onto its top. An edge
+  meeting a box against the flow (`Rollback --> Platform` from below) now
+  runs straight across the gap into the facing side instead of bending
+  towards the box's entry member at its far side.
 - **Nothing drawn is cut off at the canvas edge.** The canvas (`to_svg`'s
   view box, a laid-out scene's `width` / `height`, the quality yardstick's
   `width` / `height`) was the bounds of the nodes, frames, labels and each

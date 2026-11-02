@@ -3625,8 +3625,9 @@ fn sub_edge_ported(
 ) -> Option<[(f64, f64); 4]> {
     let dir = g.direction;
     let horizontal = matches!(dir, Direction::LR | Direction::RL);
-    // Flow-space extent of an end: (breadth centre, layer lo, layer hi).
-    let extent = |end: End| -> Option<(f64, f64, f64)> {
+    // Flow-space extent of an end: (breadth centre, layer lo, layer hi,
+    // breadth lo, breadth hi).
+    let extent = |end: End| -> Option<(f64, f64, f64, f64, f64)> {
         let (x, y, w, h) = match end {
             End::Node(v) => {
                 let n = &nodes[v];
@@ -3636,7 +3637,13 @@ fn sub_edge_ported(
         };
         let (b0, l0) = to_flow(dir, (x, y));
         let (b1, l1) = to_flow(dir, (x + w, y + h));
-        Some(((b0 + b1) / 2.0, l0.min(l1), l0.max(l1)))
+        Some((
+            (b0 + b1) / 2.0,
+            l0.min(l1),
+            l0.max(l1),
+            b0.min(b1),
+            b0.max(b1),
+        ))
     };
     let (fa, ta) = (extent(from.0)?, extent(to.0)?);
     // Does `to` lie after `from` along the flow (else before)?
@@ -3655,9 +3662,20 @@ fn sub_edge_ported(
     };
     // A box end's port: its frame side facing the other end, at the
     // breadth of the proxy member nearest to `toward` (the box centre
-    // without one).
-    let port = |members: &[usize], ext: (f64, f64, f64), toward: f64, exit: bool| {
-        let b = nearest(members, toward).unwrap_or(ext.0);
+    // without one). Against the flow (`Rollback --> Platform` from
+    // below) the proxies sit at the box's far side — its entry members
+    // head it, its exit members close it — so the port faces the other
+    // end instead, kept `SUB_PAD` inside the frame's corners: one short
+    // run straight across the gap, not an S towards a member out of
+    // sight beyond the box.
+    let port = |members: &[usize], ext: (f64, f64, f64, f64, f64), toward: f64, exit: bool| {
+        let b = if ahead {
+            nearest(members, toward).unwrap_or(ext.0)
+        } else {
+            toward
+                .max(ext.3 + SUB_PAD)
+                .min((ext.4 - SUB_PAD).max(ext.3 + SUB_PAD))
+        };
         (b, if ahead == exit { ext.2 } else { ext.1 })
     };
     // A node end sits on the node's own border, like any edge.
@@ -3726,19 +3744,87 @@ fn sub_edge_proxies(g: &Graph, node_cluster: &[Vec<usize>], grid: &[RankGroup]) 
             has_out.insert((*ca, from));
         }
     }
-    let members = |s: usize, flags: &std::collections::HashSet<(usize, usize)>| -> Vec<usize> {
-        (0..g.nodes.len())
+    let members = |s: usize, entry: bool| -> Vec<usize> {
+        let flags = if entry { &has_in } else { &has_out };
+        let m: Vec<usize> = (0..g.nodes.len())
             .filter(|&v| node_cluster[v].contains(&s) && !flags.contains(&(s, v)))
-            .collect()
+            .collect();
+        if !m.is_empty() {
+            return m;
+        }
+        // A cycle inside the box leaves every member an internal in-edge
+        // (out-edge): `Cache --> Gate` in the showcase's Platform. Then
+        // the box stood for no member, and an edge to (from) it shaped
+        // no rank at all — `Reg --> Platform` set the CI box beside
+        // Platform instead of above it. The members whose only internal
+        // in-edges (out-edges) close a cycle stand for it instead.
+        cycle_ends(g, node_cluster, grid, s, entry)
     };
-    let ends = |end: End, flags| match end {
+    let ends = |end: End, entry: bool| match end {
         End::Node(v) => vec![v],
-        End::Sub(s) => members(s, flags),
+        End::Sub(s) => members(s, entry),
     };
     g.sub_edges
         .iter()
-        .map(|e| (ends(e.from, &has_out), ends(e.to, &has_in)))
+        .map(|e| (ends(e.from, false), ends(e.to, true)))
         .collect()
+}
+
+/// The members of box `s` that enter it (`entry`) or leave it once
+/// the edges closing a cycle inside it are set aside: those a
+/// depth-first walk over the box's own edges (and `grid` pairs), in
+/// declaration order, finds running back to a node still on its path.
+/// The members with no other internal in-edge (out-edge) — never empty
+/// for a box with members: the root of the walk's last tree has none
+/// (an edge into it from an earlier tree would have joined that tree),
+/// and the first node it finishes has no other out-edge (all its
+/// out-edges run back up its path). Members come in declaration order.
+fn cycle_ends(
+    g: &Graph,
+    node_cluster: &[Vec<usize>],
+    grid: &[RankGroup],
+    s: usize,
+    entry: bool,
+) -> Vec<usize> {
+    let inside = |v: usize| node_cluster[v].contains(&s);
+    let n = g.nodes.len();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let pairs = g.edges.iter().map(|e| (e.from, e.to));
+    for (a, b) in pairs.chain(grid.iter().map(|(a, b)| (a[0], b[0]))) {
+        if a != b && inside(a) && inside(b) {
+            adj[a].push(b);
+        }
+    }
+    // 0 unvisited, 1 on the walk's path, 2 done.
+    let mut state = vec![0u8; n];
+    let mut keep_in = vec![false; n];
+    let mut keep_out = vec![false; n];
+    for root in (0..n).filter(|&v| inside(v)) {
+        if state[root] != 0 {
+            continue;
+        }
+        state[root] = 1;
+        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+        while let Some(&mut (u, ref mut next)) = stack.last_mut() {
+            let Some(&w) = adj[u].get(*next) else {
+                state[u] = 2;
+                stack.pop();
+                continue;
+            };
+            *next += 1;
+            if state[w] == 1 {
+                continue; // closes a cycle: set aside
+            }
+            keep_out[u] = true;
+            keep_in[w] = true;
+            if state[w] == 0 {
+                state[w] = 1;
+                stack.push((w, 0));
+            }
+        }
+    }
+    let flags = if entry { &keep_in } else { &keep_out };
+    (0..n).filter(|&v| inside(v) && !flags[v]).collect()
 }
 
 /// Rank-only pairs that pack a subgraph's loose members into a roughly
@@ -9678,6 +9764,43 @@ mod tests {
             .map(|n| n.y)
             .fold(f64::INFINITY, f64::min);
         assert!(high_b > low_a, "B ranks below A");
+    }
+
+    #[test]
+    fn an_edge_into_a_box_with_a_cycle_still_ranks_the_box_below() {
+        // Every member of B has an internal in-edge (b2 --> b1 closes a
+        // cycle), so B stood for no member: `a2 --> B` shaped no rank,
+        // and the boxes sat side by side. The cycle's closing edge is set
+        // aside: b1 enters B, b2 leaves it.
+        let src = "flowchart TD\nsubgraph A\n a1-->a2\nend\na2-->B\n\
+                   subgraph B\n b1-->b2\n b2-->b1\nend\nB-->z";
+        let g = parse(src).unwrap();
+        let nc = node_cluster_paths(&g);
+        let groups = sub_edge_proxies(&g, &nc, &[]);
+        let id = |v: &[usize]| -> Vec<&str> { v.iter().map(|&i| g.nodes[i].id.as_str()).collect() };
+        assert_eq!(id(&groups[0].1), ["b1"], "B entered at b1");
+        assert_eq!(id(&groups[1].0), ["b2"], "B left at b2");
+        // A box that is one cycle still has an entry and an exit.
+        let g2 = parse("flowchart TD\nx-->C\nsubgraph C\n c1-->c2-->c3-->c1\nend\nC-->y").unwrap();
+        let groups = sub_edge_proxies(&g2, &node_cluster_paths(&g2), &[]);
+        assert_eq!(groups[0].1, [g2.node_index("c1").unwrap()]);
+        assert_eq!(groups[1].0, [g2.node_index("c3").unwrap()]);
+        let s = scene(&g);
+        let frame = |id: &str| s.clusters.iter().find(|c| c.id == id).unwrap();
+        let (a, b) = (frame("A"), frame("B"));
+        assert!(
+            a.y + a.h < b.y,
+            "A ({}..{}) above B ({})",
+            a.y,
+            a.y + a.h,
+            b.y
+        );
+        // The edge drops straight from a2 onto B's top side.
+        let e = s.edges.iter().find(|e| e.to == "B").unwrap();
+        let pl = edge_polyline(e);
+        let (p0, p3) = (pl[0], pl[pl.len() - 1]);
+        assert!((p3.1 - b.y).abs() < 0.5, "ends on B's top, got {p3:?}");
+        assert!((p0.0 - p3.0).abs() < 0.5, "straight drop: {p0:?} -> {p3:?}");
     }
 
     #[test]
