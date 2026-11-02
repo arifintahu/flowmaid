@@ -19,7 +19,7 @@ use crate::model::{Direction, EdgeCurve, Graph, Shape};
 use crate::parser::parse_document;
 use crate::scene::{
     self, edge_drawn, edge_end_tangent, edge_painted_polyline, edge_stroke_width, node_outline,
-    Scene, SceneEdge, SceneNode, SVG_MARGIN,
+    Scene, SceneEdge, SceneNode, MARGIN,
 };
 use crate::Document;
 use std::collections::HashMap;
@@ -319,6 +319,11 @@ pub struct Metrics {
     /// square the head itself (report §2.3, M1: the last head length runs
     /// straight).
     pub end_kink: usize,
+    /// Drawn edges with ink off the canvas: a stroke as painted (half its
+    /// width out) or an end glyph's box outside the drawing's bounds
+    /// plus the padding `to_svg` gives them, i.e. clipped by the SVG's
+    /// view box (B1 review). Gated at 0.
+    pub ink_out: usize,
     /// One line per node/frame crossing, parallel overlap, close edge
     /// pair, label on a node or arrowhead, wiggle, wrong frame side and
     /// shared port, naming the elements (`from->to kind other`), for
@@ -415,6 +420,7 @@ impl Metrics {
             ("idiom_bow", self.idiom_bow as f64, Sum),
             ("x_drawn", self.x_drawn as f64, Sum),
             ("end_kink", self.end_kink as f64, Sum),
+            ("ink_out", self.ink_out as f64, Sum),
         ]
     }
 
@@ -1002,12 +1008,12 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
 
     // Frame title chips, as `to_svg` draws them.
     let mut bb = scene::Bbox::new();
-    scene::grow_scene(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+    scene::grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
     let (minx, maxx, miny, maxy) = bb.finish();
     let chips: Vec<Rect> = (0..sc.clusters.len())
         .map(|ci| {
             let c = &sc.clusters[ci];
-            let title = scene::fit_cluster_title(&sc.clusters, ci, maxx + SVG_MARGIN);
+            let title = scene::fit_cluster_title(&sc.clusters, ci, maxx + MARGIN);
             let (x, y) = (c.x + CHIP_INSET_X, c.y + CHIP_INSET_Y);
             Rect(
                 x,
@@ -1021,7 +1027,7 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
     // [`CHIP_SEP`] off (G6).
     let heads: Vec<Rect> = (0..sc.clusters.len())
         .map(|ci| {
-            let h = scene::title_head(&sc.clusters, ci, maxx + SVG_MARGIN);
+            let h = scene::title_head(&sc.clusters, ci, maxx + MARGIN);
             Rect(h.0, h.1, h.2, h.3)
         })
         .collect();
@@ -1747,8 +1753,8 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
             m.center_off = ((c - (span_lo + span_hi) / 2.0).abs() / half).min(1.0);
         }
     }
-    m.width = (maxx - minx) + 2.0 * SVG_MARGIN;
-    m.height = (maxy - miny) + 2.0 * SVG_MARGIN;
+    m.width = (maxx - minx) + 2.0 * MARGIN;
+    m.height = (maxy - miny) + 2.0 * MARGIN;
     m.aspect = m.width.max(m.height) / m.width.min(m.height).max(1.0);
     m.area_per_node = m.width * m.height / m.nodes.max(1) as f64;
     // Ink: shapes as painted, label boxes, strokes (length × width).
@@ -1763,6 +1769,30 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
         ink += len * edge_stroke_width(e);
     }
     m.ink = ink / (m.width * m.height).max(1.0);
+    // Ink off the canvas `to_svg` writes: the drawing's bounds and the
+    // padding round them.
+    let (x0, x1, y0, y1) = (minx - MARGIN, maxx + MARGIN, miny - MARGIN, maxy + MARGIN);
+    for e in sc.edges.iter().filter(|e| edge_drawn(e)) {
+        let half = edge_stroke_width(e) / 2.0;
+        let stroke = edge_painted_polyline(e).into_iter().map(|p| (p, half));
+        let glyphs = scene::painted_glyph_corners(e)
+            .into_iter()
+            .map(|p| (p, 0.0));
+        let out = stroke
+            .chain(glyphs)
+            .map(|((x, y), pad)| {
+                (x0 - (x - pad))
+                    .max(y0 - (y - pad))
+                    .max(x + pad - x1)
+                    .max(y + pad - y1)
+            })
+            .fold(f64::NEG_INFINITY, f64::max);
+        if out > 0.0 {
+            m.ink_out += 1;
+            m.details
+                .push(format!("{}->{} ink_out {out:.1}px", e.from, e.to));
+        }
+    }
     m
 }
 

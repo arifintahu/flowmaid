@@ -33,7 +33,7 @@
 use crate::clearance::{CLEAR_GAP, CRAMP_NODE_GAP, EDGE_SPACING};
 use crate::model::{Direction, End, Graph};
 use crate::scene::{
-    basis_sample, edge_drawn, edge_polyline, grow_scene, sample_cubic, shift_scene, Bbox, Scene,
+    basis_sample, edge_drawn, edge_polyline, grow_canvas, sample_cubic, shift_scene, Bbox, Scene,
     ARROW_MARKER_PX, MARGIN,
 };
 
@@ -318,7 +318,9 @@ pub(crate) fn finish_fixed(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool]
         Mode::Routed => crate::labels::LABEL_ROUTE_WORK,
     };
     crate::labels::relabel(g, sc, &cx, &moved, budget);
-    refit(sc, mode);
+    // A scene whose painter strokes its own width (ER, class) is drawn
+    // on its canvas as-is; a flowchart's is fitted like its SVG.
+    refit(sc, mode, g.edge_paint_width.is_none());
 }
 
 /// How far (px) out of its end the straight stub [`glyph_stubs`] gives a
@@ -655,22 +657,32 @@ fn seg_dist(p: Pt, a: Pt, b: Pt) -> f64 {
 /// is judged with: rounding only.
 const STUB_ON_LINE: f64 = 0.01;
 
-/// Grow the canvas over everything drawn; never shrink it.
+/// Grow the canvas over everything painted ([`grow_canvas`]): a route
+/// round the outermost node, every stroke's width, every end glyph.
 ///
-/// A `Static` scene that reaches below zero is shifted so its minimum
-/// becomes [`MARGIN`]. A `Routed` scene is never shifted: its node
-/// positions are the host's, exactly as given (the export handles a
-/// negative origin, see `fit_top_left`).
-pub(crate) fn refit(sc: &mut Scene, mode: Mode) {
+/// A `Static` scene whose drawing reaches into the [`MARGIN`] gutter
+/// (or below zero) is shifted so its minimum becomes [`MARGIN`] — only
+/// a translation after every stage, so no route moves — and a static
+/// flowchart's canvas then reaches exactly [`MARGIN`] past the drawing:
+/// a host drawing the scene on its `width` × `height` sees the canvas
+/// `to_svg` writes, coordinate for coordinate (a layout that left room
+/// unused before the drawing still keeps it, report Q2). A `Routed`
+/// scene is never shifted: its node positions are the host's, exactly
+/// as given (the export handles a negative origin, see `fit_top_left`).
+/// Otherwise the canvas only grows. `static_fit` is false for an ER or
+/// class scene, whose painter draws `width` × `height` as-is, padded
+/// its own way: it is shifted only out of negative space.
+pub(crate) fn refit(sc: &mut Scene, mode: Mode, static_fit: bool) {
     let mut bb = Bbox::new();
-    grow_scene(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+    grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
     if !bb.0.is_finite() {
         return;
     }
     let (minx, mut maxx, miny, mut maxy) = bb.finish();
-    if mode == Mode::Static && (minx < 0.0 || miny < 0.0) {
-        let dx = if minx < 0.0 { MARGIN - minx } else { 0.0 };
-        let dy = if miny < 0.0 { MARGIN - miny } else { 0.0 };
+    let floor = if static_fit { MARGIN } else { 0.0 };
+    if mode == Mode::Static && (minx < floor || miny < floor) {
+        let dx = if minx < floor { MARGIN - minx } else { 0.0 };
+        let dy = if miny < floor { MARGIN - miny } else { 0.0 };
         shift_scene(sc, dx, dy);
         sc.width += dx;
         sc.height += dy;
@@ -855,7 +867,7 @@ mod tests {
         for mode in [Mode::Static, Mode::Routed] {
             let mut sc = base.clone();
             shift_scene(&mut sc, -500.0, 0.0);
-            refit(&mut sc, mode);
+            refit(&mut sc, mode, true);
             let minx = sc
                 .nodes
                 .iter()

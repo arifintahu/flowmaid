@@ -414,7 +414,7 @@ fn channels_keep_edges_apart_and_off_chips() {
 /// keeps its own curve up to there. The kinks left are those S-cubics:
 /// their stroke meets the head at the angle the scene's curve arrives
 /// at, which only the edge's own shape can change.
-const DEFECT_BASELINE: [(&str, f64, f64); 15] = [
+const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
     ("end_tilt", 14.0, 19.0),
     ("end_tilt_max", 86.3, 128.4),
     ("end_gaps", 11.0, 11.0),
@@ -430,6 +430,7 @@ const DEFECT_BASELINE: [(&str, f64, f64); 15] = [
     ("idiom_bow", 7.0, 8.0),
     ("x_drawn", 521.0, 520.0),
     ("end_kink", 60.0, 77.0),
+    ("ink_out", 0.0, 0.0),
 ];
 
 /// Least mean `ink` over the fixtures (static, routed): the painted

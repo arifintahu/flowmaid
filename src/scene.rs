@@ -32,17 +32,15 @@ pub(crate) use crate::labels::{
 #[cfg(test)]
 pub(crate) use crate::labels::{covered, ObstacleGrid, Rect};
 
-/// Gutter (px) a laid-out scene keeps round its drawing in its own
-/// coordinates and canvas (`Scene::width` / `height`); [`to_svg`] pads
-/// the SVG with [`SVG_MARGIN`] instead.
+/// Gutter (px) round the drawing — everything [`grow_scene`] covers,
+/// every stroke and end glyph included — in a laid-out scene's own
+/// coordinates and canvas (`Scene::width` / `height`), and the padding
+/// [`to_svg`] gives the SVG, so a host drawing the scene sees the SVG's
+/// canvas, coordinate for coordinate. Report Q10's 16 px would move
+/// every laid-out coordinate, and a translation flips the router's
+/// float-exact tie-breaks (a sixth of the corpus reroutes): a layout
+/// change Q10 rules out.
 pub(crate) const MARGIN: f64 = 28.0;
-/// Padding (px) round the drawing in the SVG [`to_svg`] writes (report
-/// Q10, mermaid pads with 8): the canvas is the drawing's bounds plus
-/// this, whatever the scene's own [`MARGIN`]. Only the painter's: moving
-/// every laid-out coordinate by the 12 px saved would flip the router's
-/// float-exact tie-breaks and so change routes, a layout change Q10 is
-/// not.
-pub(crate) const SVG_MARGIN: f64 = 16.0;
 /// Gap between parallel edges (connecting the same node pair).
 const PARALLEL_GAP: f64 = 16.0;
 /// Wanted spacing between edge ends that share a node side when one
@@ -4770,12 +4768,12 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
     let (title, desc) = a11y.resolve(default_title);
     let title = title.as_str();
     let mut bb = Bbox::new();
-    grow_scene(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+    grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
     let (minx, maxx, miny, maxy) = bb.finish();
-    let tx = SVG_MARGIN - minx;
-    let ty = SVG_MARGIN - miny;
-    let width = (maxx - minx) + 2.0 * SVG_MARGIN;
-    let height = (maxy - miny) + 2.0 * SVG_MARGIN;
+    let tx = MARGIN - minx;
+    let ty = MARGIN - miny;
+    let width = (maxx - minx) + 2.0 * MARGIN;
+    let height = (maxy - miny) + 2.0 * MARGIN;
     let t = |p: (f64, f64)| (p.0 + tx, p.1 + ty);
 
     // Endpoint display name: pseudostates announce "start"/"end", and a
@@ -4838,7 +4836,7 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
              fill=\"#f7f8fd\" stroke=\"#c9cfe8\" stroke-width=\"1.4\"/>\n",
             x, y, c.w, c.h
         ));
-        let title = fit_cluster_title(&sc.clusters, ci, maxx + SVG_MARGIN);
+        let title = fit_cluster_title(&sc.clusters, ci, maxx + MARGIN);
         let tw = text_width(&title) * TITLE_SCALE;
         cluster_titles.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{}\" rx=\"4\" \
@@ -5178,6 +5176,11 @@ impl Bbox {
     }
 }
 
+/// Grow `bb` over the drawing as the layout and edge stages bound it:
+/// frames, nodes, edge labels and each drawn edge's `bezier` points
+/// (a mermaid `curve` sampled). The router's outer lanes and the frame
+/// titles it keeps clear of are measured from it, so it stays as it was
+/// while routes are searched; the canvas is [`grow_canvas`].
 pub(crate) fn grow_scene(
     bb: &mut Bbox,
     nodes: &[SceneNode],
@@ -5214,6 +5217,160 @@ pub(crate) fn grow_scene(
             bb.add(m.0 + w / 2.0, m.1 + 10.0);
         }
     }
+}
+
+/// Grow `bb` over everything painted: [`grow_scene`]'s bounds, and the
+/// ink of every drawn edge ([`grow_drawn_edge`]) — a route the router
+/// took round the outermost node, every stroke's width, every end glyph.
+/// The canvas — [`to_svg`]'s, a laid-out scene's own (`edgepass::refit`),
+/// the quality yardstick's — is this and [`MARGIN`] round it, so nothing
+/// drawn is clipped.
+pub(crate) fn grow_canvas(
+    bb: &mut Bbox,
+    nodes: &[SceneNode],
+    edges: &[SceneEdge],
+    clusters: &[SceneCluster],
+) {
+    grow_scene(bb, nodes, edges, clusters);
+    for e in edges.iter().filter(|e| edge_drawn(e)) {
+        grow_drawn_edge(bb, e);
+    }
+}
+
+/// Grow `bb` over the ink of drawn edge `e`: the curve it is drawn
+/// along ([`plain_segs`]: the routed spline through its waypoints, a
+/// mermaid `curve`, or its single cubic), to its exact extremes, half
+/// its stroke width out; and, on an edge the flowchart painter strokes,
+/// each end glyph's box ([`glyph_box`]). The painter's squared ends keep
+/// within a few px of that curve outside the glyph ([`square_end`]:
+/// [`SQUARE_END_MAX_STRAY`]), well inside the [`MARGIN`] round it. Cheap
+/// (no squaring, no sampling), so every canvas — a drag frame's too —
+/// is sized by it.
+fn grow_drawn_edge(bb: &mut Bbox, e: &SceneEdge) {
+    let half = edge_stroke_width(e) / 2.0;
+    let (start, segs) = plain_segs(e, |p| p);
+    let mut from = start;
+    for &seg in &segs {
+        let (x0, x1, y0, y1) = cubic_bounds(&seg.cubic(from));
+        bb.add(x0 - half, y0 - half);
+        bb.add(x1 + half, y1 + half);
+        from = seg.end();
+    }
+    if segs.is_empty() || e.paint_width.is_some() {
+        return;
+    }
+    for at_start in [true, false] {
+        let m = if at_start {
+            e.ends.start_marker(e.kind)
+        } else {
+            e.ends.end_marker(e.kind)
+        };
+        let Some(m) = m else { continue };
+        let end = if at_start {
+            let (from, back) = reverse_segs(start, &segs[..1]);
+            end_heading(from, back[0]).map(|d| (start, d))
+        } else {
+            let n = segs.len();
+            let from = if n >= 2 { segs[n - 2].end() } else { start };
+            end_heading(from, segs[n - 1]).map(|d| (segs[n - 1].end(), d))
+        };
+        if let Some((tip, d)) = end {
+            for q in glyph_box(tip, d, glyph_px(e, m)) {
+                bb.add(q.0, q.1);
+            }
+        }
+    }
+}
+
+/// The corners of the box an end glyph `px` px across is drawn in, its
+/// tip (an arrowhead's point, a cross's or circle's outer side) on the
+/// end point `tip`, `d` the unit heading into that end: `px` back along
+/// the stroke, `px / 2` either side of it — the marker's own view box
+/// ([`marker_def_sized`]), which clips whatever it draws.
+fn glyph_box(tip: (f64, f64), d: (f64, f64), px: f64) -> [(f64, f64); 4] {
+    let (n, h) = ((-d.1, d.0), px / 2.0);
+    let base = (tip.0 - d.0 * px, tip.1 - d.1 * px);
+    [
+        (tip.0 + n.0 * h, tip.1 + n.1 * h),
+        (tip.0 - n.0 * h, tip.1 - n.1 * h),
+        (base.0 + n.0 * h, base.1 + n.1 * h),
+        (base.0 - n.0 * h, base.1 - n.1 * h),
+    ]
+}
+
+/// Size (px, long and across) the flowchart painter draws edge `e`'s end
+/// glyph `m` at: [`ARROW_MARKER_PX`], or less where heads crowd one side
+/// ([`crowded_heads`]).
+fn glyph_px(_e: &SceneEdge, _m: Marker) -> f64 {
+    ARROW_MARKER_PX
+}
+
+/// The corners of each end glyph's box as the flowchart painter draws
+/// `e` ([`glyph_box`] on the painted end, [`edge_end_tangent`]): what
+/// the quality yardstick checks the canvas holds. None on an edge an ER
+/// or class painter strokes (it draws its own ends).
+pub(crate) fn painted_glyph_corners(e: &SceneEdge) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    if !edge_drawn(e) || e.paint_width.is_some() {
+        return out;
+    }
+    for at_start in [true, false] {
+        let m = if at_start {
+            e.ends.start_marker(e.kind)
+        } else {
+            e.ends.end_marker(e.kind)
+        };
+        if let Some(m) = m {
+            let (tip, d) = edge_end_tangent(e, at_start);
+            if d != (0.0, 0.0) {
+                out.extend(glyph_box(tip, d, glyph_px(e, m)));
+            }
+        }
+    }
+    out
+}
+
+/// Tight bounds `(minx, maxx, miny, maxy)` of the cubic `b`: its ends
+/// and, on each axis, where its tangent turns level or plumb.
+fn cubic_bounds(b: &[(f64, f64); 4]) -> (f64, f64, f64, f64) {
+    let axis = |p0: f64, p1: f64, p2: f64, p3: f64| -> (f64, f64) {
+        let (mut lo, mut hi) = (p0.min(p3), p0.max(p3));
+        // Handles within the ends: the curve keeps within them (hull).
+        if p1 >= lo && p1 <= hi && p2 >= lo && p2 <= hi {
+            return (lo, hi);
+        }
+        // B'(t) / 3 = a t² + b t + c.
+        let (a, b, c) = (
+            -p0 + 3.0 * p1 - 3.0 * p2 + p3,
+            2.0 * (p0 - 2.0 * p1 + p2),
+            p1 - p0,
+        );
+        let mut roots = [f64::NAN; 2];
+        if a.abs() < 1e-12 {
+            if b.abs() > 1e-12 {
+                roots[0] = -c / b;
+            }
+        } else {
+            let disc = b * b - 4.0 * a * c;
+            if disc >= 0.0 {
+                let r = disc.sqrt();
+                roots = [(-b + r) / (2.0 * a), (-b - r) / (2.0 * a)];
+            }
+        }
+        for t in roots {
+            if t > 0.0 && t < 1.0 {
+                let u = 1.0 - t;
+                let v =
+                    u * u * u * p0 + 3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t * p3;
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        (lo, hi)
+    };
+    let (x0, x1) = axis(b[0].0, b[1].0, b[2].0, b[3].0);
+    let (y0, y1) = axis(b[0].1, b[1].1, b[2].1, b[3].1);
+    (x0, x1, y0, y1)
 }
 
 fn pair(a: usize, b: usize) -> (usize, usize) {
@@ -6729,6 +6886,104 @@ mod tests {
             .collect()
     }
 
+    /// Every edge whose ink `svg` paints off its own canvas (`0 0 width
+    /// height`), as "<title> by <px>": each edge path's every coordinate
+    /// (on the curve and its control points, half the stroke width out)
+    /// and each end marker's whole box — its `viewBox` placed by
+    /// `refX` / `refY` and `markerWidth`, turned along the path's end
+    /// as `orient="auto"` turns it. Read off the SVG's own numbers.
+    fn ink_off_canvas(svg: &str) -> Vec<String> {
+        let attr = |el: &str, name: &str| -> Option<String> {
+            let rest = el.split(&format!(" {name}=\"")).nth(1)?;
+            Some(rest.split('"').next()?.to_string())
+        };
+        let nums = |v: &str| -> Vec<f64> {
+            v.split([' ', ','])
+                .filter_map(|t| t.parse::<f64>().ok())
+                .collect()
+        };
+        let vb = nums(&attr(svg.lines().next().unwrap(), "viewBox").expect("viewBox"));
+        let (w, h) = (vb[2], vb[3]);
+        // Marker id -> (view box, refX, refY, px).
+        let markers: HashMap<String, (Vec<f64>, f64, f64, f64)> = svg
+            .split("<marker ")
+            .skip(1)
+            .map(|m| {
+                let num = |k: &str| attr(m, k).unwrap().parse::<f64>().unwrap();
+                (
+                    attr(&format!(" {m}"), "id").unwrap(),
+                    (
+                        nums(&attr(m, "viewBox").unwrap()),
+                        num("refX"),
+                        num("refY"),
+                        num("markerWidth"),
+                    ),
+                )
+            })
+            .collect();
+        let mut out = Vec::new();
+        for p in edge_paths(svg) {
+            let d = attr(p, "d").unwrap();
+            let half = attr(p, "stroke-width").map_or(1.0, |v| v.parse().unwrap()) / 2.0;
+            let c = nums(&d);
+            let pts: Vec<(f64, f64)> = c.chunks(2).map(|q| (q[0], q[1])).collect();
+            let mut worst = f64::NEG_INFINITY;
+            let mut off = |q: (f64, f64), pad: f64| {
+                worst = worst
+                    .max(pad - q.0)
+                    .max(pad - q.1)
+                    .max(q.0 + pad - w)
+                    .max(q.1 + pad - h);
+            };
+            for &q in &pts {
+                off(q, half);
+            }
+            for (key, at_start) in [("marker-start", true), ("marker-end", false)] {
+                let Some(url) = attr(p, key) else { continue };
+                let id = url.trim_start_matches("url(#").trim_end_matches(')');
+                let (mvb, rx, ry, px) = &markers[id];
+                // The path's end and its heading there (forward at the
+                // start, into the end at the end), off the nearest
+                // coordinate apart from it.
+                let seq: Vec<(f64, f64)> = if at_start {
+                    pts.clone()
+                } else {
+                    pts.iter().rev().copied().collect()
+                };
+                let at = seq[0];
+                let q = *seq[1..]
+                    .iter()
+                    .find(|q| (q.0 - at.0).hypot(q.1 - at.1) > 1e-9)
+                    .expect("a heading");
+                let l = (q.0 - at.0).hypot(q.1 - at.1);
+                let mut dir = ((q.0 - at.0) / l, (q.1 - at.1) / l);
+                if !at_start {
+                    dir = (-dir.0, -dir.1);
+                }
+                let n = (-dir.1, dir.0);
+                let k = px / mvb[2];
+                for (u, v) in [
+                    (mvb[0], mvb[1]),
+                    (mvb[0] + mvb[2], mvb[1]),
+                    (mvb[0], mvb[1] + mvb[3]),
+                    (mvb[0] + mvb[2], mvb[1] + mvb[3]),
+                ] {
+                    let (a, b) = ((u - rx) * k, (v - ry) * k);
+                    off(
+                        (at.0 + dir.0 * a + n.0 * b, at.1 + dir.1 * a + n.1 * b),
+                        0.0,
+                    );
+                }
+            }
+            if worst > 0.0 {
+                let title = p.split("<title>").nth(1).unwrap_or("?");
+                let title = title.split('<').next().unwrap_or("?");
+                out.push(format!("{title} by {worst:.1}"));
+            }
+        }
+        out
+    }
+
     /// The root `<svg id="…">`, if any.
     fn root_id(svg: &str) -> Option<String> {
         let open = svg.split('>').next()?;
@@ -6917,7 +7172,7 @@ mod tests {
             curve_d(start, &segs, |p| p)
         };
         assert_eq!(edge_path_d(&e, |p| p), spline_d(&wps));
-        // `t` maps every point (the flowchart painter's SVG_MARGIN shift).
+        // `t` maps every point (the flowchart painter's MARGIN shift).
         let moved: Vec<(f64, f64)> = wps.iter().map(|&(x, y)| (x + 10.0, y + 5.0)).collect();
         assert_eq!(
             edge_path_d(&e, |(x, y)| (x + 10.0, y + 5.0)),
@@ -6937,7 +7192,7 @@ mod tests {
     }
 
     /// The flowchart painter draws every edge with `edge_path_d` — the
-    /// one builder the class / ER painters share — through its SVG_MARGIN
+    /// one builder the class / ER painters share — through its MARGIN
     /// shift, for routed, plain and curved edges alike.
     #[test]
     fn flowchart_edges_are_painted_by_edge_path_d() {
@@ -6950,9 +7205,9 @@ mod tests {
         );
         let svg = to_svg(&sc);
         let mut bb = Bbox::new();
-        grow_scene(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+        grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
         let (minx, _, miny, _) = bb.finish();
-        let (tx, ty) = (SVG_MARGIN - minx, SVG_MARGIN - miny);
+        let (tx, ty) = (MARGIN - minx, MARGIN - miny);
         let paths = edge_paths(&svg);
         assert_eq!(paths.len(), sc.edges.len());
         for (e, p) in sc.edges.iter().zip(paths) {
@@ -7573,9 +7828,9 @@ mod tests {
                     let svg = to_svg(&s);
                     // Undo to_svg's margin shift to get back to scene units.
                     let mut bb = Bbox::new();
-                    grow_scene(&mut bb, &s.nodes, &s.edges, &s.clusters);
+                    grow_canvas(&mut bb, &s.nodes, &s.edges, &s.clusters);
                     let (minx, _, miny, _) = bb.finish();
-                    (s, svg, (SVG_MARGIN - minx, SVG_MARGIN - miny))
+                    (s, svg, (MARGIN - minx, MARGIN - miny))
                 }
                 // ER and class scenes pick through this same edge_at, and
                 // their painters stroke edge_path_d in scene units.
@@ -9054,8 +9309,8 @@ mod tests {
     /// The right edge of the canvas `to_svg` draws `s` on.
     fn canvas_right(s: &Scene) -> f64 {
         let mut bb = Bbox::new();
-        grow_scene(&mut bb, &s.nodes, &s.edges, &s.clusters);
-        bb.finish().1 + SVG_MARGIN
+        grow_canvas(&mut bb, &s.nodes, &s.edges, &s.clusters);
+        bb.finish().1 + MARGIN
     }
 
     #[test]
@@ -9395,7 +9650,9 @@ mod tests {
              linkStyle 1 stroke-width:1px\nlinkStyle 2 stroke-dasharray: 5 5\n",
         );
         let p = edge_paths(&svg);
-        assert!(p[0].contains("stroke-dasharray=\"0\"") && !p[0].contains("5 4"));
+        assert!(
+            p[0].contains("stroke-dasharray=\"0\"") && !p[0].contains("stroke-dasharray=\"5 4\"")
+        );
         assert!(p[1].contains("stroke-width=\"1\"") && p[1].contains("url(#arrow)"));
         assert!(p[2].contains("stroke-dasharray=\"5 5\""));
         // A width alone needs no variant: every head has one size.
@@ -9525,11 +9782,11 @@ mod tests {
             let sc = scene(&parse(&src).unwrap());
             let svg = to_svg(&sc);
             let pts = painted_points(edge_paths(&svg)[0]);
-            // SVG coordinates: the drawing starts SVG_MARGIN in.
+            // SVG coordinates: the drawing starts MARGIN in.
             let mut bb = Bbox::new();
-            grow_scene(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+            grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
             let (minx, _, miny, _) = bb.finish();
-            let t = |p: (f64, f64)| (p.0 + SVG_MARGIN - minx, p.1 + SVG_MARGIN - miny);
+            let t = |p: (f64, f64)| (p.0 + MARGIN - minx, p.1 + MARGIN - miny);
             let b = &sc.nodes[1];
             let top = t((b.x, b.y - b.h / 2.0)).1;
             // The stroke stops ARROW_TRIM short, heading straight down;
@@ -10209,10 +10466,10 @@ mod tests {
              markerUnits=\"userSpaceOnUse\" markerWidth=\"11\" markerHeight=\"11\""
         ));
         let mut bb = Bbox::new();
-        grow_scene(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+        grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
         let (minx, _, _, _) = bb.finish();
         let d = &sc.nodes[3];
-        let left = d.x - d.w / 2.0 + SVG_MARGIN - minx;
+        let left = d.x - d.w / 2.0 + MARGIN - minx;
         let pts = painted_points(paths[1]);
         let end = pts[pts.len() - 1];
         assert!((left - end.0 - 8.0).abs() < 0.11, "{end:?} vs {left}");
@@ -10250,13 +10507,152 @@ mod tests {
         }
     }
 
+    /// Flowcharts whose routes reach past every node: the B1 review's long
+    /// detours round a whole frame (`x3_long`) and random graphs whose
+    /// routed or dragged edges ran off the canvas (`r31`, `r56`).
+    const CANVAS_PROBES: [&str; 3] = [
+        "flowchart TD\n  subgraph F1 [Frame one]\n    a1[Alpha] --> a2[Beta]\n    \
+         a2 --> a3[Gamma]\n  end\n  subgraph F2 [Frame two]\n    b1[Delta] --> b2[Epsilon]\n  \
+         end\n  start([Start]) --> a1\n  start --> b1\n  start ==> z[(Store)]\n  a3 --> z\n  \
+         b2 --> F1\n  start --> a3\n  z --> start\n  a1 --> a1\n  b1 --o b2\n  a2 --x z\n  \
+         F2 --> z\n  q{{Hex}} --> start\n  a3 --> q\n",
+        "flowchart TD\n  subgraph F0 [Frame 0]\n    n6[Node 6]\n    n4[Node 4]\n  end\n  \
+         subgraph F1 [Frame 1]\n    n1[Node 1]\n  end\n  n1 --> n2[Node 2]\n  \
+         n8[Node 8] -.-> n10[Node 10]\n  n7[Node 7] --> n3[Node 3]\n  n8 --> n0[Node 0]\n  \
+         n7 --> n9[Node 9]\n  n10 --> n6\n  n0 ==> n7\n  n6 --> n10\n  n2 --> n1\n  \
+         n1 ==> n9\n  n1 --o n8\n  n6 --> n3\n  n9 ==> n7\n  n0 -.-> n2\n  n4 --> n0\n",
+        "flowchart BT\n  subgraph F0 [Frame 0]\n    n12[Node 12]\n    n5[Node 5]\n  end\n  \
+         subgraph F1 [Frame 1]\n    n3[Node 3]\n    n2[Node 2]\n  end\n  n2 --o n11[Node 11]\n  \
+         n7[Node 7] ==> n6[Node 6]\n  n2 --> n1[Node 1]\n  n2 -.-> n0[Node 0]\n  \
+         n0 -.-> n8[Node 8]\n  n6 --> n12\n  n9[Node 9] ==> n12\n  n1 ==> n4[Node 4]\n  \
+         n0 --o n10[Node 10]\n  n2 -.-> n8\n  n2 --> n4\n  n0 --> n3\n  n1 -.-> n2\n  \
+         n2 -.-> n5\n  n9 -.-> n1\n  n1 --> n9\n  n9 --> n12\n  n10 --> n11\n  \
+         n7 --> n11\n  n5 --o n10\n  n2 ==> n12\n  n6 -.-> n0\n  n1 -.-> n8\n  \
+         n12 ==> n0\n  n8 --> n6\n",
+    ];
+
+    /// A seeded random flowchart: 7-14 nodes, a few frames, every edge
+    /// kind and end glyph, any direction, now and then a wide or dashed
+    /// `linkStyle` — the shapes the canvas test sweeps.
+    fn random_flowchart(seed: u64) -> String {
+        let mut st = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut next = |m: u64| {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (st >> 33) % m
+        };
+        let dir = ["TD", "LR", "BT", "RL"][next(4) as usize];
+        let n = 7 + next(8) as usize;
+        let mut s = format!("flowchart {dir}\n");
+        let frames = next(3) as usize;
+        for f in 0..frames {
+            s.push_str(&format!("  subgraph F{f} [Frame {f}]\n"));
+            for k in 0..2 {
+                s.push_str(&format!("    n{}[Node {}]\n", f * 3 + k, f * 3 + k));
+            }
+            s.push_str("  end\n");
+        }
+        let ops = ["-->", "==>", "-.->", "--o", "--x", "<-->", "---"];
+        let edges = n + next(n as u64) as usize;
+        for _ in 0..edges {
+            let (a, b) = (next(n as u64), next(n as u64));
+            let op = ops[next(ops.len() as u64) as usize];
+            s.push_str(&format!("  n{a}[Node {a}] {op} n{b}[Node {b}]\n"));
+        }
+        if next(2) == 0 {
+            s.push_str(&format!(
+                "  linkStyle {} stroke-width:{}px\n",
+                next(edges as u64),
+                2 + 3 * next(5)
+            ));
+        }
+        s
+    }
+
+    /// Report §2.3 B1 review: nothing drawn falls off the canvas. For
+    /// every flowchart and state fixture, the long-detour probes and
+    /// seeded random graphs, in the static scene, `route` fed its
+    /// centres, and drag frames (`route` and `route_partial` with a node
+    /// moved), every coordinate of every painted edge path (half its
+    /// stroke out) and every end marker's box lies inside the SVG's
+    /// view box; and the scene's own canvas (`width` × `height` from
+    /// the origin) holds the drawing with its gutter, a static one
+    /// starting [`MARGIN`] in exactly as the SVG does.
     #[test]
-    fn the_svg_pads_the_drawing_and_strokes_with_the_q10_tokens() {
+    fn nothing_painted_falls_off_the_canvas() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut srcs: Vec<(String, String)> = ["tests/fixtures/quality", "examples"]
+            .iter()
+            .flat_map(|d| std::fs::read_dir(format!("{root}/{d}")).unwrap())
+            .map(|f| f.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "mmd"))
+            .map(|p| {
+                (
+                    p.display().to_string(),
+                    std::fs::read_to_string(&p).unwrap(),
+                )
+            })
+            .collect();
+        srcs.sort();
+        for (k, src) in CANVAS_PROBES.iter().enumerate() {
+            srcs.push((format!("probe {k}"), src.to_string()));
+        }
+        for seed in 0..12 {
+            srcs.push((format!("random {seed}"), random_flowchart(seed)));
+        }
+        let mut bad = Vec::new();
+        let mut checked = 0;
+        for (name, src) in &srcs {
+            use crate::model::Document;
+            let g = match crate::parser::parse_document(src) {
+                Ok(Document::Flowchart(g) | Document::State(g)) => g,
+                _ => continue,
+            };
+            let st = scene(&g);
+            let c: Vec<(f64, f64)> = st.nodes.iter().map(|n| (n.x, n.y)).collect();
+            let mut frames = vec![("static", st.clone()), ("routed", route(&g, &c))];
+            let n = c.len();
+            for (v, d) in [(0, (-40.0, -40.0)), (n / 2, (60.0, 60.0))] {
+                let mut moved = c.clone();
+                moved[v] = (moved[v].0 + d.0, moved[v].1 + d.1);
+                frames.push(("drag", route(&g, &moved)));
+                frames.push(("partial", route_partial(&g, &moved, &st, &c)));
+            }
+            for (mode, sc) in &frames {
+                checked += 1;
+                for off in ink_off_canvas(&to_svg(sc)) {
+                    bad.push(format!("{name} {mode}: {off}"));
+                }
+                let mut bb = Bbox::new();
+                grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+                let (minx, maxx, miny, maxy) = bb.finish();
+                if maxx + MARGIN > sc.width + 1e-6 || maxy + MARGIN > sc.height + 1e-6 {
+                    bad.push(format!(
+                        "{name} {mode}: canvas {}x{} short",
+                        sc.width, sc.height
+                    ));
+                }
+                if *mode == "static" && (minx < MARGIN - 1e-6 || miny < MARGIN - 1e-6) {
+                    bad.push(format!(
+                        "{name} {mode}: drawing in the gutter at {minx},{miny}"
+                    ));
+                }
+            }
+        }
+        assert!(checked >= 150, "{checked} scenes");
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn the_svg_pads_the_drawing_as_the_scene_and_strokes_with_the_q10_tokens() {
         let src = "flowchart TD\nA[box] --> B[(db)]\nB ==> C[[sub]]\n";
         let sc = scene(&parse(src).unwrap());
         let svg = to_svg(&sc);
         let mut bb = Bbox::new();
-        grow_scene(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+        grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
         let (minx, maxx, miny, maxy) = bb.finish();
         let attr = |name: &str| -> f64 {
             let head = svg.lines().next().unwrap();
@@ -10266,11 +10662,14 @@ mod tests {
                 .and_then(|v| v.parse().ok())
                 .expect("a size")
         };
-        // Whole px, as the root always writes them.
-        assert!((attr("width") - (maxx - minx + 2.0 * SVG_MARGIN)).abs() <= 0.5);
-        assert!((attr("height") - (maxy - miny + 2.0 * SVG_MARGIN)).abs() <= 0.5);
-        assert_eq!(SVG_MARGIN, 16.0);
-        // The scene keeps its own gutter: no layout moved.
+        // Whole px, as the root always writes them: the drawing and the
+        // scene's own MARGIN gutter round it — the scene's canvas, the
+        // drawing starting MARGIN in (no layout moved for Q10's 16 px).
+        assert!((attr("width") - (maxx - minx + 2.0 * MARGIN)).abs() <= 0.5);
+        assert!((attr("height") - (maxy - miny + 2.0 * MARGIN)).abs() <= 0.5);
+        assert!((attr("width") - sc.width).abs() <= 0.5);
+        assert!((attr("height") - sc.height).abs() <= 0.5);
+        assert_eq!((minx, miny), (MARGIN, MARGIN));
         assert_eq!(sc.nodes[0].y - sc.nodes[0].h / 2.0, MARGIN);
         // Edges 2 / 3.5 px; every node stroke 1.8 px, the cylinder's
         // lid and the subroutine's bars included.

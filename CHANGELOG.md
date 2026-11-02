@@ -158,14 +158,14 @@ Minor, not patch: several class structs gain public fields (see
   advance painter draws the same head and cut, its last stretch along
   the route's last leg however short that leg. A crossing gap is no longer cut within a head and a gap's
   radius of an edge end, where it could bite the arrowhead.
-- **Stroke and canvas tokens** (report Q10): edges are 2 px (thick 3.5 px,
-  from 1.7 / 3.4), node outlines 1.8 px (from 1.6, the cylinder's lid, the
-  subroutine's bars and a final state's ring included), and the SVG pads
-  the drawing with 16 px instead of 28. Only the SVG's padding changed:
-  the scene keeps its 28 px gutter (`Scene` coordinates, `width`,
-  `height`) and every route is the same — moving the laid-out coordinates
-  would have flipped the router's float-exact tie-breaks. ER and class
-  SVGs keep their margins.
+- **Stroke tokens** (report Q10): edges are 2 px (thick 3.5 px, from
+  1.7 / 3.4) and node outlines 1.8 px (from 1.6, the cylinder's lid, the
+  subroutine's bars and a final state's ring included). The canvas keeps
+  its 28 px padding — the scene's own gutter — rather than Q10's 16 px:
+  `to_svg` pads exactly as `Scene` coordinates, `width` and `height` do,
+  so a host drawing the scene sees the SVG's canvas, and moving every
+  laid-out coordinate by 12 px would flip the router's float-exact
+  tie-breaks (a sixth of the test graphs reroute).
 - **Quality yardstick** (`quality::Metrics`): `end_tilt` judges each end
   glyph's heading as painted (along the stroke cut short under it) and
   reads frame ends either way across the border; new `end_kink` (appended
@@ -326,7 +326,7 @@ Minor, not patch: several class structs gain public fields (see
     (`Class::lollipop`, `ClassBox::lollipop`) whose box is not drawn, only
     its name; a host that paints every `ClassBox` as a box should skip it.
   - **`quality::Metrics` gains columns and becomes `#[non_exhaustive]`:**
-    the phase-B yardsticks (`end_tilt` … `x_drawn`) and `end_kink` are new
+    the phase-B yardsticks (`end_tilt` … `x_drawn`), `end_kink` and `ink_out` are new
     fields, so a struct literal of it no longer compiles outside the crate
     (it already broke with the first new field). It is what
     `quality::measure` returns: read its fields, or start from
@@ -334,6 +334,21 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Fixed
 
+- **Nothing drawn is cut off at the canvas edge.** The canvas (`to_svg`'s
+  view box, a laid-out scene's `width` / `height`, the quality yardstick's
+  `width` / `height`) was the bounds of the nodes, frames, labels and each
+  edge's bezier points, so a route the router took round the outermost
+  node or frame could run off it (a detour leg past the last column,
+  clipped by up to 34 px), and so could a stroke's width or an end glyph
+  at the edge of the drawing. It now covers every drawn edge — the routed
+  spline to its exact extremes, half the stroke width out, and each end
+  glyph's box — in the static scene, `route` / `route_sized` and drag
+  frames (`route_partial`) alike, the padding round it as before. A
+  static scene whose drawing reached into its 28 px gutter is shifted
+  right/down so it starts 28 px in, exactly where the SVG puts it (only a
+  translation after every stage: no route moves). New
+  `quality::Metrics::ink_out` counts edges with ink off the canvas, gated
+  at 0.
 - **A twin's label in a `<<choice>>` fan finds a spot beside its line**
   when its row is crossed by its twin's steeper line: it may now step
   beside its line anywhere along the line's far half, so it is stacked

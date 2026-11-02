@@ -15,7 +15,7 @@ use crate::layout::LABEL_BOX_H;
 use crate::model::{Graph, Marker, Shape};
 use crate::scene::{
     edge_drawn, edge_polyline, grow_scene, title_head, Bbox, Scene, SceneEdge, GLYPH_PORT_GAP,
-    SVG_MARGIN,
+    MARGIN,
 };
 use std::collections::BTreeMap;
 
@@ -613,7 +613,7 @@ fn title_heads(sc: &Scene) -> Vec<(f64, f64, f64, f64)> {
     }
     let mut bb = Bbox::new();
     grow_scene(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
-    let right = bb.finish().1 + SVG_MARGIN;
+    let right = bb.finish().1 + MARGIN;
     (0..sc.clusters.len())
         .map(|ci| title_head(&sc.clusters, ci, right))
         .collect()
