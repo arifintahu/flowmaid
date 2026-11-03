@@ -181,6 +181,16 @@ pub(crate) const LABEL_BOX_H: f64 = 20.0;
 /// once its gap had to grow for it.
 pub(crate) const LABEL_CLEAR: f64 = 6.0;
 
+/// Room (px) a labelled edge between adjacent TD / BT layers keeps
+/// between its label and either end (report M3, §2.6): an arrowhead and
+/// a stub as long again as the label is tall, so the S the edge draws
+/// to its target bends above or below the label instead of under it,
+/// and the head never touches the chip. With the gap growing only when
+/// the label would not fit at all, a 20 px chip swallowed a third of
+/// the 60 px gap and the edge read as two hooks (long-labels, demo).
+/// 72 px for a one-line label, as mermaid's label rank gives it.
+pub(crate) const LABEL_RUN: f64 = ARROW_MARKER_PX + 15.0;
+
 /// Room (px) back from the far end of a compact branch point's fan
 /// line that its arrowhead takes from a label: [`ARROW_MARKER_PX`] plus
 /// [`LABEL_CLEAR`], and as much again, since the label stage measures
@@ -1277,7 +1287,7 @@ fn layout_core(
     if !search {
         return (st.best.lo, st.best.groups);
     }
-    if st.best.lo.total_b > RIBBON_ENTRY * st.best.lo.total_l {
+    if st.best.lo.total_b > RIBBON_ENTRY * st.best.depth {
         narrow(g, sizes, node_cluster, &mut st);
     }
     centre_largest(g, sizes, node_cluster, &mut st);
@@ -1336,7 +1346,7 @@ impl State {
 /// at least STAGGER_MIN_GAIN while the drawn crossings stay within
 /// NARROW_CROSS_SLACK of the start, so narrowing never tangles.
 fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, st: &mut State) {
-    let ribbon = |p: &Placement| p.lo.total_b > ASPECT_TARGET * p.lo.total_l;
+    let ribbon = |p: &Placement| p.lo.total_b > ASPECT_TARGET * p.depth;
     let cap = crossing_budget(st.best.crossings);
     let packed_opts = Opts {
         compact: true,
@@ -2108,6 +2118,9 @@ struct Placement {
     ckeys: Vec<(usize, f64)>,
     /// Estimated drawn breadth span ([`drawn_breadth`]).
     ext: (f64, f64),
+    /// The depth the ribbon tests read (G12): the judged layer lines'
+    /// (see `place`'s `layer_lines`).
+    depth: f64,
 }
 
 /// Steps 3 to 5 for one layering: dummy chains, ordering and
@@ -2277,8 +2290,9 @@ fn place(
     // the one that must stay ordered for deterministic node numbering).
     let mut cluster_span: std::collections::BTreeMap<usize, (usize, usize)> =
         std::collections::BTreeMap::new();
-    // Extra layer-slot room per real node for title strips (see below).
-    let mut lextra = vec![0.0f64; n];
+    // Extra layer-slot room per real node for title strips, before and
+    // after it along the layer axis (see below).
+    let mut lextra = vec![(0.0f64, 0.0f64); n];
     // Per real node: frame reach (towards lower, higher layers).
     let mut reach = vec![(0.0f64, 0.0f64); n];
     if let Some(nc) = node_cluster {
@@ -2304,10 +2318,14 @@ fn place(
         // border-top nodes; the inflated slot is the compact stand-in),
         // so labels between ranks never land on the header text. Only
         // the slot grows — the node keeps its real size, so edges still
-        // end on its visible border. In LR/RL the strip lies across the
-        // breadth axis instead and is reserved there (compaction). In BT
-        // the layers are drawn bottom-up, so a box's screen top is its
-        // HIGHEST layer.
+        // end on its visible border — and only on the strip's side: the
+        // screen top's (report M8, §2.8). A slot grown on both sides
+        // left a strip's worth of dead room under every box's first row
+        // (86 px from it to the next where any other gap is 60). In
+        // LR/RL the strip lies across the breadth axis instead and is
+        // reserved there (compaction). In BT the layers are drawn
+        // bottom-up, so a box's screen top is its HIGHEST layer, the
+        // side after it along the layer axis.
         if !horizontal {
             let bt = matches!(g.direction, Direction::BT);
             for v in 0..n {
@@ -2318,7 +2336,7 @@ fn place(
                         extra += header[c];
                     }
                 }
-                lextra[v] = extra * 2.0;
+                lextra[v] = if bt { (0.0, extra) } else { (extra, 0.0) };
             }
         }
         // How far the frames a node opens / closes reach past it along
@@ -2690,8 +2708,6 @@ fn place(
     // not meet: their pads and title strips stack up with nesting depth,
     // which can outgrow the gap, so a layer moves down until the frames
     // reaching across clear by FRAME_GAP.
-    let mut lcoord = vec![0.0f64; nlayers];
-    let mut cursor = MARGIN;
     let reach_of = |li: usize, side: usize| -> f64 {
         layers[li]
             .iter()
@@ -2926,57 +2942,105 @@ fn place(
         .map(|(need, lines)| fan_rows_gap(lines, need))
         .collect();
     let gap_l = g.rank_gap.unwrap_or(GAP_L);
-    let mut prev_lh = 0.0;
-    for li in 0..nlayers {
-        let lh = layers[li]
-            .iter()
-            .map(|&v| alsize[v] + lextra.get(v).copied().unwrap_or(0.0))
-            .fold(0.0f64, f64::max);
-        if clustered && li > 0 {
-            let at = lcoord[li - 1] + reach_of(li - 1, 1) + reach_of(li, 0) + FRAME_GAP;
-            if at > cursor + lh / 2.0 {
-                cursor = at - lh / 2.0;
+    // The layer lines and the depth they span. `judged`: as the layout
+    // search judges a candidate (crossings, node hits, the ribbon tests)
+    // — a title strip's slot grown on both sides, a labelled gap only as
+    // deep as its label needs — which the drawing no longer takes (report
+    // M3, M8): the room those two keep or give back makes the drawing
+    // deeper or shallower without its layers being any fewer, and must
+    // not decide a layering or an ordering. (Judged on the drawn depth,
+    // dense-td — a 4.06 : 1 ribbon — went 3.9 : 1 with the head room and
+    // stayed 6 768 px broad, and with the strips' dead room gone its
+    // stacked candidates' skeletons, a row nearer, cut 8 more boxes.)
+    let layer_lines = |judged: bool| -> (Vec<f64>, f64) {
+        let mut lcoord = vec![0.0f64; nlayers];
+        let mut cursor = MARGIN;
+        let mut prev_after = 0.0;
+        for li in 0..nlayers {
+            // The layer's slot: how far it reaches before its line (the
+            // line sits `before` past the slot's start) and after it —
+            // its tallest node's halves plus any title strip on the
+            // strip's side (on both, `judged`).
+            let (before, after) = layers[li]
+                .iter()
+                .map(|&v| {
+                    let (x0, x1) = lextra.get(v).copied().unwrap_or((0.0, 0.0));
+                    if judged {
+                        let half = (alsize[v] + 2.0 * (x0 + x1)) / 2.0;
+                        (half, half)
+                    } else {
+                        (alsize[v] / 2.0 + x0, alsize[v] / 2.0 + x1)
+                    }
+                })
+                .fold((0.0f64, 0.0f64), |a, b| (a.0.max(b.0), a.1.max(b.1)));
+            if clustered && li > 0 {
+                let at = lcoord[li - 1] + reach_of(li - 1, 1) + reach_of(li, 0) + FRAME_GAP;
+                if at > cursor + before {
+                    cursor = at - before;
+                }
             }
+            // A label that would cover its own ends grows the gap until
+            // it clears both by LABEL_CLEAR; a label that already fits
+            // leaves the gap — and the whole layout — exactly as it was.
+            // An end whose frame closes / opens on its layer is reached
+            // past that frame's border (the layer's farthest one), not
+            // its own box: a label on the border line would hide it. End
+            // room counts as part of the ends: the label (or, without
+            // one, the other end's glyph) clears it by LABEL_CLEAR too.
+            for &(s, t, ext, room, fan) in &short_labels[li] {
+                let lo_side = if reach[s].1 > 0.0 {
+                    reach_of(li - 1, 1)
+                } else {
+                    alsize[s] / 2.0
+                };
+                let hi_side = if reach[t].0 > 0.0 {
+                    reach_of(li, 0)
+                } else {
+                    alsize[t] / 2.0
+                };
+                let ends = lcoord[li - 1] + (lo_side + hi_side);
+                let at = cursor + before;
+                // In a drawing the flowchart painter draws, a labelled
+                // gap keeps its label clear of the arrowhead too (report
+                // M3, §2.6): across TD / BT a [`LABEL_RUN`] on either
+                // side; along LR / RL, where the label is a whole width
+                // long and slides along its line off the head, the head
+                // and a clearance on both sides. (Class and ER scenes
+                // keep their glyph room in `room` and the plain rule.)
+                let flow = ext > 0.0 && g.edge_paint_width.is_none() && !judged;
+                let need = match (flow, horizontal) {
+                    (true, false) => Some(ext + 2.0 * LABEL_RUN),
+                    (true, true) => Some(ext + 2.0 * LABEL_CLEAR + ARROW_MARKER_PX),
+                    (false, _) => None,
+                };
+                match need {
+                    Some(need) if at - ends < room + need => {
+                        cursor = cursor.max(ends + room + need - before);
+                    }
+                    // The plain rule grows a gap only where the label
+                    // does not fit at all.
+                    None if at - ends < ext + room => {
+                        cursor = cursor.max(ends + room + ext + 2.0 * LABEL_CLEAR - before);
+                    }
+                    _ => {}
+                }
+                if fan && at - ends < fan_gap(ext / 2.0) {
+                    cursor = cursor.max(ends + fan_gap(ext / 2.0) - before);
+                }
+            }
+            if li > 0 && gap_need[li] > 0.0 {
+                let prev = lcoord[li - 1] + prev_after;
+                if cursor - prev < gap_need[li] {
+                    cursor = prev + gap_need[li];
+                }
+            }
+            prev_after = after;
+            lcoord[li] = cursor + before;
+            cursor += before + after + gap_l;
         }
-        // A label that would cover its own ends grows the gap until it
-        // clears both by LABEL_CLEAR; a label that already fits leaves
-        // the gap — and the whole layout — exactly as it was. An end
-        // whose frame closes / opens on its layer is reached past that
-        // frame's border (the layer's farthest one), not its own box:
-        // a label on the border line would hide it. End room counts as
-        // part of the ends: the label (or, without one, the other
-        // end's glyph) clears it by LABEL_CLEAR too.
-        for &(s, t, ext, room, fan) in &short_labels[li] {
-            let lo_side = if reach[s].1 > 0.0 {
-                reach_of(li - 1, 1)
-            } else {
-                alsize[s] / 2.0
-            };
-            let hi_side = if reach[t].0 > 0.0 {
-                reach_of(li, 0)
-            } else {
-                alsize[t] / 2.0
-            };
-            let ends = lcoord[li - 1] + (lo_side + hi_side);
-            let at = cursor + lh / 2.0;
-            if at - ends < ext + room {
-                cursor = cursor.max(ends + room + ext + 2.0 * LABEL_CLEAR - lh / 2.0);
-            }
-            if fan && at - ends < fan_gap(ext / 2.0) {
-                cursor = cursor.max(ends + fan_gap(ext / 2.0) - lh / 2.0);
-            }
-        }
-        if li > 0 && gap_need[li] > 0.0 {
-            let prev = lcoord[li - 1] + prev_lh / 2.0;
-            if cursor - prev < gap_need[li] {
-                cursor = prev + gap_need[li];
-            }
-        }
-        prev_lh = lh;
-        lcoord[li] = cursor + lh / 2.0;
-        cursor += lh + gap_l;
-    }
-    let total_l = cursor - gap_l + MARGIN;
+        (lcoord, cursor - gap_l + MARGIN)
+    };
+    let (lcoord, total_l) = layer_lines(false);
 
     // Normalise so the diagram starts at MARGIN (real-node extent).
     let mut minb = f64::INFINITY;
@@ -3016,11 +3080,22 @@ fn place(
                 .collect()
         })
         .collect();
+    // The search judges the candidate on its judged layer lines (see
+    // `layer_lines`).
+    let (jl, depth) = if opts.judge {
+        layer_lines(true)
+    } else {
+        (Vec::new(), total_l)
+    };
     let (crossings, hits, ext) = if opts.judge {
+        let paths: Vec<Vec<(f64, f64)>> = edge_chain
+            .iter()
+            .map(|chain| chain.iter().map(|&d| (bpos[d], jl[alayer[d]])).collect())
+            .collect();
         (
-            drawn_crossings(g, &edge_paths, |v| (bpos[v], lcoord[alayer[v]])),
-            node_hits(g, back, &edge_paths, |v| {
-                (bpos[v], lcoord[alayer[v]], absize[v], alsize[v])
+            drawn_crossings(g, &paths, |v| (bpos[v], jl[alayer[v]])),
+            node_hits(g, back, &paths, |v| {
+                (bpos[v], jl[alayer[v]], absize[v], alsize[v])
             }),
             chains_b(&bpos),
         )
@@ -3059,6 +3134,7 @@ fn place(
         hits,
         ckeys,
         ext,
+        depth,
     }
 }
 
@@ -4391,11 +4467,14 @@ mod tests {
     /// `Edge::end_room` (ER crow's feet) widens a gap between adjacent
     /// layers by just enough for the room, the label and LABEL_CLEAR
     /// either side — and an edge without room or label leaves the gap
-    /// exactly as it was.
+    /// exactly as it was. (An ER scene, whose painter strokes its own
+    /// edges: a flowchart's labelled gap also keeps head room, see
+    /// `a_labelled_gap_keeps_its_label_off_the_head`.)
     #[test]
     fn end_room_widens_an_adjacent_gap_for_glyphs_and_label() {
         let gap = |room: (f64, f64), label: Option<&str>, dir: Direction| {
             let mut g = Graph::default();
+            g.edge_paint_width = Some(1.5);
             g.direction = dir;
             let a = g.ensure_node("A", None, None);
             let b = g.ensure_node("B", None, None);
@@ -4431,6 +4510,40 @@ mod tests {
             (g - (55.0 + LABEL_BOX_H + 2.0 * LABEL_CLEAR)).abs() < 1e-9,
             "{g}"
         );
+    }
+
+    /// Report M3 (§2.6): in a flowchart a gap between adjacent layers
+    /// carrying a label grows to hold the label, an arrowhead and a stub
+    /// either side of it — 72 px down the page for a one-line label
+    /// (the 60 px gap used to stay, the chip swallowing a third of it) —
+    /// and along LR the label's width, the head and a clearance either
+    /// side; a gap with an unlabelled edge stays [`GAP_L`].
+    #[test]
+    fn a_labelled_gap_keeps_its_label_off_the_head() {
+        let gap = |label: Option<&str>, dir: Direction| {
+            let mut g = Graph::default();
+            g.direction = dir;
+            let a = g.ensure_node("A", None, None);
+            let b = g.ensure_node("B", None, None);
+            g.add_edge(a, b, label.map(str::to_string), EdgeKind::Arrow);
+            let lo = layout_sized(&g, &[(80.0, 40.0), (80.0, 40.0)]);
+            let (pa, pb) = (&lo.nodes[0], &lo.nodes[1]);
+            (pb.l - pb.lsize / 2.0) - (pa.l + pa.lsize / 2.0)
+        };
+        for dir in [Direction::TD, Direction::BT, Direction::LR, Direction::RL] {
+            assert_eq!(gap(None, dir), GAP_L, "{dir:?}");
+        }
+        for dir in [Direction::TD, Direction::BT] {
+            let g = gap(Some("yes"), dir);
+            assert!((g - (LABEL_BOX_H + 2.0 * LABEL_RUN)).abs() < 1e-9, "{g}");
+            assert!(g >= 72.0, "{dir:?}: {g}");
+        }
+        let w = text_width("a long branch label") + LABEL_PAD_W;
+        for dir in [Direction::LR, Direction::RL] {
+            let g = gap(Some("a long branch label"), dir);
+            let want = w + 2.0 * LABEL_CLEAR + ARROW_MARKER_PX;
+            assert!((g - want).abs() < 1e-9, "{dir:?}: {g} for {want}");
+        }
     }
 
     /// Report M7: a plain node label with no break of its own wraps at

@@ -1222,8 +1222,10 @@ mod tests {
     /// Least share (numerator, denominator) of the fixtures' crossings
     /// of a back-edge with a forward edge that put the back-edge under.
     /// Measured: 142 of 248 (57%). A layout change that moves crossings
-    /// can shift this; re-measure before loosening it.
-    const BACK_UNDER_SHARE: (usize, usize) = (1, 2);
+    /// can shift this; re-measure before loosening it. Re-measured with
+    /// B7 (report M3, M8: lone ends centred, combs, head room, no dead
+    /// strip under a box's first row): 79 of 161 (49%).
+    const BACK_UNDER_SHARE: (usize, usize) = (12, 25);
 
     /// A line crossed every 20 px: never more than [`CUTS_PER_WINDOW`]
     /// cuts (gaps or notches) within any [`CUT_WINDOW`]; the rest are
@@ -1314,8 +1316,11 @@ mod tests {
     /// static and routed: 3 | 2 before short lines handed their extra
     /// gaps on. Left: dense-td's `n21 -> n16`, a back-edge (it keeps
     /// its gaps, going under by preference), and one bench-75 drag line
-    /// whose crossers would chain theirs.
-    const SHORT_TWICE_MAX: (usize, usize) = (1, 1);
+    /// whose crossers would chain theirs. Routed 1 -> 2 with B7 (report
+    /// M3, M8): the dense fixtures' re-laid gaps (head room in labelled
+    /// ones, no dead strip under a box's first row) leave one more short
+    /// line of a `route()` drawing cut twice.
+    const SHORT_TWICE_MAX: (usize, usize) = (1, 2);
 
     #[test]
     fn a_short_line_keeps_at_most_one_gap() {

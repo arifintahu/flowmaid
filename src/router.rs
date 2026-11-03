@@ -3967,8 +3967,13 @@ pub(crate) fn nudge(g: &Graph, sc: &mut Scene, cx: &Ctx, mode: Mode, moved: &mut
         // round: a straight builder edge keeps its waypoints, and its
         // label its spot.
         // In `route()` only a path this stage redraws anyway: the others
-        // keep the router's corners, unjudged (G13).
-        let wide = (cur.len() > 2 && (redraw || mode == Mode::Static))
+        // keep the router's corners, unjudged (G13). A state note card's
+        // link keeps them in either mode: `route()` would draw it with
+        // the router's, so a drag that leaves its ends put would round
+        // its corners afresh (verify g26: 36 px corners in `scene()`,
+        // 14 px in every drag frame).
+        let note = crate::ports::note_link(sc, cx, i);
+        let wide = (cur.len() > 2 && !note && (redraw || mode == Mode::Static))
             .then(|| {
                 let narrow = drawn_with(e, &smooth(&cur, CORNER_R));
                 let wide = drawn_with(e, &smooth(&cur, CORNER_MAX));

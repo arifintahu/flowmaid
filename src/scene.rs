@@ -15381,6 +15381,84 @@ mod tests {
         );
     }
 
+    /// Report M8 (§2.8): a box's title strip takes its room above the
+    /// box's first row only — on the screen top, the layers' far side in
+    /// BT — so the next row inside follows at the usual layer gap (the
+    /// slot grown on both sides left a strip's worth of dead room under
+    /// every first row: 86 px where any other gap is 60).
+    #[test]
+    fn a_title_strip_leaves_no_dead_room_under_its_first_row() {
+        for dir in ["TD", "BT"] {
+            let src = format!(
+                "flowchart {dir}\n  C[Client] --> A\n  subgraph P [Platform]\n    \
+                 A[Auth service] --> U[User DB]\n    U --> W[Worker]\n  end\n"
+            );
+            let sc = scene(&parse(&src).unwrap());
+            let n = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+            let (top, next) = if dir == "TD" {
+                (n("A"), n("U"))
+            } else {
+                (n("W"), n("U"))
+            };
+            // Down the screen from the first row to the next either way.
+            let gap = (next.y - next.h / 2.0) - (top.y + top.h / 2.0);
+            assert!((gap - crate::layout::GAP_L).abs() < 1e-6, "{dir}: {gap}");
+            // The strip itself still sits above the first row, inside the
+            // frame: its title clear of the row.
+            let f = &sc.clusters[0];
+            let first = if dir == "TD" { n("A") } else { n("W") };
+            assert!(
+                first.y - first.h / 2.0 - f.y >= SUB_HEADER + SUB_PAD - 1e-6,
+                "{dir}: frame top {} over {}",
+                f.y,
+                first.y - first.h / 2.0
+            );
+        }
+    }
+
+    /// Report M3 (§2.6): a decision's labelled branches between adjacent
+    /// layers get a gap that holds the label, the head and a stub either
+    /// side; each label sits in the middle of its curve, where the S is
+    /// straight, clear of the arrowhead; and each arrival lands in the
+    /// middle of its target (long-labels: 43.7 px off-centre once).
+    #[test]
+    fn decision_labels_sit_mid_curve_clear_of_their_heads() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/long-labels.mmd"
+        ))
+        .unwrap();
+        for sc in static_and_routed(&src) {
+            for to in ["C", "D"] {
+                let e = sc
+                    .edges
+                    .iter()
+                    .find(|e| e.from == "B" && e.to == to)
+                    .unwrap();
+                let (b, t) = (
+                    sc.nodes.iter().find(|n| n.id == "B").unwrap(),
+                    sc.nodes.iter().find(|n| n.id == to).unwrap(),
+                );
+                let gap = (t.y - t.h / 2.0) - (b.y + b.h / 2.0);
+                assert!(gap >= 72.0 - 1e-6, "B -> {to}: gap {gap}");
+                let (_, m, _) = e.label.as_ref().unwrap();
+                let mid = cubic_mid(e.bezier[0], e.bezier[1], e.bezier[2], e.bezier[3]);
+                // (Within a step of the label stage's spots along it.)
+                assert!(
+                    (m.0 - mid.0).hypot(m.1 - mid.1) <= 6.0,
+                    "B -> {to}: label at {m:?}, curve middle {mid:?}"
+                );
+                let tip = e.bezier[3];
+                let clear = tip.1 - (m.1 + LABEL_BOX_H / 2.0);
+                assert!(
+                    clear >= ARROW_MARKER_PX + crate::layout::LABEL_CLEAR,
+                    "B -> {to}: {clear} px from label to tip"
+                );
+                assert!((tip.0 - t.x).abs() < 5.0, "B -> {to}: {} vs {}", tip.0, t.x);
+            }
+        }
+    }
+
     #[test]
     fn lr_colliding_labels_grow_their_gap_only_to_the_widest_one() {
         // Four labels share the gap after `laptop`, and their spans
@@ -15407,7 +15485,11 @@ mod tests {
             .filter_map(|e| e.label.as_ref().map(|l| l.2))
             .fold(0.0, f64::max);
         assert!(gap >= widest, "gap {gap} cannot hold a {widest} label");
-        assert!(gap <= widest + 2.0 * LABEL_BOX_H, "gap {gap} for {widest}");
+        // Plus the arrowhead the label keeps clear of (report M3).
+        assert!(
+            gap <= widest + 2.0 * LABEL_BOX_H + ARROW_MARKER_PX,
+            "gap {gap} for {widest}"
+        );
     }
 
     #[test]
@@ -15609,6 +15691,113 @@ mod tests {
             && !near(p0.1, p3.1)
             && ((near(c1.0, p0.0) && !near(c1.1, p0.1) && near(c2.1, p3.1) && !near(c2.0, p3.0))
                 || (near(c1.1, p0.1) && !near(c1.0, p0.0) && near(c2.0, p3.0) && !near(c2.1, p3.1)))
+    }
+
+    /// Verifier leftovers (B7): a note card's link whose node side also
+    /// holds another edge's end — a router path one way, none the other —
+    /// had its elbow end spread 7 px off in `scene()` and not in
+    /// `route()` (`spread-face`, `spread-bottom`); and a link the router
+    /// drew had 36 px corners in `scene()`, 14 px in `route()`
+    /// (`nested-composite`). The link end is a pin to the ports stage and
+    /// a link keeps the router's corners, so both draw every link alike
+    /// from the same centres, and a 1 px drag of a node no link ends on
+    /// moves none of them.
+    #[test]
+    fn note_links_hold_their_ends_and_corners_in_scene_route_and_drag() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/notes");
+        for name in ["spread-face", "spread-bottom", "nested-composite"] {
+            let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");
+            let g = match crate::parser::parse_document(&src).unwrap() {
+                crate::model::Document::State(g) => g,
+                other => panic!("not a state diagram: {other:?}"),
+            };
+            let s = scene(&g);
+            let at: Vec<(f64, f64)> = s.nodes.iter().map(|n| (n.x, n.y)).collect();
+            let r = route(&g, &at);
+            let links: Vec<usize> = (0..g.edges.len())
+                .filter(|&ei| {
+                    let e = &g.edges[ei];
+                    is_note_card(&s.nodes[e.from]) || is_note_card(&s.nodes[e.to])
+                })
+                .collect();
+            let same = |a: &SceneEdge, b: &SceneEdge| {
+                let close = |p: &(f64, f64), q: &(f64, f64)| {
+                    (p.0 - q.0).abs() < 1e-6 && (p.1 - q.1).abs() < 1e-6
+                };
+                a.waypoints.len() == b.waypoints.len()
+                    && a.waypoints
+                        .iter()
+                        .zip(&b.waypoints)
+                        .all(|(p, q)| close(p, q))
+                    && (!a.waypoints.is_empty()
+                        || a.bezier.iter().zip(&b.bezier).all(|(p, q)| close(p, q)))
+            };
+            let mut held = 0;
+            for &ei in &links {
+                let (a, b) = (&s.edges[ei], &r.edges[ei]);
+                // An elbow, or the nested composite's link the router
+                // drew round its box (`in458`, whose corners differed;
+                // other router paths may take another course in
+                // `route()`, whose search is a drag frame's): one and
+                // the same.
+                let card = |id: &str| {
+                    s.nodes
+                        .iter()
+                        .find(|n| n.id == id)
+                        .map(|n| n.label.as_str())
+                };
+                let routed = name == "nested-composite"
+                    && (card(&a.from) == Some("in458") || card(&a.to) == Some("in458"));
+                if elbow_of(a) || routed {
+                    assert!(
+                        same(a, b),
+                        "{name} {} -> {}: {:?} {:?}\nvs {:?} {:?}",
+                        a.from,
+                        a.to,
+                        a.bezier,
+                        a.waypoints,
+                        b.bezier,
+                        b.waypoints
+                    );
+                    held += 1;
+                }
+            }
+            assert!(held >= 1, "{name}: no link compared");
+            for v in 0..g.nodes.len() {
+                if is_note_card(&s.nodes[v]) {
+                    continue;
+                }
+                let mut moved = at.clone();
+                moved[v].0 += 1.0;
+                let p = route_partial(&g, &moved, &s, &at);
+                // A drag `route_partial` hands to `route()` whole redraws
+                // every free curve with `route()`'s own tangents (a node
+                // with a box's worth of edges): not this check's business.
+                let whole = (0..g.edges.len()).any(|ei| {
+                    let e = &g.edges[ei];
+                    e.from != v
+                        && e.to != v
+                        && !links.contains(&ei)
+                        && s.edges[ei].waypoints.is_empty()
+                        && s.edges[ei].bezier != p.edges[ei].bezier
+                });
+                if whole {
+                    continue;
+                }
+                for &ei in links.iter().filter(|&&ei| {
+                    let e = &g.edges[ei];
+                    e.from != v && e.to != v
+                }) {
+                    assert!(
+                        same(&s.edges[ei], &p.edges[ei]),
+                        "{name}: dragging {} moved {} -> {}",
+                        g.nodes[v].id,
+                        s.edges[ei].from,
+                        s.edges[ei].to
+                    );
+                }
+            }
+        }
     }
 
     #[test]

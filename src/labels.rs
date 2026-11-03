@@ -88,6 +88,9 @@ const LABEL_PREFER: f64 = 0.5;
 /// other end): the middle of the half away from it (mirrored for an
 /// edge entering one).
 const LABEL_HUB_PREFER: f64 = 0.75;
+/// Most edge ends a node may have and still be a decision rather than
+/// a hub to [`LABEL_HUB_PREFER`]: one way in, two out (or the reverse).
+const LABEL_HUB_MIN: usize = 3;
 /// Least share of its line's length, counted from a compact branch
 /// point (see [`is_branch_point`]), at which a label of the point's fan
 /// keeps its spot: a little past the middle, so a label still at the
@@ -1741,6 +1744,20 @@ fn place(
         })
         .collect();
     // (preferred spot, fan-out of a hub end or 0) per edge.
+    // Edges per node pair, either way round: a twin's label stacks
+    // along its own line (below).
+    fn pair(e: &SceneEdge) -> (&str, &str) {
+        let (a, b) = (e.from.as_str(), e.to.as_str());
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+    let mut pairs: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for e in edges.iter() {
+        *pairs.entry(pair(e)).or_insert(0) += 1;
+    }
     let hub: Vec<(f64, usize)> = edges
         .iter()
         .zip(&fan)
@@ -1749,10 +1766,23 @@ fn place(
             let dt = degree.get(e.to.as_str()).copied().unwrap_or(0);
             // A hub end piles every label of its fan near it: prefer
             // the middle of the half away from the busier end — away
-            // from a compact branch point whatever the counts.
-            if fan == Some(true) || fan.is_none() && e.from != e.to && df > 1 && df > dt {
+            // from a compact branch point whatever the counts. Not a
+            // decision's branch (its node has [`LABEL_HUB_MIN`] ends at
+            // most) drawn as a single curve across one gap of a
+            // flowchart drawing, with no parallel twin (twins' labels
+            // stack along their own lines): the layout sized that gap
+            // for its label in the middle, clear of the head (report M3,
+            // §2.6), and the half away from the decision is where the
+            // curve turns into its target (long-labels' `incomplete` sat
+            // on that bend, against the head).
+            let twin = pairs.get(&pair(e)).is_some_and(|&k| k > 1);
+            let across = e.paint_width.is_none() && e.waypoints.is_empty() && !twin;
+            let hub_end = |d: usize, other: usize| {
+                e.from != e.to && d > 1 && d > other && !(across && d <= LABEL_HUB_MIN)
+            };
+            if fan == Some(true) || fan.is_none() && hub_end(df, dt) {
                 (LABEL_HUB_PREFER, df)
-            } else if fan == Some(false) || fan.is_none() && e.from != e.to && dt > 1 && dt > df {
+            } else if fan == Some(false) || fan.is_none() && hub_end(dt, df) {
                 (1.0 - LABEL_HUB_PREFER, dt)
             } else {
                 (LABEL_PREFER, 0)

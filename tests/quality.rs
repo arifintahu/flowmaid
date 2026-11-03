@@ -50,8 +50,20 @@ const GAP_FLOORS: &[(&str, f64, f64)] = &[
     // width (`n32`, 204 px) now wraps to two lines, the drawing grows
     // 17 px taller, and a pair of parallel legs closes 9.63 -> 9.53 px
     // while the routed drawing crosses 4 fewer edges.
-    ("dense-lr", 9.5, 5.5),
-    ("dense-td", 12.1, 3.2),
+    //
+    // B7 (report M3, M8, §2.4, §2.6, §2.8): every labelled gap keeps
+    // its label clear of the head (72 px across a TD gap, the head and
+    // a clearance either side along LR), a lone end meets its box side
+    // in the middle, a comb spaces evenly, and a box's title strip no
+    // longer leaves a strip of dead room under its first row (dense-td
+    // 1 823 -> 1 663 px tall). Its static drawing's closest pair is
+    // now two router legs 10.5 px apart in one shared channel under the
+    // g5 / g6 frames, which closed by 160 px (12.16 -> 10.50, floor
+    // 10.4); its
+    // routed pairs opened 6.6 -> 12.0 and dense-lr's 9.5 / 9.7 ->
+    // 11.7 / 12.1, ratcheted here.
+    ("dense-lr", 11.7, 12.0),
+    ("dense-td", 10.4, 12.0),
     ("fanout-frames", 40.0, 40.0),
     ("wide-labels", 40.0, 40.0),
 ];
@@ -177,7 +189,15 @@ fn quality_gate() {
 /// `n12`'s bottom-corner ends `n12 -> n36` / `n12 -> n38` start 6 px up
 /// the bottom arc and their curves run 1-2 px longer beside g1's and
 /// g2's right borders (1018.7 -> 1021.7); no route changed.
-const BORDER_LEN_MAX: (f64, f64) = (1_022.0, 2_065.0);
+/// B7 (report M3, M8): 1022 -> 1475 static, 2065 -> 2105 routed, as
+/// intended drawing changes cost it: dense-td lost the dead strip under
+/// each box's first row (160 px over the drawing, as much as 99 px in
+/// one gap), its labelled gaps grew by their head room, and its lone
+/// ends moved to their sides' middles, so its long `n31 -> n38`
+/// (316 + 192 -> 453 + 277 px under g5's and g6's bottoms) and
+/// `n22 -> n40` (126 px down g6's left) ride borders the closer
+/// channel leaves no lane beside; bench-75 routed 360 -> 402.
+const BORDER_LEN_MAX: (f64, f64) = (1_475.0, 2_105.0);
 
 /// Edges keep off frame borders where their channel has room (G4).
 #[test]
@@ -217,8 +237,12 @@ fn every_fixture_has_a_ceiling() {
 /// by fewer strokes exists; the rest sit in bundles with no such spot.
 /// Integrated with the round-2 router (re-sorted ports, labelled edges
 /// kept off spacing-only reroutes): 35 / 20 on the merged pipeline;
-/// 0 / 4 on the generated dense fixtures.
-const LBL_EDGE_MAX: (usize, usize) = (0, 4);
+/// 0 / 4 on the generated dense fixtures. B7 (report M3): 0 -> 1
+/// static — dense-lr's `n12 -> n33` label sits beside its line in the
+/// cable of three curves that leaves hub `n12`'s over-full side (its
+/// lone far ends now meet their targets in the middle), its box's edge
+/// over the neighbour `n12 -> n36`; no spot along the cable is clear.
+const LBL_EDGE_MAX: (usize, usize) = (1, 4);
 
 /// Most hard label hits (node, label, chip or arrowhead) over all
 /// fixtures, per mode (static, routed). None: a spot covering an
@@ -362,11 +386,19 @@ fn crossing_gaps_do_not_read_as_dashes() {
 /// `svc4 -> logs` off the app frame's border, see `BORDER_LEN_MAX`),
 /// routed hug 3 667 -> 3 447, tight 9 224 -> 8 142 static and
 /// 20 942 -> 19 120 routed, overlap 2 746 -> 2 390 and 7 594 -> 6 748.
+/// B7 (report M3, M8, see `BORDER_LEN_MAX`): static overlap 2 920 ->
+/// 3 200 and routed 7 620 -> 7 770 (dense-td 1 734 -> 2 290 static,
+/// 4 318 -> 5 638 routed; dense-lr static 246 -> 490), the longest run
+/// 400 -> 470 and 1 290 -> 1 400 (dense-td), static tight 9 350 ->
+/// 12 860 (dense-td 3 888 -> 7 072: its channels a strip's depth
+/// closer; dense-lr 960 -> 2 562: the fan out of hub `n12` whose far
+/// ends now meet their targets in the middle runs as a cable); hug
+/// ratcheted down to 2 820 | 3 430 (dense-td static 2 208 -> 2 008).
 const CHANNEL_MAX: [(&str, f64, f64); 4] = [
-    ("overlap_len", 2_920.0, 7_620.0),
-    ("overlap_max", 400.0, 1_290.0),
-    ("tight_len", 9_350.0, 21_900.0),
-    ("hug_len", 3_010.0, 3_700.0),
+    ("overlap_len", 3_200.0, 7_770.0),
+    ("overlap_max", 470.0, 1_400.0),
+    ("tight_len", 12_860.0, 21_900.0),
+    ("hug_len", 2_820.0, 3_430.0),
 ];
 
 /// Most edges (over all fixtures, per mode) that pass a title chip
@@ -509,22 +541,35 @@ fn channels_keep_edges_apart_and_off_chips() {
 /// 2 | 3 -> 0 | 0, end_gap_max 4.5 -> 0.05 (the flattening of the
 /// outline polygon the metric measures against, `OUTLINE_FLATNESS`);
 /// ceiling 0.1. No other row moved.
+///
+/// B7 (report M3, M8, §2.4, §2.6, §2.8): lone ends meet their sides in
+/// the middle, combs space evenly, nearly straight pairs are drawn
+/// straight, labelled gaps keep head room and title strips no dead room
+/// under a box's first row. Lowered: end_tilt 8 -> 7 static, end_kink
+/// 55 | 71 -> 54 | 69, idiom_spline 23 | 22 -> 22 | 21, idiom_scubic
+/// routed 81 -> 80, x_drawn 505 | 508 -> 494 | 503, lat_backtrack routed
+/// 696.1 -> 667. Raised, as the closer channels of the dense fixtures
+/// cost them: band_pairs 91 | 101 -> 96 | 106 and band_len 41 064 |
+/// 47 104 -> 46 184 | 52 184 (dense-td's fans run as cables a strip's
+/// depth nearer each other, 19 804 -> 23 042 static, 22 150 -> 27 434
+/// routed; dense-lr's `n12` fan 4 670 -> 6 570 static), lat_backtrack
+/// static 1 813 -> 1 814.2 (dense-td 123.2 -> 124.5).
 const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
-    ("end_tilt", 8.0, 11.0),
+    ("end_tilt", 7.0, 11.0),
     ("end_tilt_max", 76.8, 128.4),
     ("end_gaps", 0.0, 0.0),
     ("end_gap_max", 0.1, 0.1),
     ("lat_wiggles", 16.0, 16.0),
-    ("lat_backtrack", 1_813.0, 696.1),
+    ("lat_backtrack", 1_814.2, 667.0),
     ("own_frame_x", 0.0, 0.0),
     ("own_frame_len", 0.0, 0.0),
-    ("band_pairs", 91.0, 101.0),
-    ("band_len", 41_064.0, 47_104.0),
-    ("idiom_scubic", 61.0, 81.0),
-    ("idiom_spline", 23.0, 22.0),
+    ("band_pairs", 96.0, 106.0),
+    ("band_len", 46_184.0, 52_184.0),
+    ("idiom_scubic", 61.0, 80.0),
+    ("idiom_spline", 22.0, 21.0),
     ("idiom_bow", 2.0, 1.0),
-    ("x_drawn", 505.0, 508.0),
-    ("end_kink", 55.0, 71.0),
+    ("x_drawn", 494.0, 503.0),
+    ("end_kink", 54.0, 69.0),
     ("ink_out", 0.0, 0.0),
 ];
 

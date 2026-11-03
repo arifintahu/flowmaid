@@ -165,6 +165,37 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Changed
 
+- **Labelled gaps keep their labels off the arrowhead; ends meet their
+  sides in the middle** (report M3, §2.4, §2.6). In a flowchart or state
+  diagram a gap between adjacent layers that carries an edge label grows
+  to hold the label, an arrowhead and a stub either side of it: 72 px
+  down the page for a one-line label (the 60 px gap used to stay, a
+  20 px chip swallowing a third of it and the edge reading as two hooks),
+  and along LR / RL the label's width, the head and a clearance either
+  side (the head used to be left out). A decision's branch label sits in
+  the middle of its curve, where the S runs straight, instead of in the
+  half that turns into its target. An edge end alone on its box side
+  meets that side in the middle (long-labels' arrivals landed up to
+  44 px off their targets' centres, and the flow through a node jogged);
+  three or more ends on one box side are spaced evenly, centred where
+  their edges head (fanout's Aggregator took 14 / 29 / 29 / 14 px); when
+  ends must make room, the ends of straight edges keep their place and a
+  back-edge's give way; and a 1:1 pair on facing sides a few px apart
+  along them is drawn straight. Parallel edges keep their own spacing. A
+  state note card's link holds its end whatever else shares its node's
+  side, and keeps the router's corners, so `scene()` and `route()` draw
+  it alike and a drag that leaves its ends put never moves it (its elbow
+  ends used to sit 7-18 px apart in the two). Class and ER diagrams,
+  whose painters set their own ends, are unchanged. The layout search
+  judges a candidate on the old depths, so the head room never changes
+  a layering or ordering choice.
+- **No dead room under a subgraph's first row** (report M8, §2.8). A
+  box's title strip now takes its room only above the box's first row
+  (below it in BT, the screen top), so the next row inside follows at the
+  usual layer gap; the strip used to be reserved on both sides of the
+  row, leaving 26 px of empty band under every box's first row (subgraph
+  786 -> 734 px tall, advanced 1 267 -> 1 214, dense-td 1 823 -> 1 663).
+  Titles are still never struck.
 - **Long node labels wrap** (report M7, §2.12). A flowchart or state
   label that breaks none of its own lines now wraps at 200 px (mermaid's
   `flowchart.wrappingWidth` default) instead of stretching its node into
