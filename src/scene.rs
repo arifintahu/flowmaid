@@ -6385,7 +6385,8 @@ fn bowed(mut pts: [(f64, f64); 4], bow: f64) -> [(f64, f64); 4] {
 }
 
 /// Per edge of `g`: for the return edge (`back(ei)`) of a 2-cycle drawn
-/// as single curves across one gap (`curve(ei)`, as for [`twin_bows`]),
+/// as single curves across one gap (`curve(ei)`, as for [`twin_bows`]) —
+/// the only two edges between their ends —
 /// the breadth side its parallel offset `offs` puts it on (-1 low, +1
 /// high), 0 for every other edge: the return edge [`skewed`] away from
 /// its twin along the flow where no [`twin_bows`] bow parts them. Only
@@ -6404,9 +6405,16 @@ fn twin_sides(
         .iter()
         .enumerate()
         .map(|(i, e)| {
+            // Exactly the two of them: among more parallel edges a move
+            // away from one runs into the next (q27's `n4 ==> n0` beside
+            // three `n0 --> n4`).
+            let pair = |f: &Edge| {
+                drawn(f) && (f.from == e.from && f.to == e.to || f.from == e.to && f.to == e.from)
+            };
             let twin = drawn(e)
                 && back(i)
                 && curve(i)
+                && g.edges.iter().filter(|f| pair(f)).count() == 2
                 && g.edges.iter().enumerate().any(|(j, f)| {
                     j != i && f.from == e.to && f.to == e.from && drawn(f) && curve(j)
                 });
@@ -14032,6 +14040,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn only_a_lone_two_cycle_skews_its_return_curve() {
+        // Among more parallel edges a return curve moved away from one
+        // runs into the next (q27: `n4 ==> n0` beside three `n0 --> n4`
+        // ends rerouted and swung `n0 --> n4` in at 62 deg): only the two
+        // edges of a lone 2-cycle get a side.
+        let sides = |src: &str| {
+            let g = parse(src).unwrap();
+            let back = |ei: usize| g.nodes[g.edges[ei].from].id == "B";
+            twin_sides(&g, &parallel_offsets(&g), |_| true, back)
+        };
+        let lone = sides("flowchart TD\nA --> B\nB --> A");
+        assert_eq!(lone[0], 0.0, "{lone:?}");
+        assert_ne!(lone[1], 0.0, "{lone:?}");
+        assert!(sides("flowchart TD\nA --> B\nB --> A\nA -.-> B")
+            .iter()
+            .all(|&s| s == 0.0));
     }
 
     #[test]

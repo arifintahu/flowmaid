@@ -191,8 +191,9 @@ Minor, not patch: several class structs gain public fields (see
   tangent at the end it moves from: its twin and the forward edge's
   course stay as they are, both ends still leave and enter square, and a
   labelled return edge moves far enough for its label to keep off the
-  twin. Twins already bent hard into an end keep their course, and the
-  router reroutes them as before. A back-edge whose ends lie
+  twin. Twins already bent hard into an end, and a return edge among
+  more parallel edges between the same two nodes, keep their course, and
+  the router reroutes them as before. A back-edge whose ends lie
   more than 450 px apart across the flow takes a lane instead: a reversed S
   would sweep along the gap through every edge there and meet its end at a
   slant (bench-75's `svc2 -> db` entered `db` at 71° in `route()`). On a
