@@ -3757,6 +3757,8 @@ fn shifted(
 /// `pts` with its first stair step (two opposite corners closer than
 /// [`JOG_MIN`]) merged into one leg, trying the shorter neighbouring leg
 /// first: it moves onto the other's line (a port leg slides its port).
+/// Past the last such step (`skip` counts the ones passed over), a
+/// longer step between two port legs ([`straight_between_ports`]).
 /// `None` when there is no step to merge or no move is allowed.
 fn merge_jog(f: &Fences, routes: &[Option<Vec<Pt>>], i: usize, skip: usize) -> Option<Vec<Pt>> {
     let pts = routes[i].as_ref()?;
@@ -3788,7 +3790,63 @@ fn merge_jog(f: &Fences, routes: &[Option<Vec<Pt>>], i: usize, skip: usize) -> O
             .find_map(|(sg, to)| shifted(f, routes, sg, to, Some(k)))
             .map(collapse);
     }
-    None
+    straight_between_ports(f, routes, i, skip - seen)
+}
+
+/// A path of one step between its two port legs (`port, step, port`,
+/// [`JOG_MIN`] or longer) drawn as one straight leg: both ports slide
+/// onto a line their sides share — the `pick`th of the shared lines
+/// nearest each port leg's own, then the shared span's two ends (the
+/// nudge judges each and passes over one that scores worse) — (B7
+/// review r1 #8: BT, a port slid off its frame's title chip left a
+/// 29 px step right under a centred head, on the border of the frame
+/// round the head's node, where one line through both sides, inside
+/// the head node's corner, runs clear of the chip). `None` when the
+/// sides share no line, the candidates are spent or a port may not move
+/// there ([`shifted`]).
+fn straight_between_ports(
+    f: &Fences,
+    routes: &[Option<Vec<Pt>>],
+    i: usize,
+    pick: usize,
+) -> Option<Vec<Pt>> {
+    let pts = routes[i].as_ref()?;
+    if pts.len() != 4 {
+        return None;
+    }
+    let info = f.infos[i].as_ref()?;
+    let (l0, l2) = (leg(i, 0, pts[0], pts[1])?, leg(i, 2, pts[2], pts[3])?);
+    let same = (pts[1].0 - pts[0].0) * (pts[3].0 - pts[2].0)
+        + (pts[1].1 - pts[0].1) * (pts[3].1 - pts[2].1)
+        > 0.0;
+    if l0.axis != l2.axis || !same || dist(pts[1], pts[2]) < JOG_MIN {
+        return None;
+    }
+    let (_, a0, a1) = slide_range(f.w, info.ends.0, pts[0], l0.axis)?;
+    let (_, b0, b1) = slide_range(f.w, info.ends.1, pts[3], l2.axis)?;
+    let (lo, hi) = (a0.max(b0), a1.min(b1));
+    if lo > hi {
+        return None;
+    }
+    let mut lines: Vec<f64> = Vec::new();
+    for t in [l0.at.max(lo).min(hi), l2.at.max(lo).min(hi), lo, hi] {
+        if lines.iter().all(|&u| (u - t).abs() > EPS) {
+            lines.push(t);
+        }
+    }
+    let to = *lines.get(pick)?;
+    // The start's port leg first (unless it runs there already), then
+    // the end's, the step between them vanishing.
+    let first = if (to - l0.at).abs() < EPS {
+        pts.clone()
+    } else {
+        shifted(f, routes, l0, to, None)?
+    };
+    let l2 = leg(i, 2, first[2], first[3])?;
+    let mut next = routes.to_vec();
+    next[i] = Some(first);
+    let out = collapse(shifted(f, &next, l2, to, Some(1))?);
+    (out.len() == 2).then_some(out)
 }
 
 /// The corner list of an edge drawn as an orthogonal path (every leg of
@@ -5985,6 +6043,41 @@ mod tests {
             );
         }
         assert!((p[0].1 < q[0].1) == (p[1].0 > q[1].0), "{p:?} {q:?}");
+    }
+
+    /// B7 review r1 (#8): BT, `Third row --> Deep` leaves its box's
+    /// top past the frame's title chip and rose to a 29 px step right
+    /// under Deep's centred head, on the nested frame's border (in
+    /// `route()`, a channel that doubled back); both its ports slide onto
+    /// one line the two sides share, clear of the chip, in either mode.
+    #[test]
+    fn a_step_between_two_ports_straightens_onto_a_shared_line() {
+        let src = "flowchart BT\n  subgraph P [Platform title]\n    A[First row] --> B[Second row]\n    \
+                   B --> C[Third row]\n  end\n  subgraph Q [Nested parent]\n    subgraph R [Nested child]\n      \
+                   D[Deep] -->|label here| E[Deeper]\n    end\n  end\n  C --> D\n  X[Outside] -->|enter| A\n";
+        let g = parse(src).unwrap();
+        let s = scene(&g);
+        let r = route(&g, &centres(&g));
+        for (mode, sc) in [("static", &s), ("routed", &r)] {
+            let e = sc
+                .edges
+                .iter()
+                .find(|e| e.from == "C" && e.to == "D")
+                .unwrap();
+            let pts: Vec<Pt> = if e.waypoints.is_empty() {
+                e.bezier.to_vec()
+            } else {
+                e.waypoints.clone()
+            };
+            assert!(
+                pts.iter().all(|p| (p.0 - pts[0].0).abs() < 1e-6),
+                "{mode}: {:?} {:?}",
+                e.bezier,
+                e.waypoints
+            );
+        }
+        let rep = measure_source(src, false).unwrap();
+        assert_eq!((rep.statik.edge_chip, rep.routed.edge_chip), (0, 0));
     }
 
     #[test]

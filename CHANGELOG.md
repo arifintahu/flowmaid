@@ -218,7 +218,14 @@ Minor, not patch: several class structs gain public fields (see
   moved clear (a free curve slid along the flow, a router leg across its
   channel) where that costs nothing else, and an end's straight run into
   its arrowhead is left out where it would swing the curve into a box it
-  passes beside (it is squared at paint time instead).
+  passes beside (it is squared at paint time instead). A path whose one
+  step lies between its two port legs is drawn straight where both ports
+  can slide onto a line their sides share (BT, a port slid off a frame's
+  title chip left a 29 px step right under the head, on the border of the
+  frame round its node). `route()` no longer threads a channel between
+  two boxes closer than its two 16 px steps: the step out of one passed
+  the step into the other and the path doubled back on itself; such an
+  edge starts as the static scene's direct curve.
 - **Long node labels wrap** (report M7, §2.12). A flowchart or state
   label that breaks none of its own lines now wraps at 200 px (mermaid's
   `flowchart.wrappingWidth` default) instead of stretching its node into

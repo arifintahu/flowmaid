@@ -7974,8 +7974,13 @@ fn direct_back(
 /// gap between clusters instead of cutting through their interiors.
 /// `a_box`/`b_box` = `(x, y, w, h)` of the endpoint's top-level cluster
 /// (or the node's own box when it has no cluster). Returns empty when
-/// the clusters aren't cleanly stacked along the flow axis (fall back
-/// to the direct curve then).
+/// the clusters aren't cleanly stacked along the flow axis, or stand
+/// closer than the two `GAP`s the path steps out and in by (fall back
+/// to the direct curve then, as the static layout draws such an edge):
+/// there the step out of one box would pass the step into the other
+/// and the path double back on itself (B7 review r1 #8: BT, with the
+/// frames 18 px apart, `Third row --> Deep` rose 14 px past the gap,
+/// fell back and ended in a slanted run under the head).
 fn cross_cluster_route(
     a_c: (f64, f64),
     a_sz: (f64, f64),
@@ -7989,11 +7994,12 @@ fn cross_cluster_route(
     if vertical {
         let down = b_c.1 >= a_c.1;
         // Only route when the two boxes are clearly separated along the
-        // flow axis (source fully above target, or vice-versa).
+        // flow axis (source fully above target, or vice-versa), with
+        // room for both steps.
         let ok = if down {
-            a_box.1 + a_box.3 < b_box.1
+            a_box.1 + a_box.3 + 2.0 * GAP <= b_box.1
         } else {
-            b_box.1 + b_box.3 < a_box.1
+            b_box.1 + b_box.3 + 2.0 * GAP <= a_box.1
         };
         if !ok {
             return Vec::new();
@@ -8027,9 +8033,9 @@ fn cross_cluster_route(
     } else {
         let right = b_c.0 >= a_c.0;
         let ok = if right {
-            a_box.0 + a_box.2 < b_box.0
+            a_box.0 + a_box.2 + 2.0 * GAP <= b_box.0
         } else {
-            b_box.0 + b_box.2 < a_box.0
+            b_box.0 + b_box.2 + 2.0 * GAP <= a_box.0
         };
         if !ok {
             return Vec::new();
@@ -10642,6 +10648,63 @@ mod tests {
         let r = route(&g, &centers);
         assert_eq!(r.edges[0].ends, g.edges[0].ends);
         assert!(to_svg(&r).contains("marker-start=\"url(#cross-start)\""));
+    }
+
+    /// B7 review r1 (#8): two boxes closer than the channel's two steps
+    /// get no channel (its step out of one would pass its step into the
+    /// other and the path double back); far enough apart they do, in
+    /// order along the flow, either way and in either direction.
+    #[test]
+    fn a_cross_cluster_channel_never_doubles_back() {
+        // BT: the source box below, the target's 18 px above it.
+        let (a, b) = ((0.0, 302.0, 134.0, 288.0), (0.0, 28.0, 134.0, 256.0));
+        assert!(cross_cluster_route(
+            (95.0, 361.0),
+            (92.0, 38.0),
+            a,
+            (95.0, 237.0),
+            (65.0, 38.0),
+            b,
+            true
+        )
+        .is_empty());
+        let a = (0.0, 330.0, 134.0, 288.0);
+        let up = cross_cluster_route(
+            (95.0, 391.0),
+            (92.0, 38.0),
+            a,
+            (95.0, 237.0),
+            (65.0, 38.0),
+            b,
+            true,
+        );
+        assert!(up.windows(2).all(|w| w[1].1 <= w[0].1), "{up:?}");
+        // LR: the same, sideways.
+        let (a, b) = ((0.0, 0.0, 100.0, 80.0), (120.0, 0.0, 100.0, 80.0));
+        assert!(cross_cluster_route(
+            (50.0, 40.0),
+            (60.0, 30.0),
+            a,
+            (170.0, 40.0),
+            (60.0, 30.0),
+            b,
+            false
+        )
+        .is_empty());
+        let b = (140.0, 0.0, 100.0, 80.0);
+        let right = cross_cluster_route(
+            (50.0, 40.0),
+            (60.0, 30.0),
+            a,
+            (190.0, 40.0),
+            (60.0, 30.0),
+            b,
+            false,
+        );
+        assert!(
+            right.len() == 4 && right.windows(2).all(|w| w[1].0 >= w[0].0),
+            "{right:?}"
+        );
     }
 
     #[test]
