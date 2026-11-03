@@ -174,7 +174,13 @@ Minor, not patch: several class structs gain public fields (see
   and along LR / RL the label's width, the head and a clearance either
   side (the head used to be left out). A decision's branch label sits in
   the middle of its curve, where the S runs straight, instead of in the
-  half that turns into its target. An edge end alone on its box side
+  half that turns into its target. So does a hub's (a node with more
+  ends) where the drawing runs down the page: the gap grows (by up to
+  48 px) until the label, centred on its curve's middle, clears the
+  fan's other curves (a hub's `express` sat on the bend 6 px off its
+  head, its middle crossed by a sibling's curve); a fan too crowded for
+  that, or with parallel twins, keeps its gap and its labels keep to the
+  half away from the hub. An edge end alone on its box side
   meets that side in the middle (long-labels' arrivals landed up to
   44 px off their targets' centres, and the flow through a node jogged);
   three or more ends on one box side are spaced evenly, centred where

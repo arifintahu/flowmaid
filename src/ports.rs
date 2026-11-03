@@ -61,7 +61,7 @@ const STUB_EPS: f64 = 0.5;
 /// (report M3, §2.4): a comb of three or more ends spreads over the
 /// side at up to this, centred where its edges head, so a wide box's
 /// fan keeps its ends together instead of reaching for the corners.
-const PORT_EVEN_MAX: f64 = 2.0 * PORT_SPACING;
+pub(crate) const PORT_EVEN_MAX: f64 = 2.0 * PORT_SPACING;
 /// Least pitch (px) of an even comb ([`even_comb`]) holding two or more
 /// arrowheads, where its side has the room: a head's width and the
 /// spacing at which two strokes read as two, so neighbouring heads keep

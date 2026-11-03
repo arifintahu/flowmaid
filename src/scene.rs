@@ -15709,6 +15709,57 @@ mod tests {
         }
     }
 
+    /// B7 review r1 (#6, report M3): a hub's labelled branches across one
+    /// gap get a gap deep enough that each label, centred on its curve's
+    /// middle, clears the fan's other curves; the label sits there, not
+    /// in the half near the head (`express` sat 5.7 px off its head's
+    /// base, on the bend, where at the middle its box met `Pack`'s
+    /// curve). In both modes.
+    #[test]
+    fn a_hub_s_labels_sit_mid_curve_clear_of_their_fan_and_heads() {
+        let src = "flowchart TD\n  A[Order received] --> B[Pack]\n  A -->|express| C[Ship now]\n  \
+                   A --> D[Invoice]\n  A -->|gift wrap| E[Wrap]\n  B --> F[Done]\n  C --> F\n";
+        for sc in static_and_routed(src) {
+            for to in ["C", "E"] {
+                let e = sc
+                    .edges
+                    .iter()
+                    .find(|e| e.from == "A" && e.to == to)
+                    .unwrap();
+                let (_, m, w) = e.label.clone().unwrap();
+                let mid = cubic_mid(e.bezier[0], e.bezier[1], e.bezier[2], e.bezier[3]);
+                assert!(
+                    (m.0 - mid.0).hypot(m.1 - mid.1) <= 6.0,
+                    "A -> {to}: label at {m:?}, curve middle {mid:?}"
+                );
+                let clear = e.bezier[3].1 - (m.1 + LABEL_BOX_H / 2.0);
+                assert!(
+                    clear >= ARROW_MARKER_PX + crate::layout::LABEL_CLEAR,
+                    "A -> {to}: {clear} px from label to tip"
+                );
+                // No other stroke of the fan runs through the label.
+                let r = (
+                    m.0 - w / 2.0,
+                    m.1 - LABEL_BOX_H / 2.0,
+                    m.0 + w / 2.0,
+                    m.1 + LABEL_BOX_H / 2.0,
+                );
+                for f in sc.edges.iter().filter(|f| f.from == "A" && f.to != to) {
+                    let pts = edge_polyline(f);
+                    assert!(
+                        pts.iter()
+                            .all(|p| p.0 < r.0 || p.0 > r.2 || p.1 < r.1 || p.1 > r.3),
+                        "A -> {to}'s label is crossed by A -> {}",
+                        f.to
+                    );
+                }
+            }
+        }
+        // Nor does the harness find a label on another stroke.
+        let rep = crate::quality::measure_source(src, false).unwrap();
+        assert_eq!((rep.statik.lbl_edge, rep.routed.lbl_edge), (0, 0));
+    }
+
     #[test]
     fn lr_colliding_labels_grow_their_gap_only_to_the_widest_one() {
         // Four labels share the gap after `laptop`, and their spans

@@ -315,6 +315,176 @@ fn unlink_bar_cards<'a>(
 /// labels of a compact branch point's fan.
 const FAN_GAP_MAX: f64 = 4.0 * GAP_L;
 
+/// Most a fan's labels grow their gap past the plain labelled gap
+/// (`ext + 2 * LABEL_RUN`, report M3) in [`hub_label_room`]: a fan too
+/// crowded for that keeps the plain gap (its labels then find their own
+/// clear spots, as before).
+const HUB_LABEL_GROW_MAX: f64 = 48.0;
+
+/// Step (px) [`hub_label_room`] grows a trial gap by.
+const HUB_LABEL_STEP: f64 = 2.0;
+
+/// Per lower layer: `(upper end, lower end, gap)` — the least border to
+/// border gap at which a labelled edge across one gap, drawn as the
+/// builder draws it (an S whose controls sit mid-gap), keeps its label
+/// centred on its curve's middle clear of the other curves of each fan
+/// it is part of (B7 review r1 #6, report M3: a hub's labels sat in the
+/// half near the head, on the bend: `express` 5.7 px off its head's
+/// base, where at the middle its box met `Pack`'s curve). A fan is the
+/// edges between one node and the next layer, its ports modelled as the
+/// ports stage spreads a side ([`crate::ports::PORT_EVEN_MAX`], ordered
+/// by their far ends); the label clears another curve by
+/// [`STROKE_PAD`]. Only gaps that need more than the plain labelled gap,
+/// by at most [`HUB_LABEL_GROW_MAX`], get an entry. The label stage
+/// prefers such a label's middle (`labels::place`).
+fn hub_label_room(
+    g: &Graph,
+    back: &[bool],
+    alayer: &[usize],
+    bpos: &[f64],
+    absize: &[f64],
+    nlayers: usize,
+    horizontal: bool,
+) -> Vec<Vec<(usize, usize, f64)>> {
+    let mut out: Vec<Vec<(usize, usize, f64)>> = vec![Vec::new(); nlayers];
+    // Along LR / RL a label lies along its line, a whole width long, and
+    // the labelled gap already holds it with the head (report M3); the
+    // label stage slides it along its line off the others.
+    if horizontal {
+        return out;
+    }
+    let n = g.nodes.len();
+    let short = |ei: usize| {
+        let e = &g.edges[ei];
+        e.from != e.to
+            && e.from < n
+            && e.to < n
+            && !back[ei]
+            && !matches!(e.kind, EdgeKind::Invisible)
+            && alayer[e.from].abs_diff(alayer[e.to]) == 1
+    };
+    // Parallel twins stack their own labels.
+    let twin = |ei: usize| {
+        let e = &g.edges[ei];
+        g.edges.iter().enumerate().any(|(j, f)| {
+            j != ei && ((f.from == e.from && f.to == e.to) || (f.from == e.to && f.to == e.from))
+        })
+    };
+    for (ei, e) in g.edges.iter().enumerate() {
+        let Some(lbl) = &e.label else { continue };
+        // A curve the user picked (`curve:` / `interpolate`) is not the
+        // builder's S.
+        if !short(ei) || twin(ei) || e.meta.curve.is_some() {
+            continue;
+        }
+        // Half extents across the flow and along it.
+        let (ha, hl) = ((text_width(lbl) + LABEL_PAD_W) / 2.0, LABEL_BOX_H / 2.0);
+        let floor = 2.0 * hl + 2.0 * LABEL_RUN;
+        let mut need = floor;
+        for v in [e.from, e.to] {
+            let other = if v == e.from { e.to } else { e.from };
+            let down = alayer[other] > alayer[v];
+            // Every end on v's side facing the gap, by its far end.
+            let mut side: Vec<(f64, usize)> = g
+                .edges
+                .iter()
+                .enumerate()
+                .filter(|(j, f)| {
+                    let far = if f.from == v { f.to } else { f.from };
+                    (f.from == v || f.to == v)
+                        && f.from != f.to
+                        && far < n
+                        && !back[*j]
+                        && (alayer[far] > alayer[v]) == down
+                        && alayer[far] != alayer[v]
+                })
+                .map(|(j, f)| (bpos[if f.from == v { f.to } else { f.from }], j))
+                .collect();
+            if side.len() < 2 {
+                continue;
+            }
+            // Parallel twins leave their ports a twin offset apart and
+            // stack their own labels: the even comb is not their model.
+            let far = |j: usize| {
+                let f = &g.edges[j];
+                if f.from == v {
+                    f.to
+                } else {
+                    f.from
+                }
+            };
+            if side
+                .iter()
+                .enumerate()
+                .any(|(a, x)| side[a + 1..].iter().any(|y| far(x.1) == far(y.1)))
+            {
+                continue;
+            }
+            side.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let k = side.len();
+            let pitch = ((absize[v] - 2.0 * PORT_INSET) / (k + 1) as f64)
+                .clamp(crate::ports::PORT_SPACING, crate::ports::PORT_EVEN_MAX);
+            let port = |i: usize| bpos[v] + (i as f64 - (k - 1) as f64 / 2.0) * pitch;
+            let curves: Vec<(f64, f64, usize)> = side
+                .iter()
+                .enumerate()
+                .filter(|(_, &(_, j))| short(j))
+                .map(|(i, &(far, j))| (port(i), far, j))
+                .collect();
+            let Some(&(p, b, _)) = curves.iter().find(|c| c.2 == ei) else {
+                continue;
+            };
+            let clear = |gap: f64| {
+                // The label's box at its curve's middle, grown by the
+                // stroke pad: no other curve of the fan crosses it.
+                let (y0, y1) = (gap / 2.0 - hl - STROKE_PAD, gap / 2.0 + hl + STROKE_PAD);
+                let (x0, x1) = (
+                    (p + b) / 2.0 - ha - STROKE_PAD,
+                    (p + b) / 2.0 + ha + STROKE_PAD,
+                );
+                curves.iter().filter(|c| c.2 != ei).all(|&(q, f, _)| {
+                    let (a, c) = (s_curve_at(q, f, gap, y0), s_curve_at(q, f, gap, y1));
+                    a.max(c) < x0 || a.min(c) > x1
+                })
+            };
+            let mut gap = need;
+            while gap <= floor + HUB_LABEL_GROW_MAX && !clear(gap) {
+                gap += HUB_LABEL_STEP;
+            }
+            if gap <= floor + HUB_LABEL_GROW_MAX {
+                need = need.max(gap);
+            }
+        }
+        if need > floor {
+            let (lo, hi) = if alayer[e.from] < alayer[e.to] {
+                (e.from, e.to)
+            } else {
+                (e.to, e.from)
+            };
+            out[alayer[hi]].push((lo, hi, need));
+        }
+    }
+    out
+}
+
+/// Where across the flow the S the builder draws from `p` (at depth 0)
+/// to `f` (at depth `gap`), its controls mid-gap, runs at depth `y`.
+fn s_curve_at(p: f64, f: f64, gap: f64, y: f64) -> f64 {
+    let depth = |t: f64| gap * (1.5 * t * (1.0 - t) + t * t * t);
+    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+    let y = y.clamp(0.0, gap);
+    for _ in 0..30 {
+        let mid = (lo + hi) / 2.0;
+        if depth(mid) < y {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let t = (lo + hi) / 2.0;
+    p + (f - p) * (3.0 * t * t - 2.0 * t * t * t)
+}
+
 /// Least gap (px, at least `need`) between two TD/BT layers that lets
 /// the label stage stack the labels of the compact branch points' fans
 /// `lines` between them, as it does (`labels::stack_fans`): per point, in
@@ -2941,6 +3111,11 @@ fn place(
         .zip(&fan_lines)
         .map(|(need, lines)| fan_rows_gap(lines, need))
         .collect();
+    let hub_need = if g.edge_paint_width.is_none() {
+        hub_label_room(g, back, &alayer, &bpos, &absize, nlayers, horizontal)
+    } else {
+        vec![Vec::new(); nlayers]
+    };
     let gap_l = g.rank_gap.unwrap_or(GAP_L);
     // Per lower layer: the least distance between its line and the one
     // before it for every edge crossing a frame border in that gap to
@@ -3104,6 +3279,17 @@ fn place(
                 }
                 if fan && at - ends < fan_gap(ext / 2.0) {
                     cursor = cursor.max(ends + fan_gap(ext / 2.0) - before);
+                }
+            }
+            // A hub fan's label clears its siblings' curves at its own
+            // curve's middle (`hub_label_room`), from box border to box
+            // border.
+            if !judged {
+                for &(s, t, need) in &hub_need[li] {
+                    let ends = lcoord[li - 1] + (alsize[s] + alsize[t]) / 2.0;
+                    if cursor + before - ends < need {
+                        cursor = ends + need - before;
+                    }
                 }
             }
             if li > 0 && gap_need[li] > 0.0 {

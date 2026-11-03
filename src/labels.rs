@@ -1761,7 +1761,8 @@ fn place(
     let hub: Vec<(f64, usize)> = edges
         .iter()
         .zip(&fan)
-        .map(|(e, &fan)| {
+        .enumerate()
+        .map(|(ei, (e, &fan))| {
             let df = degree.get(e.from.as_str()).copied().unwrap_or(0);
             let dt = degree.get(e.to.as_str()).copied().unwrap_or(0);
             // A hub end piles every label of its fan near it: prefer
@@ -1775,10 +1776,42 @@ fn place(
             // §2.6), and the half away from the decision is where the
             // curve turns into its target (long-labels' `incomplete` sat
             // on that bend, against the head).
+            // So is a hub's edge across one gap with no node between its
+            // ends whose label, centred on its line's middle, no other
+            // stroke runs through (B7 review r1 #6: a hub's labels sat in
+            // the half near the head, on the bend — `express` 5.7 px off
+            // its head's base): the layout grows such a gap until each of
+            // its labels clears the fan's other curves there
+            // (`layout::hub_label_room`). Where it could not (a fan
+            // drawn as a cable of near-parallel curves), the label keeps
+            // to the far half, where the fan has spread.
             let twin = pairs.get(&pair(e)).is_some_and(|&k| k > 1);
             let across = e.paint_width.is_none() && e.waypoints.is_empty() && !twin;
+            let mid_clear = || {
+                let (Some(pts), Some((_, _, w))) = (&lines[ei], &e.label) else {
+                    return false;
+                };
+                let r = label_rect(line_middle(pts), *w);
+                // Nor does another label's box as built, kept as far as a
+                // sibling keeps (moving there would only push it aside).
+                let g = FAN_SIBLING_GAP;
+                let near = (r.0 - g, r.1 - g, r.2 + g, r.3 + g);
+                one_gap_down(e, nodes)
+                    && e.meta.curve.is_none()
+                    && field.strokes().count(r, ei, 1) == 0
+                    && edges.iter().enumerate().all(|(j, f)| {
+                        j == ei
+                            || lines[j].is_none()
+                            || f.label
+                                .as_ref()
+                                .map_or(true, |(_, c, w)| !boxes_touch(&label_rect(*c, *w), &near))
+                    })
+            };
             let hub_end = |d: usize, other: usize| {
-                e.from != e.to && d > 1 && d > other && !(across && d <= LABEL_HUB_MIN)
+                e.from != e.to
+                    && d > 1
+                    && d > other
+                    && !(across && (d <= LABEL_HUB_MIN || mid_clear()))
             };
             if fan == Some(true) || fan.is_none() && hub_end(df, dt) {
                 (LABEL_HUB_PREFER, df)
@@ -1995,6 +2028,52 @@ fn place(
 /// Part of a fan line walked from its far end: (spot, depth back along
 /// the flow).
 type Walk = Vec<(Pt, f64)>;
+
+/// The point halfway along polyline `pts` (by length).
+fn line_middle(pts: &[(f64, f64)]) -> (f64, f64) {
+    let len: f64 = pts
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+        .sum();
+    let mut left = len / 2.0;
+    for w in pts.windows(2) {
+        let d = (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
+        if d >= left && d > 0.0 {
+            let f = left / d;
+            return (
+                w[0].0 + (w[1].0 - w[0].0) * f,
+                w[0].1 + (w[1].1 - w[0].1) * f,
+            );
+        }
+        left -= d;
+    }
+    pts.last().copied().unwrap_or((0.0, 0.0))
+}
+
+/// Whether edge `e`, drawn as one free curve down (or up) the page,
+/// spans a single gap: no node's centre lies along the flow strictly
+/// between its two boxes. The flow runs the way its curve leaves its
+/// start (its first control's offset), as the builder draws a curve
+/// across a gap; along LR / RL a label lies along its line, and the
+/// layout sizes no hub room for it (`layout::hub_label_room`).
+fn one_gap_down(e: &SceneEdge, nodes: &[SceneNode]) -> bool {
+    let at = |id: &str| nodes.iter().find(|n| n.id == id);
+    let (Some(a), Some(b)) = (at(&e.from), at(&e.to)) else {
+        return false;
+    };
+    let [p0, p1, ..] = e.bezier;
+    if (p1.1 - p0.1).abs() <= (p1.0 - p0.0).abs() {
+        return false;
+    }
+    let (a0, a1, b0, b1) = (
+        a.y - a.h / 2.0,
+        a.y + a.h / 2.0,
+        b.y - b.h / 2.0,
+        b.y + b.h / 2.0,
+    );
+    let (lo, hi) = if a0 <= b0 { (a1, b0) } else { (b1, a0) };
+    lo < hi && nodes.iter().all(|n| n.y <= lo || n.y >= hi)
+}
 
 /// Stacks the labels of the compact branch points' fans flagged in
 /// `lift` (a fan is flagged whole) in rows across the far half of their
