@@ -146,7 +146,12 @@ Minor, not patch: several class structs gain public fields (see
   a member of a frame the lane leaves runs a stub past that frame's
   border instead of along it. When another edge fans out of (or into) an
   end toward the lane — a hub — the lane meets that end on its side
-  facing the lane, the lanes meeting one side one after the other. The
+  facing the lane, the lanes meeting one side one after the other, when
+  the lane passes outside the end itself by 24 px (a lane within the
+  end's breadth ran on along it through the box and turned to its flank
+  from inside, the arrowhead hidden under the node and pointing out:
+  `rollback` into `Check queue` in an RL chart, `Check -> c` in an LR
+  state choice). The
   router takes the lanes first, so the forward edges route round them,
   and in `scene()` an edge it searches for riding a frame border or
   cramped searches on past a first candidate that does not beat it

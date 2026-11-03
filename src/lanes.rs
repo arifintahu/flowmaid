@@ -244,13 +244,21 @@ pub(crate) fn corners(
 }
 
 /// Whether a lane at breadth `x` meets `end` on its side facing the lane
-/// instead of across its flow side: when the lane passes outside that
-/// side's usable span, another edge on that flow side heads out toward
-/// the lane (`fans`: the breadths the end's other edges there head to)
-/// — the leg along the side would run beside its curve, as beside a
-/// hub's fan — and nothing beside the end along the flow (`beside`:
-/// breadth spans of the nodes level with it) lies between it and the
-/// lane. A fork/join bar is always met across.
+/// instead of across its flow side: when the lane passes outside the
+/// end itself by [`LANE_CLEAR`], another edge on that flow side heads
+/// out toward the lane (`fans`: the breadths the end's other edges there
+/// head to) — the leg along the side would run beside its curve, as
+/// beside a hub's fan — and nothing beside the end along the flow
+/// (`beside`: breadth spans of the nodes level with it) lies between it
+/// and the lane. A fork/join bar is always met across.
+///
+/// Outside the side's usable span ([`port_span`]) is not enough: a lane
+/// within the end's own breadth runs on along the end to its centre
+/// level through the box and meets the flank from inside, its head
+/// painted under the end pointing out (r274: `rollback` into `Check
+/// queue`, the lane 11 px inside its 38 px breadth). Past the flank by
+/// [`LANE_CLEAR`], the turn in has room for a rounded corner and the
+/// arrowhead square to the side.
 pub(crate) fn meets_side(
     end: (&Placed, Shape),
     x: f64,
@@ -269,6 +277,9 @@ pub(crate) fn meets_side(
     } else {
         return false;
     };
+    if (x - p.b).abs() < p.bsize / 2.0 + LANE_CLEAR {
+        return false;
+    }
     let out = x - edge;
     let (lo, hi) = (p.b.min(x) - DIRECT_CLEAR, p.b.max(x) + DIRECT_CLEAR);
     fans.iter().any(|&f| (f - edge) * out > 0.0)
@@ -971,6 +982,23 @@ mod tests {
             &[(200.0, 240.0)]
         ));
         assert!(!meets_side((&b, Shape::Rect), 300.0, &[60.0], &[]));
+        // Not within the end's own breadth (0..120), though outside its
+        // ports' span (12..108): the lane would run on along the end
+        // through it and meet the flank from inside (r274). Nor just past
+        // the flank: the turn in needs LANE_CLEAR for its corner and head.
+        assert!(!meets_side((&b, Shape::Rect), 115.0, &fans, &[]));
+        assert!(!meets_side(
+            (&b, Shape::Rect),
+            120.0 + LANE_CLEAR - 1.0,
+            &fans,
+            &[]
+        ));
+        assert!(meets_side(
+            (&b, Shape::Rect),
+            120.0 + LANE_CLEAR,
+            &[250.0],
+            &[]
+        ));
     }
 
     #[test]

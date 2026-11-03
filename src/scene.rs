@@ -13176,6 +13176,115 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_meets_its_ends_from_outside() {
+        // r274 (RL): `rollback`'s lane ran 11 px inside `Check queue`'s
+        // 38 px breadth, outside its ports' span: met on the flank, the
+        // lane ran on along the box to its centre level and turned to the
+        // flank from inside, its head painted under the box pointing out
+        // (end tilt 180 deg). r232 (LR) and r164 (BT) in `scene()`, r046
+        // (RL) in `route()` and state `choice_lr` (`Check -> c` left
+        // Check's bottom and ran 40 px inside it) the same. A lane meets
+        // a flank only past it by LANE_CLEAR (`lanes::meets_side`): every
+        // drawn point of a lane but its two ends lies outside both end
+        // boxes, and its head points into its target.
+        let flow = |n: &str| format!("flowchart {n}");
+        let srcs = [
+            format!(
+                "{}\nN0(Done archive)\nN1[Check]\nN2[Done emit]\nN3([Validate])\n\
+                 N4[Check queue]\nN5(Report)\nN0 --> N1\nN1 -->|next| N2\nN0 --> N3\n\
+                 N1 --> N4\nN3 --> N5\nN0 --> N3\nN4 -.-> N3\nN5 -->|rollback| N4",
+                flow("RL")
+            ),
+            format!(
+                "{}\nN0[Queue]\nN1(Report notify)\nN2[Report]\nN3[Queue fetch]\nN4{{Emit}}\n\
+                 N5([Done])\nN6(Archive notify)\nN7{{Store done}}\nN0 --> N1\nN1 --> N2\n\
+                 N1 --> N3\nN2 --> N4\nN3 --> N5\nN5 --> N6\nN6 --> N7\nN3 --> N7\n\
+                 N4 -.-> N1\nN4 --> N0\nN6 --> N3",
+                flow("LR")
+            ),
+            format!(
+                "{}\nN0(Validate parse)\nN1([Notify])\nN2{{{{Notify}}}}\nN3([Check fetch])\n\
+                 N4[Check]\nN5{{Load}}\nN6[Report]\nN0 --> N1\nN0 -->|fail| N2\nN2 --> N3\n\
+                 N3 -->|next| N4\nN3 --> N5\nN5 --> N6\nN2 --> N4\nN1 --> N6\nN3 --> N5\n\
+                 N6 ==>|retry| N3\nN3 --> N2\nN6 -->|retry| N4",
+                flow("BT")
+            ),
+            format!(
+                "{}\nN0(Store)\nN1(Notify check)\nN2([Parse])\nN3((Retry emit))\n\
+                 N4([Check report])\nN5([Emit load])\nN6(Notify store)\nN7{{Queue parse}}\n\
+                 N0 --> N1\nN1 --> N2\nN2 --> N3\nN2 --> N4\nN4 -->|ok| N5\nN5 --> N6\n\
+                 N6 --> N7\nN3 --> N5\nN2 --> N7\nN4 --> N5\nN6 -->|rollback| N0\n\
+                 N5 ==> N2\nN5 ==>|rollback| N4",
+                flow("RL")
+            ),
+            "stateDiagram-v2\ndirection LR\nstate c <<choice>>\n[*] --> Check\nCheck --> c\n\
+             c --> Ok : yes\nc --> Fail : no\nFail --> Check : retry\nOk --> [*]"
+                .to_string(),
+        ];
+        for src in &srcs {
+            let g = match crate::parser::parse_document(src).unwrap() {
+                crate::model::Document::Flowchart(g) | crate::model::Document::State(g) => g,
+                _ => panic!("flowchart or state"),
+            };
+            let s = scene(&g);
+            let c: Vec<(f64, f64)> = s.nodes.iter().map(|n| (n.x, n.y)).collect();
+            let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
+            let sign = if matches!(g.direction, Direction::BT | Direction::RL) {
+                -1.0
+            } else {
+                1.0
+            };
+            let mut lanes = 0;
+            for (mode, sc) in [("static", s.clone()), ("routed", route(&g, &c))] {
+                for (i, e) in g.edges.iter().enumerate() {
+                    let se = &sc.edges[i];
+                    let (a, b) = (&sc.nodes[e.from], &sc.nodes[e.to]);
+                    let at = |n: &SceneNode| sign * if horizontal { n.x } else { n.y };
+                    if e.from == e.to || se.waypoints.len() < 3 || at(b) >= at(a) {
+                        continue;
+                    }
+                    lanes += 1;
+                    let p = edge_polyline(se);
+                    let (p0, p3) = (p[0], p[p.len() - 1]);
+                    // Strictly inside the outline (a px in from it).
+                    let inside = |n: &SceneNode, q: (f64, f64)| {
+                        let (dx, dy) = ((q.0 - n.x).abs(), (q.1 - n.y).abs());
+                        let (hw, hh) = (n.w / 2.0 - 1.0, n.h / 2.0 - 1.0);
+                        match n.shape {
+                            Shape::Diamond => dx / hw + dy / hh < 1.0,
+                            Shape::Circle | Shape::DoubleCircle => dx.hypot(dy) < hw.min(hh),
+                            Shape::Stadium => {
+                                let r = hh.min(hw);
+                                dy < hh && (dx < hw - r || (dx - (hw - r)).hypot(dy) < r)
+                            }
+                            _ => dx < hw && dy < hh,
+                        }
+                    };
+                    let near = |q: (f64, f64), r: (f64, f64)| (q.0 - r.0).hypot(q.1 - r.1) < 1.5;
+                    for &q in p.iter().filter(|&&q| !near(q, p0) && !near(q, p3)) {
+                        assert!(
+                            !inside(a, q) && !inside(b, q),
+                            "{mode} {} -> {}: {q:?} inside an end in\n{src}",
+                            a.id,
+                            b.id
+                        );
+                    }
+                    // The head points into the target.
+                    let q = p[p.len() - 2];
+                    let (dx, dy) = (p3.0 - q.0, p3.1 - q.1);
+                    assert!(
+                        dx * (b.x - p3.0) + dy * (b.y - p3.1) > 0.0,
+                        "{mode} {} -> {}: head points out in\n{src}",
+                        a.id,
+                        b.id
+                    );
+                }
+            }
+            assert!(lanes > 0, "no lane in\n{src}");
+        }
+    }
+
+    #[test]
     fn a_short_bowed_twin_leaves_and_enters_near_square() {
         // State lr_right: the labelled return edge of a 2-cycle across a
         // 74 px LR gap bowed its full TWIN_LABEL_BOW at its source (35 deg
