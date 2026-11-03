@@ -153,6 +153,10 @@ const BAND_COST: f64 = 12.0;
 /// choose costs a back-edge (px): two bends' worth, so the chosen side
 /// wins unless the other is clearly shorter.
 const SIDE_SWITCH_COST: f64 = 2.0 * BEND_COST;
+/// What ending on a plain stub costs at a glyph end whose head grew
+/// longer than it ([`stub_len`]): two bends' worth, so the long stub
+/// wins unless it needs a clearly longer way round.
+const SHORT_STUB_COST: f64 = 2.0 * BEND_COST;
 /// A\* pops allowed per search in [`crate::scene::route`]; when
 /// exhausted the try finds nothing.
 const ROUTE_WORK_BUDGET: usize = 6_000;
@@ -2743,19 +2747,19 @@ fn free_slot(
 /// on each of the node's other sides at [`SIDE_SWITCH_COST`]: the side's
 /// midpoint, or on a straight side the free slot nearest it, at least
 /// [`PORT_SPACING`] from every end in `taken` there but edge `me`'s (so
-/// two reroutes never land on one port, G9).
+/// two reroutes never land on one port, G9). Each stub reaches `len` px
+/// out of its side ([`stub_len`]).
 fn terms(
     w: &World,
     end: EndRef,
     port: Pt,
     alt: bool,
-    clear: f64,
+    len: f64,
     taken: &[(EndRef, Pt, usize)],
     me: usize,
 ) -> Vec<Term> {
     let rect = w.end_rect(end);
     let side = side_of(rect, port);
-    let len = clear + STUB_EXTRA;
     let mut v = vec![Term {
         port,
         stub: stub_of(rect, side, port, len),
@@ -2777,6 +2781,26 @@ fn terms(
         }
     }
     v
+}
+
+/// How far (px) the stub of one end of edge `e` reaches out of its side
+/// on a lattice of clearance `clear`: just past the clearance
+/// ([`STUB_EXTRA`]) — or, at a glyph end under a head grown past
+/// [`ARROW_MARKER_PX`] (a wide `linkStyle` stroke,
+/// [`crate::scene::edge_head_len`]), the head's length plus a corner's
+/// radius ([`CORNER_R`]), so the rounded corner before the stub leaves
+/// the whole head on a straight run into the side. A 16 px stroke's
+/// 28 px head on a 14 px stub sat over the corner, and the painter's
+/// head, turning with the curve's last stretch, hooked past the side
+/// and doubled back into it (q72 `n1 ==> n7` in `route()`).
+fn stub_len(e: &crate::scene::SceneEdge, glyph: bool, clear: f64) -> f64 {
+    let plain = clear + STUB_EXTRA;
+    let head = crate::scene::edge_head_len(e);
+    if glyph && head > ARROW_MARKER_PX {
+        plain.max(head + CORNER_R)
+    } else {
+        plain
+    }
 }
 
 /// How one routing attempt may run.
@@ -2830,14 +2854,31 @@ fn route_edge(
     let (p0, p3) = drawn_ends(e);
     let o = w.outer;
     let usable = |t: &Term| inside(o, t.stub) && w.stub_free(info, t.stub);
-    let starts: Vec<Term> = terms(w, info.ends.0, p0, t.alt, clear, env.taken, me)
-        .into_iter()
-        .filter(usable)
-        .collect();
-    let goals: Vec<Term> = terms(w, info.ends.1, p3, t.alt, clear, env.taken, me)
-        .into_iter()
-        .filter(usable)
-        .collect();
+    // An end's terminals with its own stub length ([`stub_len`]); where
+    // that is longer than the plain one, the plain stubs come too, at
+    // [`SHORT_STUB_COST`]: the long stub wins where it costs about the
+    // same, never by a long way round.
+    let end_terms = |end: EndRef, port: Pt, glyph: bool| {
+        let (plain, len) = (clear + STUB_EXTRA, stub_len(e, glyph, clear));
+        let mut found: Vec<Term> = terms(w, end, port, t.alt, len, env.taken, me)
+            .into_iter()
+            .filter(usable)
+            .collect();
+        if len > plain {
+            found.extend(
+                terms(w, end, port, t.alt, plain, env.taken, me)
+                    .into_iter()
+                    .filter(usable)
+                    .map(|t| Term {
+                        cost: t.cost + SHORT_STUB_COST,
+                        ..t
+                    }),
+            );
+        }
+        found
+    };
+    let starts: Vec<Term> = end_terms(info.ends.0, p0, e.ends.start_marker(e.kind).is_some());
+    let goals: Vec<Term> = end_terms(info.ends.1, p3, e.ends.end_marker(e.kind).is_some());
     let stubs: Vec<Pt> = starts.iter().chain(&goals).map(|t| t.stub).collect();
     if stubs.is_empty() {
         return None;

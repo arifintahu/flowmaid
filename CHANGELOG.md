@@ -315,7 +315,11 @@ Minor, not patch: several class structs gain public fields (see
   last channel leg slanted into its node gets a straight stub along the
   side's normal in `SceneEdge::waypoints` (so hosts draw it too), unless
   the stub would bring it nearer a node or along another edge than the
-  routing left it. The squared ends and the cut are the SVG painter's:
+  routing left it, and a route the router draws into a head grown past
+  11 px takes a stub long enough to hold it where that costs about the
+  same way round (a 16 px `linkStyle` edge turned into its node 14 px
+  out under a 28 px head, which hooked past the side into it, in
+  `route()`). The squared ends and the cut are the SVG painter's:
   `SceneEdge::bezier` is unchanged and still ends on the border (hosts draw
   their own heads along its end tangent), the painted curve stays within a
   pixel of it outside the head beyond two head lengths of the tip, and

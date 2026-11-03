@@ -13408,6 +13408,46 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_strokes_routed_head_lies_on_a_straight_stub() {
+        // B3 review r5 #5 (q72): in route() the 16 px `linkStyle` edge
+        // n1 ==> n7 turned into n7's side 14.5 px out — the router's
+        // plain stub — under a 28 px head, so the painter's head turned
+        // with the corner and hooked past the side into it (wiggles
+        // 0 -> 1). A glyph end under a grown head now takes a stub the
+        // head's length plus a corner's radius long where that costs
+        // about the same way round.
+        let src = "flowchart RL\n  n10 ==>|thick lbl| n6\n  n1 ==> n7\n  n6 <-.-> n10\n  \
+                   n7 -->|lbl| n9\n  n2 o--o n5\n  n3 <--> n7\n  n10 o--o n7\n  \
+                   n10 -.->|dot| n3\n  n1 ==> n10\n  n6 --- n3\n  n10 <-.-> n8\n  \
+                   n2 -->|lbl| n3\n  n3 <-.-> n10\n  n4 ==> n3\n  n7 ==>|thick lbl| n7\n  \
+                   n5 <--> n10\n  n0 ==> n8\n  n1 <-.-> n6\n  n7 -.-> n2\n  n10 --o n0\n  \
+                   linkStyle 8 stroke:#c33,stroke-width:7px\n  linkStyle 14 stroke-width:9px\n  \
+                   linkStyle 1 stroke:#c33,stroke-width:16px\n";
+        let g = parse(src).unwrap();
+        let [_, r] = static_and_routed(src);
+        let e = the_edge(&r, "n1", "n7");
+        // The route's last corner lies a head's length out at least.
+        let w = &e.waypoints;
+        let n = w.len();
+        let end = w[n - 1];
+        let on_last = |p: (f64, f64)| (p.0 - end.0).abs() < 0.5 || (p.1 - end.1).abs() < 0.5;
+        let straight = (0..n - 1)
+            .rev()
+            .take_while(|&k| on_last(w[k]) && on_last(w[k + 1]))
+            .map(|k| (w[k].0 - end.0).hypot(w[k].1 - end.1))
+            .fold(0.0, f64::max);
+        let head = edge_head_len(e);
+        assert!(head > ARROW_MARKER_PX, "{head}");
+        assert!(
+            straight >= head,
+            "stub {straight:.1} px under a {head:.1} px head"
+        );
+        // And nothing hooks back along the flow.
+        let m = crate::quality::measure(&g, &r);
+        assert_eq!((m.wiggles, m.backtrack), (0, 0.0));
+    }
+
+    #[test]
     fn a_rerouted_edge_between_members_stays_in_their_frame_in_route() {
         // B3 review r5 #3 (q21): in route() a member's edge to its own
         // box (drawn to the box's entry member, `n5 <--> F0` to Node 6)
