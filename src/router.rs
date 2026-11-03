@@ -419,7 +419,12 @@ fn clip(a: Pt, b: Pt, r: R) -> Option<(Pt, Pt)> {
     ))
 }
 
-/// Distance from `p` to a node's drawn outline (0 inside).
+/// Distance from `p` to a node's drawn outline (0 inside). Diamonds and
+/// circles exactly; any other shape as its box, which for a hexagon, a
+/// parallelogram or a cylinder (whose outline lies inside it) errs on
+/// the side of clearance: a path never threads a slant's empty corner,
+/// and the ends themselves go onto the true outline afterwards
+/// (`edgepass::snap_ends`, report M6).
 fn outline_gap(r: R, shape: Shape, p: Pt) -> f64 {
     let (hw, hh) = ((r.2 - r.0) / 2.0, (r.3 - r.1) / 2.0);
     let (cx, cy) = ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0);
