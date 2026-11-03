@@ -1869,6 +1869,9 @@ fn place(
     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
     // Per original edge: dummy chain in the edge's own from→to order.
     let mut edge_chain: Vec<Vec<usize>> = vec![Vec::new(); g.edges.len()];
+    // Adjacent pairs linked so far only by a 2-cycle's return edge,
+    // which stands in for the first forward edge of the pair.
+    let mut return_only: std::collections::HashSet<(usize, usize)> = Default::default();
     for (ei, e) in g.edges.iter().enumerate() {
         if e.from == e.to {
             continue; // self-loop — no layered path
@@ -1883,10 +1886,27 @@ fn place(
         let (llo, lhi) = (alayer[lo], alayer[hi]);
         if lhi <= llo + 1 {
             // A 2-cycle's return edge runs beside its twin across the
-            // gap: one link between the pair, not a second pull.
-            if llo < lhi && !(back[ei] && succs[lo].contains(&hi)) {
-                succs[lo].push(hi);
-                preds[hi].push(lo);
+            // gap: one link between the pair, not a second pull —
+            // whichever of the two is written first. A doubled link
+            // made BK's median land on the pair and pulled the node off
+            // the middle of its fan: lr's Service Layer sat level with
+            // Redis Cache instead of centred on Database / Redis when
+            // `CACHE --> SVC` came first (report Q8). Parallel FORWARD
+            // edges keep one link each: a twin pair then runs straight
+            // down its own column, which the twin curves and their
+            // labels are drawn for (deduplicated, a choice's
+            // `low`/`medium` twins slanted across the fan).
+            if llo < lhi {
+                if back[ei] {
+                    if !succs[lo].contains(&hi) {
+                        succs[lo].push(hi);
+                        preds[hi].push(lo);
+                        return_only.insert((lo, hi));
+                    }
+                } else if !return_only.remove(&(lo, hi)) {
+                    succs[lo].push(hi);
+                    preds[hi].push(lo);
+                }
             }
             continue; // same or adjacent layer — no dummies
         }
@@ -3382,7 +3402,9 @@ fn coordinates_bk(
     }
 
     // Adjacent-layer neighbour sets (back/invisible links that skip a
-    // layer are excluded — BK only reasons about layer±1 segments).
+    // layer are excluded — BK only reasons about layer±1 segments). A
+    // 2-cycle lists its pair once (see the layering above); parallel
+    // forward edges are listed once per edge on purpose (report Q8).
     let mut up: Vec<Vec<usize>> = vec![Vec::new(); na];
     let mut down: Vec<Vec<usize>> = vec![Vec::new(); na];
     for v in 0..na {

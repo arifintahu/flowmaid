@@ -13516,6 +13516,39 @@ mod tests {
     }
 
     #[test]
+    fn a_two_cycle_pulls_its_pair_once_whichever_edge_comes_first() {
+        // Report Q8: a 2-cycle listed its pair twice in Brandes-Köpf's
+        // neighbours when the return edge was written first, so the
+        // median landed on the pair and Service Layer sat level with
+        // Redis Cache instead of on the middle of its fan. Either order
+        // now gives lr's symmetric fans.
+        let lr = include_str!("../examples/lr.mmd");
+        let swapped = "flowchart LR\n  U[User] --> FE(Frontend) --> API{Auth?}\n  \
+                       API -->|ok| SVC[Service Layer]\n  API -.->|denied| ERR[401 Response]\n  \
+                       CACHE([Redis Cache]) --> SVC\n  SVC ==> DB[Database]\n  SVC --> CACHE\n";
+        for src in [lr, swapped] {
+            let sc = scene(&parse(src).unwrap());
+            let y = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap().y;
+            assert!(
+                (y("API") - (y("SVC") + y("ERR")) / 2.0).abs() < 0.5,
+                "Auth? off the middle of its ok/denied fan: {src}"
+            );
+            assert!(
+                (y("SVC") - (y("DB") + y("CACHE")) / 2.0).abs() < 0.5,
+                "Service Layer off the middle of its fan: {src}"
+            );
+            assert!((y("U") - y("API")).abs() < 0.5, "the spine stays straight");
+        }
+        // Parallel forward edges keep their weight: a twin pair runs
+        // straight down its own column (the twin curves are drawn for
+        // that), the third branch beside it.
+        let sc =
+            scene(&parse("flowchart TD\n  A --> B\n  B --> C\n  B --> C\n  B --> D\n").unwrap());
+        let x = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap().x;
+        assert!((x("B") - x("C")).abs() < 0.5);
+    }
+
+    #[test]
     fn a_parallel_label_and_a_loop_keep_off_the_other_lines() {
         // stress (report P0 #13): the `parallel` label clears the
         // unlabelled twin, and the thick A ==> D keeps clear of B's loop.

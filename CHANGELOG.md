@@ -697,6 +697,14 @@ Minor, not patch: several class structs gain public fields (see
   sizes tags, which are a size smaller. `pie::slice_color` matches
   `style::accent(i)` for slices 0–7 and again for 16–23, not only for the
   first eight as its doc (and the 0.33.0 notes) said.
+- **A 2-cycle no longer pulls its node off the middle of its fan** (report
+  Q8). With the return edge written first (`CACHE --> SVC` before
+  `SVC --> CACHE`), the pair was linked twice in Brandes-Köpf's neighbour
+  lists, so the median landed on it and `lr`'s Service Layer sat level with
+  Redis Cache instead of centred on Database / Redis. A 2-cycle now counts
+  once whichever edge comes first, so either order draws the same
+  symmetric fans. Parallel forward edges still count once each: a twin
+  pair runs straight down its own column, as its curves are drawn for.
 
 ## [0.33.0] - 2026-10-31
 
