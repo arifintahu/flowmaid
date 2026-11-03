@@ -47,7 +47,7 @@ const PARALLEL_GAP: f64 = 16.0;
 const TWIN_LABEL_BOW: f64 = LABEL_BOX_H + 2.0 * crate::labels::STROKE_PAD;
 /// Most (degrees) a twin's bow ([`bowed`]) tilts an end off square: the
 /// bow shrinks to what keeps both ends within it.
-const TWIN_BOW_TILT: f64 = 10.0;
+const TWIN_BOW_TILT: f64 = 9.5;
 /// How far (px) a self-loop's controls reach past its node's side.
 const LOOP_EXT: f64 = 48.0;
 /// Room (px) a parallel edge's label keeps from the neighbouring line of
@@ -5103,7 +5103,7 @@ const BOX_RX: f64 = 3.0;
 const ROUNDED_RX: f64 = 9.0;
 /// Most inset (px) of a hexagon's side points and of a parallelogram's
 /// slant; a quarter of the width on a narrower node.
-const SLANT_MAX: f64 = 14.0;
+pub(crate) const SLANT_MAX: f64 = 14.0;
 /// Most half height (px) of a cylinder's cap ellipse; a quarter of the
 /// node's height on a shorter one.
 const CYLINDER_RY_MAX: f64 = 8.0;
@@ -6725,6 +6725,30 @@ pub(crate) fn anchor(
     }
 }
 
+/// `pt`, an end on the border of `p` (flow coordinates) of a back-edge
+/// drawn across the gap, kept on the part of a diamond's or a circle's
+/// border that faces along the flow — its side facing upstream (`up`)
+/// or downstream — within the span the ports stage spreads that side's
+/// ends over ([`crate::lanes::port_span`]). `anchor` aims such an end
+/// at its other end shifted by its parallel offset, which can carry it
+/// round onto the diamond's flank: there the ports stage took it for an
+/// end on that flank and never spaced it from its twin's on the flow
+/// side, 4 px away (r048: `Parse emit --> Emit`'s head on the start of
+/// `Emit --> Parse emit` at Emit's top). Any other shape: as it is.
+fn on_flow_side(p: &Placed, shape: Shape, pt: (f64, f64), up: bool) -> (f64, f64) {
+    if !matches!(
+        shape,
+        Shape::Diamond | Shape::Circle | Shape::DoubleCircle | Shape::StateStart | Shape::StateEnd
+    ) {
+        return pt;
+    }
+    let (lo, hi) = crate::lanes::port_span(shape, p);
+    if pt.0 >= lo && pt.0 <= hi {
+        return pt;
+    }
+    crate::lanes::port_at(shape, p, pt.0.max(lo).min(hi), up)
+}
+
 /// Edge geometry for the layered layout (used by `scene`). A back-edge
 /// that comes here has no lane ([`crate::lanes`]: nothing lies between
 /// its ends): it crosses the gap as a forward edge does, leaving its
@@ -6771,6 +6795,10 @@ fn edge_points(
             return [p0, (p0.0, p0.1 + dl), (p3.0, p3.1 - dl), p3];
         }
         // Back across the gap: the forward curve run the other way.
+        let (p0, p3) = (
+            on_flow_side(a, sa, p0, true),
+            on_flow_side(b, sb, p3, false),
+        );
         let dl = ((p0.1 - p3.1) * 0.5).max(20.0);
         return [p0, (p0.0, p0.1 - dl), (p3.0, p3.1 + dl), p3];
     }
@@ -7114,11 +7142,15 @@ fn route_backs(g: &Graph, flow: &[Placed]) -> Vec<Back> {
 
 /// The skeleton [`route_backs`] judges a forward edge from node `from`
 /// to `to` by, in flow coordinates `flow`: its centre-to-centre chord,
-/// stepped round each node it runs through
-/// ([`crate::clearance::NODE_SEP`] past the side of that box the chord
-/// passes nearer), on along the flow from the last such step to the
-/// target's level, as the router's orthogonal detour runs on past the
-/// box it went round into its target. The static layout judges a
+/// stepped round each node it runs through — held at its breadth when
+/// the line already lies beside the box there and a run along the flow
+/// at that breadth passes clear of the boxes before it, else
+/// [`crate::clearance::NODE_SEP`] past the side its target lies on (the
+/// side the chord passes nearer when the target lies within the box's
+/// breadth too) — and on along the flow from the last such step to the
+/// target's level: the shape of the router's orthogonal path round the
+/// box (r158: `Done -> Done` holds its source's breadth past the
+/// cylinder and turns into its target). The static layout judges a
 /// forward edge by its channel points, which the layering threads past
 /// the boxes between its ends, and `route()` reroutes a free curve that
 /// runs through a box round it: judged by its bare chord through such a
@@ -7142,9 +7174,17 @@ fn forward_skeleton(flow: &[Placed], from: usize, to: usize) -> Vec<(f64, f64)> 
         return vec![p, q];
     }
     between.sort_by(|x, y| (x.l - p.1).abs().total_cmp(&(y.l - p.1).abs()));
+    // Whether a run along the flow at breadth `b` from `l0` to `l1`
+    // passes clear of every box between.
+    let clear = |b: f64, l0: f64, l1: f64| {
+        let (l0, l1) = (l0.min(l1), l0.max(l1));
+        !between
+            .iter()
+            .any(|n| n.l > l0 && n.l <= l1 && (b - n.b).abs() < n.bsize / 2.0)
+    };
     let mut pts = vec![p];
     let mut cur = p;
-    for n in between {
+    for &n in &between {
         // Where the line on crosses the box's centre line along the flow.
         let t = (n.l - cur.1) / (q.1 - cur.1);
         let at = cur.0 + t * (q.0 - cur.0);
@@ -7152,10 +7192,21 @@ fn forward_skeleton(flow: &[Placed], from: usize, to: usize) -> Vec<(f64, f64)> 
         if at <= lo || at >= hi {
             continue;
         }
-        let side = if at - lo < hi - at {
-            lo - crate::clearance::NODE_SEP
+        // Past the box on the side the path is already on (it holds its
+        // breadth along the flow past it, as the router's path does), else
+        // on the side its target lies, else the nearer one.
+        let (below, above) = (
+            lo - crate::clearance::NODE_SEP,
+            hi + crate::clearance::NODE_SEP,
+        );
+        let side = if (cur.0 <= lo || cur.0 >= hi) && clear(cur.0, cur.1, n.l) {
+            cur.0
+        } else if q.0 <= lo {
+            below
+        } else if q.0 >= hi || at - lo >= hi - at {
+            above
         } else {
-            hi + crate::clearance::NODE_SEP
+            below
         };
         cur = (side, n.l);
         pts.push(cur);
@@ -7179,8 +7230,18 @@ fn direct_back(
     lone: (bool, bool),
 ) -> [(f64, f64); 4] {
     let (ea, eb) = ((a, sa, lone.0), (b, sb, lone.1));
-    let p0 = anchor(a, sa, (toward(ea, eb), b.l), off, false);
-    let p3 = anchor(b, sb, (toward(eb, ea), a.l), off, true);
+    let p0 = on_flow_side(
+        a,
+        sa,
+        anchor(a, sa, (toward(ea, eb), b.l), off, false),
+        true,
+    );
+    let p3 = on_flow_side(
+        b,
+        sb,
+        anchor(b, sb, (toward(eb, ea), a.l), off, true),
+        false,
+    );
     let dl = tangent(p0.1 - p3.1);
     [p0, (p0.0, p0.1 - dl), (p3.0, p3.1 + dl), p3]
 }
@@ -13356,9 +13417,18 @@ mod tests {
                     N0 --> N1\nN1 --> N2\nN2 --> N3\nN2 --> N4\nN4 -->|ok| N5\nN5 --> N6\n\
                     N6 --> N7\nN3 --> N5\nN2 --> N7\nN4 --> N5\nN6 -->|rollback| N0\n\
                     N5 ==> N2\nN5 ==>|rollback| N4";
+        // r158 (RL): `Done -> Done` (circle to diamond) runs its chord
+        // through the cylinder the lane leaves, but the router holds its
+        // source's breadth past the cylinder: judged round its nearer
+        // side, `rollback` took the bottom in `route()`, across 3 edges.
+        let r158 = "flowchart RL\nN0{Check load}\nN1([Check])\nN2(Store emit)\nN3((Done))\n\
+                    N4(Parse)\nN5([Emit])\nN6([Validate queue])\nN7([Load])\nN8[(Done)]\n\
+                    N9{Done}\nN0 --> N1\nN1 -->|next| N2\nN1 --> N3\nN2 --> N4\n\
+                    N4 -->|yes| N5\nN3 --> N6\nN6 -->|yes| N7\nN6 --> N8\nN7 --> N9\n\
+                    N3 --> N9\nN3 --> N5\nN8 -.->|rollback| N1";
         // (source, edge index, the lane's side: its mean breadth less its
         // target's, across the flow — x in BT, y in RL).
-        for (src, ei, across_x) in [(r280, 8, true), (r046, 11, false)] {
+        for (src, ei, across_x) in [(r280, 8, true), (r046, 11, false), (r158, 11, false)] {
             let g = parse(src).unwrap();
             let sides: Vec<f64> = static_and_routed(src)
                 .iter()
@@ -13387,6 +13457,63 @@ mod tests {
                 sides[0],
                 sides[1]
             );
+        }
+    }
+
+    #[test]
+    fn a_two_cycle_into_a_diamond_keeps_its_twin_ends_apart() {
+        // r048 (BT): `Parse emit --> Emit` crossing the gap back aimed at
+        // Parse emit shifted by its parallel offset and landed on Emit's
+        // upper-right flank, 4 px from where `Emit -> Parse emit` leaves
+        // its top: the ports stage took it for an end on the flank and
+        // never spaced the two, so the curves crossed and the head sat on
+        // the twin's start. The end now stays on the diamond's flow side.
+        let src = "flowchart BT\nN0(Done)\nN1(Queue notify)\nN2{Emit}\nN3[Store emit]\n\
+                   N4{Notify}\nN5{Parse emit}\nN6[Load]\nN0 -->|yes| N1\nN1 -->|fail| N2\n\
+                   N1 -->|ok| N3\nN2 -->|no| N4\nN2 -->|no| N5\nN5 --> N6\nN2 --> N4\n\
+                   N5 --> N2\nN2 ==> N0\nN4 --> N3";
+        let g = parse(src).unwrap();
+        for sc in static_and_routed(src) {
+            let m = crate::quality::measure(&g, &sc);
+            assert_eq!((m.shared_ports, m.arrow_on_start), (0, 0), "{m:?}");
+            assert!(end_skew(&sc.edges[7], false) < 10.0, "{:?}", sc.edges[7]);
+        }
+    }
+
+    #[test]
+    fn a_lane_meets_a_slanted_shape_on_its_flat_run() {
+        // advanced's `fail` lane (TD): its port span was a box's (12 px
+        // in from the bounding box's corners), so its tip landed past
+        // Developer's bottom-right vertex (1.9 px off the outline, half
+        // the head over the slant) and its tail just off Security scan's
+        // top-right vertex. Both ends now lie on the flat runs.
+        let src = std::fs::read_to_string("examples/advanced.mmd").unwrap();
+        let g = parse(&src).unwrap();
+        let s = scene(&g);
+        let c: Vec<(f64, f64)> = s.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let ei = g
+            .edges
+            .iter()
+            .position(|e| e.label.as_deref() == Some("fail"))
+            .expect("fail edge");
+        for sc in [s.clone(), route(&g, &c)] {
+            let e = &sc.edges[ei];
+            assert!(e.waypoints.len() > 2, "a lane: {e:?}");
+            let p = edge_polyline(e);
+            for (q, v) in [(p[0], g.edges[ei].from), (p[p.len() - 1], g.edges[ei].to)] {
+                let n = &sc.nodes[v];
+                let k = SLANT_MAX.min(n.w / 4.0);
+                assert!(
+                    (q.0 - n.x).abs() <= n.w / 2.0 - k - ARROW_MARKER_PX / 2.0,
+                    "{} at {q:?} off the flat run of {:?}",
+                    n.id,
+                    (n.x, n.w)
+                );
+                assert!(
+                    (q.1 - n.y).abs() >= n.h / 2.0 - 0.5,
+                    "{q:?} on the flat side"
+                );
+            }
         }
     }
 

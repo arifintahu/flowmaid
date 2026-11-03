@@ -155,7 +155,9 @@ Minor, not patch: several class structs gain public fields (see
   end's breadth ran on along it through the box and turned to its flank
   from inside, the arrowhead hidden under the node and pointing out:
   `rollback` into `Check queue` in an RL chart, `Check -> c` in an LR
-  state choice). The
+  state choice). A lane meets a hexagon or parallelogram on the flat run
+  of its side, off the slant (advanced's `fail` lane put its head half
+  over Developer's corner). The
   router takes the lanes first, so the forward edges route round them,
   and in `scene()` an edge it searches for riding a frame border or
   cramped searches on past a first candidate that does not beat it
@@ -176,12 +178,16 @@ Minor, not patch: several class structs gain public fields (see
   aligns the two nodes. In LR / RL a labelled 2-cycle's two curves bow
   apart by a label's height, so each label rides its own line (wide-labels'
   return label covered its twin near Client) — in a short gap less, so
-  each end still leaves and enters within 10° of square, and the ports
+  each end still leaves and enters within 9.5° of square, and the ports
   stage moves a control that runs straight out of an end along with it
   (state `lr_right`'s return head entered `Draft` at 30°). A back-edge whose ends lie
   more than 450 px apart across the flow takes a lane instead: a reversed S
   would sweep along the gap through every edge there and meet its end at a
-  slant (bench-75's `svc2 -> db` entered `db` at 71° in `route()`).
+  slant (bench-75's `svc2 -> db` entered `db` at 71° in `route()`). On a
+  diamond or circle such an end stays on the part of the border facing
+  along the flow, where the ports stage spaces it from its twin's (a
+  2-cycle into a diamond put its head on its twin's start, on the
+  diamond's flank).
 - **An LR / RL back-edge's label takes its height across the flow**, not
   its width: wide-labels is 160 px tall (was 413, the loop under the row
   sized by a 337 px label).

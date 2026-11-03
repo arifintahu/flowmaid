@@ -104,6 +104,14 @@ pub(crate) fn port_span(shape: Shape, p: &Placed) -> (f64, f64) {
         | Shape::StateEnd => PORT_ROUND_SPAN * p.bsize / 2.0,
         Shape::ForkBar => p.bsize / 2.0 - PORT_INSET,
         Shape::Stadium => p.bsize / 2.0 - p.lsize / 2.0 - 4.0,
+        // The flat run of a hexagon's or a parallelogram's side stops
+        // its slant short of the bounding box: an end within a slant of
+        // the corner lands off the outline, its head half over the edge
+        // (advanced's `fail` lane: its tip past Developer's bottom-right
+        // vertex, its tail off Security scan's top-right one).
+        Shape::Hexagon | Shape::Parallelogram | Shape::ParallelogramAlt => {
+            p.bsize / 2.0 - 12.0f64.max(crate::scene::SLANT_MAX.min(p.bsize / 4.0) + PORT_INSET)
+        }
         _ => p.bsize / 2.0 - 12.0,
     }
     .max(0.0);
@@ -963,6 +971,23 @@ mod tests {
             |_| 0,
         );
         assert_eq!(x, 300.0 + LANE_CLEAR);
+    }
+
+    #[test]
+    fn a_slanted_shape_s_port_span_is_its_flat_run() {
+        // A hexagon or parallelogram 120 wide slants 14 px at each
+        // corner: its span stops PORT_INSET short of the slant, not 12
+        // px short of the bounding box.
+        let p = placed(100.0, 0.0, 120.0, 40.0);
+        let inset = crate::scene::SLANT_MAX + PORT_INSET;
+        for shape in [
+            Shape::Hexagon,
+            Shape::Parallelogram,
+            Shape::ParallelogramAlt,
+        ] {
+            assert_eq!(port_span(shape, &p), (40.0 + inset, 160.0 - inset));
+        }
+        assert_eq!(port_span(Shape::Rect, &p), (52.0, 148.0));
     }
 
     #[test]
