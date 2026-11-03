@@ -519,6 +519,22 @@ Minor, not patch: several class structs gain public fields (see
   on every depth; `#6a7086` fell under 4.5:1 on a nested frame). State
   diagram composites draw the same way. Layout and titles' placement are
   unchanged; titles still paint after the edges, never struck.
+- **Crossing gaps no longer make a line look broken** (report Q15,
+  §2.10). Which line of a crossing goes under was chosen crossing by
+  crossing to keep gaps sparse, so a line crossing two others a few px
+  apart could go under the first and over the second — a gap, a stroke
+  and the other line's gap in a row, which reads as a break (fanout's
+  loop-back did, 14 px apart). Crossings on one line closer than 25 px
+  are now one cluster, and the line takes one role across it — the role
+  most of them already gave it (a tie: under for a back-edge, else over,
+  so the line stays whole) — wherever that chains no gaps into a dashed
+  look and piles no line with more gaps than the busiest already had
+  (quality fixtures: 109 | 138 such flips static | routed -> 76 | 99,
+  dense-lr 6 -> 1, dense-td 13 -> 2; the rest sit on bench-75's busiest
+  bands). A line shorter than three dash periods (180 px) now also hands
+  its extra gaps to the longer lines crossing it where that dashes
+  nothing, so a short edge under two long sweeps is cut once, not twice
+  (a back-edge keeps its gaps, going under by preference).
 - **Breaking** (needs a **minor** bump). Nothing public is removed or
   renamed, and every function keeps its signature. What breaks, and how to
   migrate:
