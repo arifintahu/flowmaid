@@ -205,7 +205,10 @@ Minor, not patch: several class structs gain public fields (see
   widening the gap only by what the loop reaches past it (stress is 269
   px wide, 221 before, 293 while the whole reach was added) — so a
   long edge's channel beside it no longer runs through the loop's apex
-  (stress: `A ==> D`), and a back-edge's lane clears the loop too. The
+  (stress: `A ==> D`), and a back-edge's lane clears the loop too: it
+  never meets an end on the flank that end loops on, but crosses its flow
+  side there instead (a lane into a looped hub turned in through the loop,
+  its head on the loop's own). The
   router treats every self-loop as an obstacle, so `route()` keeps other
   edges off it as well (stress's `A ==> D` ran 5 px from `B`'s loop on a
   drag). `route()` draws a loop on the side `scene()` does — in LR / RL

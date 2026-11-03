@@ -2944,6 +2944,8 @@ fn scene_from_layout(
             && lo.nodes[e.from].layer != lo.nodes[e.to].layer
     });
     let mut abs_edges: Vec<AbsEdge> = Vec::with_capacity(g.edges.len());
+    // How far each node's self-loop reaches past its side.
+    let loops = loop_reach(g);
     for (ei, (e, off)) in g.edges.iter().zip(offs).enumerate() {
         let a = &lo.nodes[e.from];
         let b = &lo.nodes[e.to];
@@ -2987,7 +2989,9 @@ fn scene_from_layout(
                 let far = if f.from == v { f.to } else { f.from };
                 near.map_or(lo.nodes[far].b, |p| p.0)
             };
-            let side = lane_sides(g, &lo.nodes, e, lane.x, heads);
+            // Self-loops sit on their node's high side ([`free_edge`]).
+            let loop_side = |v: usize| if loops[v] > 0.0 { 1.0 } else { 0.0 };
+            let side = lane_sides(g, &lo.nodes, e, lane.x, heads, loop_side);
             let lane = lane_room(g, e, lane, &lo.nodes, &frames);
             let (pts, wps, mid) = lane_geometry(ends.0, ends.1, lane, side);
             let label = e.label.as_ref().map(|l| (mid, text_width(l) + 14.0));
@@ -4236,7 +4240,14 @@ fn route_built(
                 let f = &g.edges[k];
                 flow_at[if f.from == v { f.to } else { f.from }].b
             };
-            let side = lane_sides(g, &flow_at, e, lane.x, heads);
+            // Where `free_edge` draws each self-loop: the high side,
+            // the low one when a drag crowded that ([`loop_on_low_side`]).
+            let loop_side = |v: usize| match loops_at[v] > 0.0 {
+                false => 0.0,
+                true if loop_on_low_side(&flow_at, v, &loops_at) => -1.0,
+                true => 1.0,
+            };
+            let side = lane_sides(g, &flow_at, e, lane.x, heads, loop_side);
             let lane = lane_room(g, e, lane, &flow_at, &frames);
             let (pts, wps, mid) = lane_geometry((fa, sa), (fb, sb), lane, side);
             let tf = |p: (f64, f64)| from_flow(g.direction, p);
@@ -6943,19 +6954,28 @@ fn flow_frame_spans(g: &Graph, at: &[Placed], dir: Direction) -> Vec<Option<(f64
 /// facing the lane ([`crate::lanes::meets_side`]), in flow coordinates
 /// `at` (index-parallel with `g.nodes`): `heads(k, v)` is the breadth
 /// edge `k` heads to from its end at node `v` (its far end, or its
-/// first channel point).
+/// first channel point). `loop_side(v)` is the breadth side node `v`'s
+/// self-loop is drawn on (+1 high, -1 low, 0 without one): a flank
+/// carrying the loop is never met — the turn in would run through the
+/// loop, the head stacked on the loop's own (m6: `again` into `Parse`
+/// through its loop) — so the lane crosses the end's flow side there,
+/// its leg past the end's layer, clear of the loop.
 fn lane_sides(
     g: &Graph,
     at: &[Placed],
     e: &Edge,
     x: f64,
     heads: impl Fn(usize, usize) -> f64,
+    loop_side: impl Fn(usize) -> f64,
 ) -> [bool; 2] {
     let level = |p: &Placed, q: &Placed| {
         p.l - p.lsize / 2.0 < q.l + q.lsize / 2.0 && p.l + p.lsize / 2.0 > q.l - q.lsize / 2.0
     };
     [(e.from, true), (e.to, false)].map(|(v, upstream)| {
         let p = &at[v];
+        if (x - p.b) * loop_side(v) > 0.0 {
+            return false;
+        }
         // The end's other edges on the flow side the lane meets: into the
         // source from upstream, out of the target downstream.
         let fans: Vec<f64> = g
@@ -13678,6 +13698,75 @@ mod tests {
             lb.2 <= c[b].0 - s.nodes[b].w / 2.0 + 1.0,
             "left of B: {lb:?}"
         );
+    }
+
+    #[test]
+    fn a_lane_never_meets_the_flank_its_end_loops_on() {
+        // A lane met its end on the flank facing it even when that flank
+        // carried the end's self-loop: the turn in ran through the loop,
+        // the head stacked on the loop's own (m6: `again` into Parse;
+        // w3: `reindex` into Parse; l5: `again` out of End in scene()
+        // only, so the static and routed lanes left End by different
+        // sides). The lane now crosses the end's flow side there, its
+        // leg past the end's layer, in both modes alike.
+        let srcs = [
+            "flowchart BT\nA[Load]-->B[Parse]\nB-->B\nB-->C[Check]\nB-->D[Warn]\n\
+             C-->E[Emit]\nD-->E\nE-->|again|B",
+            "flowchart TD\nA[Start] --> B[Work]\nB --> B\nB --> C[Check]\nC --> D[End]\n\
+             D --> D\nD -->|again| B\nC --> E[Extra]\nE --> D",
+            "flowchart TD\nA[Ingest] --> B[Parse]\nA --> C[Enrich]\nB --> B\nC --> C\n\
+             A ==> D[Store]\nB --> D\nC --> D\nD --> E[Index]\nE --> E\n\
+             E -.->|reindex| B\nD -->|fix| A\nsubgraph W[Workers]\nB\nC\nend",
+        ];
+        let bbox = |p: &[(f64, f64)]| {
+            p.iter().fold(
+                (
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ),
+                |r, q| (r.0.min(q.0), r.1.min(q.1), r.2.max(q.0), r.3.max(q.1)),
+            )
+        };
+        type Pt = (f64, f64);
+        let cut = |p: Pt, q: Pt, r: Pt, s: Pt| {
+            let side = |a: Pt, b: Pt, c: Pt| (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+            side(p, q, r) * side(p, q, s) < 0.0 && side(r, s, p) * side(r, s, q) < 0.0
+        };
+        let crosses = |p: &[Pt], q: &[Pt]| {
+            p.windows(2)
+                .any(|a| q.windows(2).any(|b| cut(a[0], a[1], b[0], b[1])))
+        };
+        for src in srcs {
+            let g = parse(src).unwrap();
+            for (mode, sc) in ["static", "routed"].iter().zip(static_and_routed(src)) {
+                let mut lanes = 0;
+                for (ei, e) in g.edges.iter().enumerate() {
+                    let looped = |v: usize| g.edges.iter().position(|f| f.from == v && f.to == v);
+                    if e.from == e.to || sc.edges[ei].waypoints.len() < 3 {
+                        continue;
+                    }
+                    let path = edge_painted_polyline(&sc.edges[ei]);
+                    for v in [e.from, e.to] {
+                        let Some(li) = looped(v) else { continue };
+                        lanes += 1;
+                        let lp = edge_painted_polyline(&sc.edges[li]);
+                        let id = (&g.nodes[e.from].id, &g.nodes[e.to].id);
+                        assert!(!crosses(&path, &lp), "{mode} {id:?} crosses the loop");
+                        let r = bbox(&lp);
+                        assert!(
+                            !path.iter().any(|&(x, y)| x > r.0 + 1.0
+                                && x < r.2 - 1.0
+                                && y > r.1 + 1.0
+                                && y < r.3 - 1.0),
+                            "{mode} {id:?} inside the loop {r:?}"
+                        );
+                    }
+                }
+                assert!(lanes > 0, "{mode}: no lane at a looped end in {src}");
+            }
+        }
     }
 
     #[test]
