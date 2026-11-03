@@ -414,6 +414,33 @@ pub(crate) fn crossings(
     n
 }
 
+/// The skeletons of the `placed` lanes (want, breadth) want `i`'s lane
+/// may cross: those whose band overlaps its own and that share no end
+/// with it (lanes meeting at an end nest by their stagger instead), each
+/// laid by `path` (want, breadth) as the caller judges a lane. Without
+/// them a lane took the side its planned neighbour's leg runs across
+/// (x2-nested-backs: `rollback` went over the top, across `retry`'s lane,
+/// in `scene()` and under in `route()`).
+pub(crate) fn planned_skeletons(
+    wants: &[Want],
+    placed: &[(usize, f64)],
+    i: usize,
+    path: impl Fn(usize, f64) -> Vec<Pt>,
+) -> Vec<Skeleton> {
+    let w = &wants[i];
+    let (a, b) = w.ends;
+    placed
+        .iter()
+        .filter(|&&(j, _)| {
+            let o = &wants[j];
+            o.band.0 < w.band.1
+                && w.band.0 < o.band.1
+                && ![o.ends.0, o.ends.1].iter().any(|&v| v == a || v == b)
+        })
+        .map(|&(j, x)| Skeleton::new(wants[j].ends, path(j, x)))
+        .collect()
+}
+
 /// Whether a lane meeting an end at port breadth `xa` (within the end's
 /// port `span`) and running at breadth `x` crosses another edge leaving
 /// that end on the same flow side toward breadth `f`. The ports stage
@@ -442,7 +469,8 @@ pub(crate) fn crosses_at_end(xa: f64, x: f64, span: (f64, f64), f: f64) -> bool 
 /// (`spans`, source then target) to the lane. The spots on a side are
 /// its bound by the obstacles and the ends of the two spans past it; of
 /// equal cost, the one nearest the obstacles, and of the two sides' best
-/// the high one on a tie. So the lane takes the shortest way, within an
+/// the high one on a tie (the low one when `tie_low`). So the lane takes
+/// the shortest way, within an
 /// end's own span when that reaches past the obstacles (it leaves or
 /// enters that end straight) — unless that way crosses more: then a spot
 /// further out within an end's span, which runs straight out of the end
@@ -454,6 +482,7 @@ pub(crate) fn lane_at(
     obstacles: &[(f64, f64)],
     clear: f64,
     spans: [(f64, f64); 2],
+    tie_low: bool,
     mut cross: impl FnMut(f64) -> usize,
 ) -> f64 {
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -500,9 +529,10 @@ pub(crate) fn lane_at(
         spot(f64::NEG_INFINITY, lo, lo, true),
         spot(hi, f64::INFINITY, hi, true),
     );
-    // Of the two sides' best, the cheaper; the high side on a tie.
+    // Of the two sides' best, the cheaper; on a tie the high side, or
+    // the low one when `tie_low`.
     match (low, high) {
-        (Some(l), Some(h)) if l.0 < h.0 - LANE_EPS => l.1,
+        (Some(l), Some(h)) if l.0 < h.0 - LANE_EPS || tie_low && l.0 <= h.0 + LANE_EPS => l.1,
         (_, Some(h)) => h.1,
         (Some(l), None) => l.1,
         (None, None) => hi,
@@ -615,11 +645,13 @@ pub(crate) struct Want {
 /// whose ends lie farthest from what it passes — each planned lane an
 /// obstacle to the later ones sharing its band; lanes on one side
 /// leaving or entering one layer then stagger their stubs, the inner
-/// lane's longest, so the legs nest. `cross(i, x)` counts the crossings
-/// of want `i`'s lane at breadth `x`.
+/// lane's longest, so the legs nest. `cross(i, x, placed)` counts the
+/// crossings of want `i`'s lane at breadth `x`, the lanes planned so far
+/// (`placed`: want, breadth) among what it may cross (see
+/// [`planned_skeletons`]).
 pub(crate) fn plan(
     wants: &[Want],
-    mut cross: impl FnMut(usize, f64) -> usize,
+    mut cross: impl FnMut(usize, f64, &[(usize, f64)]) -> usize,
 ) -> Vec<Option<Lane>> {
     let mut order: Vec<usize> = (0..wants.len()).collect();
     // Of lanes with one band, the one whose ends lie farthest from what
@@ -696,17 +728,37 @@ pub(crate) fn plan(
                 }
             }
         }
-        let mut x = lane_at(&obs, w.clear, w.spans, |x| cross(i, x));
+        // Of two sides that cost the same, the one the planned lanes
+        // sharing an end and its band with it took: nested round them
+        // there, it leaves the other side to the lanes still to come
+        // (x2-nested-backs: `fail` beside `retry`, out of one end, so
+        // `rollback` loops the other way crossing nothing, in `scene()`
+        // and `route()` alike).
+        let mid = (w.spans[0].0 + w.spans[0].1 + w.spans[1].0 + w.spans[1].1) / 4.0;
+        let kin = placed
+            .iter()
+            .filter(|&&(j, _)| {
+                let o = &wants[j];
+                o.band.0 < w.band.1
+                    && w.band.0 < o.band.1
+                    && [o.ends.0, o.ends.1]
+                        .iter()
+                        .any(|&v| v == w.ends.0 || v == w.ends.1)
+            })
+            .map(|&(_, x)| if x < mid { -1 } else { 1 })
+            .sum::<i32>();
+        let tie_low = kin < 0;
+        let mut x = lane_at(&obs, w.clear, w.spans, tie_low, |x| cross(i, x, &placed));
         let reach = (x - w.label_half - LANE_CLEAR, x + w.label_half + LANE_CLEAR);
         let local = !hits(&w.foreign, reach.0, reach.1);
         if !local {
             obs.extend_from_slice(&w.foreign);
-            x = lane_at(&obs, w.clear, w.spans, |x| cross(i, x));
+            x = lane_at(&obs, w.clear, w.spans, tie_low, |x| cross(i, x, &placed));
         }
         // Not straight out of its own end: round those lanes too.
         if alongside.iter().any(|&(_, k)| !legless(i, x, k)) {
             obs.extend(alongside.iter().map(|&(s, _)| s));
-            x = lane_at(&obs, w.clear, w.spans, |x| cross(i, x));
+            x = lane_at(&obs, w.clear, w.spans, tie_low, |x| cross(i, x, &placed));
         }
         out[i] = Some(Lane {
             x,
@@ -840,20 +892,40 @@ mod tests {
     }
 
     #[test]
+    fn a_tied_lane_takes_the_side_asked_for() {
+        // Both sides equally far and crossing nothing: the high one by
+        // default, the low one when `tie_low` (the side the planned
+        // lanes sharing its end took, see `plan`).
+        let spans = [(40.0, 60.0), (40.0, 60.0)];
+        let obs = [(0.0, 100.0)];
+        assert!(lane_at(&obs, LANE_CLEAR, spans, false, |_| 0) > 100.0);
+        assert!(lane_at(&obs, LANE_CLEAR, spans, true, |_| 0) < 0.0);
+        // Not a tie: the cheaper side whatever is asked.
+        let x = lane_at(&obs, LANE_CLEAR, spans, true, |x| usize::from(x < 0.0));
+        assert!(x > 100.0);
+    }
+
+    #[test]
     fn a_lane_clears_only_what_lies_between_and_hugs_it() {
         // One obstacle 0..100: the lane runs LANE_CLEAR past its nearer
         // side to the ends, inside the end's own span when it reaches.
         let spans = [(90.0, 180.0), (40.0, 60.0)];
-        let x = lane_at(&[(0.0, 100.0)], LANE_CLEAR, spans, |_| 0);
+        let x = lane_at(&[(0.0, 100.0)], LANE_CLEAR, spans, false, |_| 0);
         assert_eq!(x, 100.0 + LANE_CLEAR);
         // A crossing on that side sends it round the other.
-        let x = lane_at(&[(0.0, 100.0)], LANE_CLEAR, spans, |x| {
+        let x = lane_at(&[(0.0, 100.0)], LANE_CLEAR, spans, false, |x| {
             usize::from(x > 50.0)
         });
         assert_eq!(x, -LANE_CLEAR);
         // Never through a gap between two obstacles, however short.
         let spans = [(140.0, 160.0), (140.0, 160.0)];
-        let x = lane_at(&[(0.0, 100.0), (200.0, 300.0)], LANE_CLEAR, spans, |_| 0);
+        let x = lane_at(
+            &[(0.0, 100.0), (200.0, 300.0)],
+            LANE_CLEAR,
+            spans,
+            false,
+            |_| 0,
+        );
         assert_eq!(x, 300.0 + LANE_CLEAR);
     }
 
@@ -931,7 +1003,7 @@ mod tests {
             crossings(&out, (0, 1), spans, std::slice::from_ref(&invalid)),
             0
         );
-        let x = lane_at(&[(150.0, 274.0)], LANE_CLEAR, spans, |x| {
+        let x = lane_at(&[(150.0, 274.0)], LANE_CLEAR, spans, false, |x| {
             let p = judged_path(x, spans, 6.0, 1.0, 5.5, 1.5);
             crossings(&p, (0, 1), spans, std::slice::from_ref(&invalid))
         });
@@ -976,7 +1048,7 @@ mod tests {
             ends: (src, 9),
         };
         let wants = [want(1, 200.0), want(2, 290.0), want(3, 380.0)];
-        let lanes = plan(&wants, |i, x| {
+        let lanes = plan(&wants, |i, x, _| {
             let s = wants[i].spans[0];
             usize::from(x < s.0 - 1e-9 || x > s.1 + 1e-9)
         });
@@ -989,7 +1061,7 @@ mod tests {
         // Planned round each other instead (no cheaper spot of their
         // own), they are dealt out so the end nearest their side takes
         // the lane farthest out, with the shortest stub.
-        let lanes = plan(&wants, |_, _| 0);
+        let lanes = plan(&wants, |_, _, _| 0);
         let xs: Vec<f64> = lanes.iter().map(|l| l.unwrap().x).collect();
         assert!(xs[0] < xs[1] && xs[1] < xs[2], "{xs:?}");
         let st: Vec<usize> = lanes.iter().map(|l| l.unwrap().stagger[0]).collect();
@@ -1017,13 +1089,13 @@ mod tests {
             spans: [(110.0, 130.0), (110.0, 130.0)],
             ends: (0, 1),
         };
-        let lanes = plan(&[want(3.0, (0.0, 3.0)), want(1.0, (1.0, 2.0))], |_, _| 0);
+        let lanes = plan(&[want(3.0, (0.0, 3.0)), want(1.0, (1.0, 2.0))], |_, _, _| 0);
         let (outer, inner) = (lanes[0].unwrap().x, lanes[1].unwrap().x);
         assert_eq!(inner, 100.0 + LANE_CLEAR);
         assert_eq!(outer, inner + LANE_CLEAR);
         // Nothing between the ends: drawn directly.
         let mut w = want(1.0, (0.0, 1.0));
         w.blocked = false;
-        assert_eq!(plan(&[w], |_, _| 0), vec![None]);
+        assert_eq!(plan(&[w], |_, _, _| 0), vec![None]);
     }
 }

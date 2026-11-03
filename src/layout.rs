@@ -3002,11 +3002,22 @@ pub(crate) fn back_lanes(
             }
         })
         .collect();
-    let lanes = plan(&wants, |i, x| {
+    let lanes = plan(&wants, |i, x, placed| {
         let e = &g.edges[backs[i]];
         let (a, b) = (&at[e.from], &at[e.to]);
         let path = crate::lanes::judged_path(x, wants[i].spans, a.l, b.l, a.l - 0.5, b.l + 0.5);
-        crate::lanes::crossings(&path, (e.from, e.to), wants[i].spans, &skeletons)
+        // A planned lane's legs a little nearer its ends than this one's
+        // (on the layers both would sit mid-gap, on top of each other, and
+        // never properly cross): a leg across the gap then crosses the
+        // other lane running through it.
+        let planned = crate::lanes::planned_skeletons(&wants, placed, i, |j, xj| {
+            let f = &g.edges[backs[j]];
+            let (pa, pb) = (&at[f.from], &at[f.to]);
+            crate::lanes::judged_path(xj, wants[j].spans, pa.l, pb.l, pa.l - 0.4, pb.l + 0.4)
+        });
+        let ends = (e.from, e.to);
+        crate::lanes::crossings(&path, ends, wants[i].spans, &skeletons)
+            + crate::lanes::crossings(&path, ends, wants[i].spans, &planned)
     });
     backs
         .iter()

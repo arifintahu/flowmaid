@@ -7083,12 +7083,22 @@ fn route_backs(g: &Graph, flow: &[Placed]) -> Vec<Back> {
             }
         })
         .collect();
-    let lanes = plan(&wants, |i, x| {
+    let lanes = plan(&wants, |i, x, placed| {
         let e = &g.edges[backs[i]];
         let (a, b) = (&flow[e.from], &flow[e.to]);
         let (s0, s3) = legs(a, b, &Lane::plain(0.0));
         let path = judged_path(x, wants[i].spans, a.l, b.l, s0, s3);
-        crossings(&path, (e.from, e.to), wants[i].spans, &skeletons)
+        // The lanes planned so far, as the layout judges them too
+        // (`layout::back_lanes`), so both pick the same side.
+        let planned = crate::lanes::planned_skeletons(&wants, placed, i, |j, xj| {
+            let f = &g.edges[backs[j]];
+            let (pa, pb) = (&flow[f.from], &flow[f.to]);
+            let (t0, t3) = legs(pa, pb, &Lane::plain(0.0));
+            judged_path(xj, wants[j].spans, pa.l, pb.l, t0, t3)
+        });
+        let ends = (e.from, e.to);
+        crossings(&path, ends, wants[i].spans, &skeletons)
+            + crossings(&path, ends, wants[i].spans, &planned)
     });
     for (&ei, lane) in backs.iter().zip(lanes) {
         out[ei] = lane.map_or(Back::Direct, Back::Lane);
@@ -13110,6 +13120,49 @@ mod tests {
                 })
                 .sum();
             assert!(covered <= 1, "{covered} twin strokes under labels");
+        }
+    }
+
+    #[test]
+    fn nested_lanes_take_the_same_sides_in_scene_and_route() {
+        // x2-nested-backs: `fail` (Store -> Parse) tied between its two
+        // sides in the layout's planning and took the bottom, so
+        // `rollback` (Transform -> Source) went over the top across
+        // `retry`'s lane; route() put `fail` beside `retry` on top and
+        // `rollback` underneath, crossing nothing, so the two lanes
+        // swapped sides on the first drag. A tie now goes to the side the
+        // planned lanes sharing its end took, and planned lanes count
+        // among what a later lane crosses, in both.
+        let src = "flowchart LR\n  S[Source] --> P1[Parse] --> P2[Validate] --> P3[Transform] --> P4[Store]\n  \
+                   P1 --> Q[Queue]\n  Q --> P3\n  P4 -->|fail| P1\n  P4 -->|retry| P2\n  \
+                   P3 -.->|rollback| S\n  P4 ==>|done| S";
+        let [st, rt] = static_and_routed(src);
+        let side = |sc: &Scene, f: &str, t: &str| {
+            let mid = sc.nodes.iter().map(|n| n.y).sum::<f64>() / sc.nodes.len() as f64;
+            let p = edge_polyline(the_edge(sc, f, t));
+            let (lo, hi) = p.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |r, q| {
+                (r.0.min(q.1), r.1.max(q.1))
+            });
+            (mid - lo) > (hi - mid)
+        };
+        for (f, t) in [("P4", "P1"), ("P3", "S"), ("P4", "P2"), ("P4", "S")] {
+            assert_eq!(side(&st, f, t), side(&rt, f, t), "{f} -> {t}");
+        }
+        for sc in [&st, &rt] {
+            let backs: Vec<Vec<(f64, f64)>> = [("P4", "P1"), ("P3", "S"), ("P4", "P2")]
+                .iter()
+                .map(|&(f, t)| edge_polyline(the_edge(sc, f, t)))
+                .collect();
+            for a in 0..backs.len() {
+                for b in a + 1..backs.len() {
+                    let crosses = backs[a].windows(2).any(|w| {
+                        backs[b]
+                            .windows(2)
+                            .any(|v| crate::lanes::tests_seg_cross(w[0], w[1], v[0], v[1]))
+                    });
+                    assert!(!crosses, "lanes {a} and {b} cross");
+                }
+            }
         }
     }
 

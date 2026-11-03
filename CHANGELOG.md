@@ -131,7 +131,12 @@ Minor, not patch: several class structs gain public fields (see
   nearest their side takes the outermost lane and the shortest stub;
   lanes of edges between the same two ends leave and enter in that order
   too, the outermost nearest the lane (x6: two `Gamma -> Alpha` lanes
-  crossed twice in `route()`).
+  crossed twice in `route()`). A lane counts the lanes planned before it
+  among the edges it may cross, and of two sides that cost the same takes
+  the one the lanes sharing an end with it took, so `scene()` and
+  `route()` pick the same sides (x2-nested-backs: `fail` and `rollback`
+  swapped sides on the first drag, and the static `rollback` crossed
+  `retry`'s lane).
   Where it meets an end another edge also uses, the lane is judged by
   where that edge heads, so it never turns across an edge arriving beside
   it: the state `retry` loop runs straight up out of `Rejected` round the
