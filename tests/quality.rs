@@ -583,7 +583,11 @@ fn channels_keep_edges_apart_and_off_chips() {
 /// over the drawing) cost it, both still at or under the values before
 /// B7: x_drawn static 494 -> 498 (dense-td 88 -> 92) and idiom_spline
 /// routed 21 -> 22 (dense-td 0 -> 1, a `route()` channel spline the
-/// router no longer redraws orthogonally).
+/// router no longer redraws orthogonally). A comb of two or more
+/// arrowheads keeps its heads a clear gap apart (`ports::HEAD_COMB_MIN`,
+/// B7 review r1 #7): x_drawn routed 500 -> 502 (dense-td 73 -> 76, still
+/// under the 503 before), band_pairs static 95 -> 94, band_len static
+/// 46 030 -> 45 800.
 const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
     ("end_tilt", 7.0, 11.0),
     ("end_tilt_max", 76.8, 128.4),
@@ -593,12 +597,12 @@ const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
     ("lat_backtrack", 1_814.2, 667.0),
     ("own_frame_x", 0.0, 0.0),
     ("own_frame_len", 0.0, 0.0),
-    ("band_pairs", 95.0, 104.0),
-    ("band_len", 46_030.0, 51_310.0),
+    ("band_pairs", 94.0, 104.0),
+    ("band_len", 45_800.0, 51_310.0),
     ("idiom_scubic", 61.0, 80.0),
     ("idiom_spline", 21.0, 22.0),
     ("idiom_bow", 2.0, 1.0),
-    ("x_drawn", 498.0, 500.0),
+    ("x_drawn", 498.0, 502.0),
     ("end_kink", 53.0, 69.0),
     ("ink_out", 0.0, 0.0),
 ];

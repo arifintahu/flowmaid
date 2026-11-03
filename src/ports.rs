@@ -9,13 +9,13 @@
 //! the smallest total move that keeps neighbouring ends a port spacing
 //! apart (an isotonic fit) inside the usable part of the side.
 
-use crate::clearance::{CHIP_SEP, NODE_SEP};
+use crate::clearance::{CHIP_SEP, EDGE_SPACING, NODE_SEP};
 use crate::edgepass::{end_rect, normal, side_of, Ctx, EndRef, Mode, Side};
 use crate::layout::LABEL_BOX_H;
 use crate::model::{Graph, Marker, Shape};
 use crate::scene::{
-    edge_drawn, edge_polyline, grow_scene, title_head, Bbox, Scene, SceneEdge, GLYPH_PORT_GAP,
-    MARGIN, SLANT_MAX,
+    edge_drawn, edge_polyline, grow_scene, title_head, Bbox, Scene, SceneEdge, ARROW_MARKER_PX,
+    GLYPH_PORT_GAP, MARGIN, SLANT_MAX,
 };
 use std::collections::BTreeMap;
 
@@ -62,6 +62,13 @@ const STUB_EPS: f64 = 0.5;
 /// side at up to this, centred where its edges head, so a wide box's
 /// fan keeps its ends together instead of reaching for the corners.
 const PORT_EVEN_MAX: f64 = 2.0 * PORT_SPACING;
+/// Least pitch (px) of an even comb ([`even_comb`]) holding two or more
+/// arrowheads, where its side has the room: a head's width and the
+/// spacing at which two strokes read as two, so neighbouring heads keep
+/// a clear gap. At the port spacing a narrow box's five arrivals sat
+/// 3 px apart and read as one bar of heads (fanout's Aggregator, B7
+/// review r1 #7).
+const HEAD_COMB_MIN: f64 = ARROW_MARKER_PX + EDGE_SPACING;
 /// How far (px) along their sides the ends of a 1:1 pair on facing
 /// sides may lie apart and still be drawn as one straight line (report
 /// M3): a lone end is slid that far to meet its partner, and a comb
@@ -904,7 +911,22 @@ fn place_ports(
                 .iter()
                 .enumerate()
                 .any(|(j, a)| ports[j + 1..].iter().any(|b| sibling(a, b))))
-        .then(|| even_comb(&ports, kept, s, room, lo, hi))
+        .then(|| {
+            // Two or more heads in the comb keep a gap between them.
+            let heads = ports
+                .iter()
+                .filter(|p| {
+                    let e = &sc.edges[p.edge];
+                    if p.src {
+                        e.ends.start_marker(e.kind).is_some()
+                    } else {
+                        e.ends.end_marker(e.kind).is_some()
+                    }
+                })
+                .count();
+            let head_min = if heads >= 2 { HEAD_COMB_MIN } else { 0.0 };
+            even_comb(&ports, kept, head_min, s, room, lo, hi)
+        })
         .filter(|x| {
             ports.iter().zip(x).all(|(p, &t)| {
                 let held = kept(p) || p.weight >= NOTE_WEIGHT;
@@ -1232,9 +1254,11 @@ fn around_kept(
 }
 
 /// Report M3 (§2.4): a box side's three or more ends (in order) at one
-/// even pitch, a share of the side's usable span `[lo, hi]` (never
+/// even pitch, the side's usable span `[lo, hi]` shared out (never
 /// under the spacing `s` nor over the even room `room`, at most
-/// [`PORT_EVEN_MAX`]), the comb set where its ends want to be — their
+/// [`PORT_EVEN_MAX`], and at least `head_min` where the room allows:
+/// [`HEAD_COMB_MIN`] for a comb of arrowheads), the comb set where its
+/// ends want to be — their
 /// weighted mean, so a straight edge's or a note link's end stays put —
 /// and kept on the span. The plain spacing packed equal wants a port
 /// spacing apart and left wide gaps to the middle end: a fan's heads
@@ -1242,6 +1266,7 @@ fn around_kept(
 fn even_comb(
     ports: &[PortEnd],
     kept: impl Fn(&PortEnd) -> bool,
+    head_min: f64,
     s: f64,
     room: f64,
     lo: f64,
@@ -1251,6 +1276,7 @@ fn even_comb(
     let pitch = ((hi - lo) / (k + 1) as f64)
         .min(PORT_EVEN_MAX)
         .max(s)
+        .max(head_min)
         .min(room.max(s));
     let slot = |j: usize| (j as f64 - (k - 1) as f64 / 2.0) * pitch;
     // The ends `kept` (a drag's kept edges'), if any, alone set the
@@ -2087,7 +2113,10 @@ mod tests {
                 .iter()
                 .fold((f64::MAX, 0.0f64), |a, &g| (a.0.min(g), a.1.max(g)));
             assert!(hi - lo <= 2.0, "uneven comb {gaps:?}");
-            assert!(lo >= PORT_SPACING - 1e-6, "{gaps:?}");
+            // Five heads keep a clear gap between them (B7 review r1
+            // #7: at the port spacing they sat 3 px apart, one bar).
+            assert!(lo >= HEAD_COMB_MIN - 1e-6, "{gaps:?}");
+            assert!(lo - ARROW_MARKER_PX >= EDGE_SPACING - 1e-6, "{gaps:?}");
             // Centred: Worker 3 drops straight into its middle.
             assert!((xs[2] - agg.x).abs() < 1e-6, "{xs:?} vs {}", agg.x);
             for w in ["B1", "B2", "B4", "B5"] {
@@ -2270,7 +2299,7 @@ mod tests {
         // A comb whose kept ends sit on its slots keeps them there,
         // wherever the redrawn end wants to be.
         let comb = [end(0, 100.0, 0.0), end(1, 114.0, 0.1), end(3, 140.0, 0.2)];
-        let x = even_comb(&comb, kept, 14.0, 14.0, 60.0, 160.0);
+        let x = even_comb(&comb, kept, 0.0, 14.0, 14.0, 60.0, 160.0);
         assert!(
             (x[0] - 100.0).abs() < 1e-9 && (x[1] - 114.0).abs() < 1e-9,
             "{x:?}"
@@ -2278,7 +2307,7 @@ mod tests {
         assert!((x[2] - 128.0).abs() < 1e-9, "{x:?}");
         // Off its 25 px slots they would move (`place_ports` then spaces
         // the side by the plain rule): the centre is theirs all the same.
-        let x = even_comb(&comb, kept, 14.0, 30.0, 60.0, 160.0);
+        let x = even_comb(&comb, kept, 0.0, 14.0, 30.0, 60.0, 160.0);
         assert!((x[1] - 119.5).abs() < 1e-9, "{x:?}");
     }
 

@@ -178,7 +178,8 @@ Minor, not patch: several class structs gain public fields (see
   meets that side in the middle (long-labels' arrivals landed up to
   44 px off their targets' centres, and the flow through a node jogged);
   three or more ends on one box side are spaced evenly, centred where
-  their edges head (fanout's Aggregator took 14 / 29 / 29 / 14 px); when
+  their edges head (fanout's Aggregator took 14 / 29 / 29 / 14 px), and
+  a comb of arrowheads keeps a clear gap between its heads; when
   ends must make room, the ends of straight edges keep their place and a
   back-edge's give way; and a 1:1 pair on facing sides a few px apart
   along them is drawn straight. Parallel edges keep their own spacing.
