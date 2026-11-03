@@ -62,9 +62,9 @@ pub(crate) fn leaves_open(s: &str) -> bool {
 
 /// Lower the body of a markdown string into label markup. `wrap`
 /// wraps each line at that width (node labels: the graph's
-/// [`crate::model::Graph::wrapping_width`], mermaid 12's 120 px by
-/// default — its markdown labels wrap like its plain ones), balanced
-/// as [`crate::layout::wrap_label`] wraps a plain label; `single_line`
+/// [`crate::model::Graph::wrapping_width`], [`crate::layout::WRAP_WIDTH`]
+/// by default — mermaid's markdown labels wrap like its plain ones),
+/// balanced as [`crate::layout::wrap_label`] wraps a plain label; `single_line`
 /// joins the lines with spaces (edge labels and subgraph titles, which
 /// are one line in flowmaid). A raw backtick or `"` in the body is an
 /// error, as in mermaid's lexer.
@@ -431,70 +431,24 @@ fn trim_line(mut l: Line) -> Line {
     l
 }
 
-/// Label markup for a styled line: adjacent runs of one style merge,
-/// a styled run becomes `<b>…</b>`, `<i>…</i>` or `<b><i>…</i></b>`.
+/// `l` as label markup ([`crate::wrap::markup`]).
 fn markup(l: &Line) -> String {
-    let mut merged: Line = Vec::new();
-    for (t, b, i) in l {
-        match merged.last_mut() {
-            Some(last) if last.1 == *b && last.2 == *i => last.0.push_str(t),
-            _ => merged.push((t.clone(), *b, *i)),
-        }
-    }
-    merged
-        .into_iter()
-        .map(|(t, b, i)| match (b, i) {
-            (false, false) => t,
-            (true, false) => format!("<b>{t}</b>"),
-            (false, true) => format!("<i>{t}</i>"),
-            (true, true) => format!("<b><i>{t}</i></b>"),
-        })
-        .collect()
+    crate::wrap::markup(l)
 }
 
 /// Word wrap of one styled line at `width` px, measured with the same
-/// estimate node sizing uses (bold counts wider, tags count zero), into
-/// as few lines as fit, evened out ([`crate::wrap::balanced`]). A word
-/// wider than the limit keeps a line to itself, unsplit, as in
-/// mermaid's HTML labels. A space keeps the style it was written in.
+/// estimate node sizing uses (bold counts wider, tags count zero), as
+/// [`crate::layout::wrap_label`] wraps a plain label
+/// ([`crate::wrap::wrap`]): into as few lines as fit, evened out,
+/// breaking between CJK characters too. A word wider than the limit
+/// keeps a line to itself, unsplit, as in mermaid's HTML labels. A
+/// space keeps the style it was written in.
 fn wrap_line(l: Line, width: f64) -> Vec<String> {
-    // Words (a word may mix styles), each with the style of the space
-    // before it.
-    let mut words: Vec<(Line, (bool, bool))> = vec![(Vec::new(), (false, false))];
-    for (t, b, i) in l {
-        for (k, part) in t.split(' ').enumerate() {
-            if k > 0 {
-                if words.last().is_some_and(|w| w.0.is_empty()) {
-                    words.pop();
-                }
-                words.push((Vec::new(), (b, i)));
-            }
-            if !part.is_empty() {
-                let w = &mut words.last_mut().expect("non-empty").0;
-                w.push((part.to_string(), b, i));
-            }
-        }
-    }
-    words.retain(|w| !w.0.is_empty());
-    // Words i..j on one line, each later word after a space in the
-    // style it was written in.
-    let line = |i: usize, j: usize| -> Line {
-        let mut out: Line = words[i].0.clone();
-        for (w, (sb, si)) in &words[i + 1..j] {
-            out.push((" ".to_string(), *sb, *si));
-            out.extend(w.iter().cloned());
-        }
-        out
-    };
-    if words.is_empty() {
+    let toks = crate::wrap::Tokens::new(&l);
+    if toks.len() == 0 {
         return vec![String::new()];
     }
-    let starts = crate::wrap::balanced(words.len(), width, |i, j| text_width(&markup(&line(i, j))));
-    starts
-        .iter()
-        .enumerate()
-        .map(|(k, &s)| markup(&line(s, starts.get(k + 1).copied().unwrap_or(words.len()))))
-        .collect()
+    toks.lines(&crate::wrap::wrap(&toks.widths(text_width), width))
 }
 
 #[cfg(test)]
@@ -691,6 +645,43 @@ mod tests {
         assert_eq!(out, "<b>bold words here</b> and more");
         let out = lower("**bold words here** and more", Some(w), false).unwrap();
         assert_eq!(out, "<b>bold words</b>\n<b>here</b> and more");
+    }
+
+    /// B6 review r1 #6: a markdown node label's lines are broken as it
+    /// is lowered, but the graph keeps the markdown: `to_mermaid` writes
+    /// it back as written (no `<br/>` of the width's), and
+    /// `set_wrapping_width` lowers it again at the new width. A label
+    /// set some other way since is left alone.
+    #[test]
+    fn markdown_labels_round_trip_and_rewrap_as_written() {
+        let body = "**Markdown** label that is _long_ enough to wrap at the width";
+        let src = format!("flowchart TD\nJ[\"`{body}`\"] --> K@{{ label: \"**meta** {body}\" }}");
+        let mut g = crate::parser::parse(&src).unwrap();
+        assert!(g.nodes[0].label.contains('\n'), "{:?}", g.nodes[0].label);
+        let text = crate::to_mermaid(&g);
+        assert!(text.contains(&format!("\"`{body}`\"")), "{text}");
+        assert!(text.contains(&format!("\"`**meta** {body}`\"")), "{text}");
+        assert!(!text.contains("<br"), "{text}");
+        let back = crate::parser::parse(&text).unwrap();
+        assert_eq!(back.nodes[0].label, g.nodes[0].label);
+        assert_eq!(back.nodes[1].label, g.nodes[1].label);
+        // A narrower width breaks it into more lines; none, into one.
+        let lines = |g: &crate::model::Graph| g.nodes[0].label.lines().count();
+        let two = lines(&g);
+        g.set_wrapping_width(Some(80.0));
+        assert!(lines(&g) > two, "{:?}", g.nodes[0].label);
+        assert!(g.nodes[1].label.lines().count() > 2);
+        g.set_wrapping_width(None);
+        assert_eq!(lines(&g), 1);
+        assert_eq!(
+            g.nodes[0].label,
+            "<b>Markdown</b> label that is <i>long</i> enough to wrap at the width"
+        );
+        // An edited label is the host's: kept, and written as it is.
+        g.nodes[0].label = "Edited".to_string();
+        g.set_wrapping_width(Some(80.0));
+        assert_eq!(g.nodes[0].label, "Edited");
+        assert!(crate::to_mermaid(&g).contains("J[\"Edited\"]"));
     }
 
     #[test]

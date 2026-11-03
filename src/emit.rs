@@ -471,6 +471,13 @@ fn node_ref(g: &Graph, i: usize) -> String {
         return n.id.clone();
     }
     let (open, close) = shape_delims(n.shape);
+    // A markdown label goes back as the markdown it was written in, not
+    // as its lowered lines (whose breaks the width put there); a body
+    // the string lexer could not hold (a metadata label's backtick or
+    // quote) falls back to the lowered text.
+    if let Some(body) = g.md_label(i).filter(|b| !b.contains(['`', '"'])) {
+        return format!("{}{}\"`{}`\"{}", n.id, open, body, close);
+    }
     format!("{}{}{}{}", n.id, open, label_text(&n.label), close)
 }
 

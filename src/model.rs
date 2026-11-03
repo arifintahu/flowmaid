@@ -435,6 +435,12 @@ pub struct Graph {
     /// Labels never wrap: set by [`Graph::set_wrapping_width`]`(None)`
     /// (class and ER graphs, whose painters lay their own text out).
     no_wrap: bool,
+    /// The markdown body each markdown node label was lowered from, by
+    /// node index (`A["`…`"]`, a metadata `label`): lowering breaks its
+    /// lines at the wrapping width, so [`Graph::set_wrapping_width`]
+    /// lowers it again and `to_mermaid` writes the markdown back as
+    /// written ([`Graph::md_label`]).
+    md_labels: BTreeMap<usize, String>,
     index: HashMap<String, usize>,
 }
 
@@ -664,9 +670,10 @@ impl Graph {
     /// `%%{init: {"flowchart": {"wrappingWidth": N}}}%%` or
     /// `wrappingWidth: N` under `config.flowchart` in its frontmatter;
     /// `None` when labels keep the lines they were written with
-    /// ([`Graph::set_wrapping_width`]). The node labels themselves never
-    /// change: the scene shows the wrapped lines (`SceneNode::label`)
-    /// and sizes the nodes for them.
+    /// ([`Graph::set_wrapping_width`]). A plain node label itself never
+    /// changes: the scene shows the wrapped lines (`SceneNode::label`)
+    /// and sizes the nodes for them. A markdown label's lines are broken
+    /// as it is lowered, at this width.
     pub fn wrapping_width(&self) -> Option<f64> {
         if self.no_wrap {
             None
@@ -678,8 +685,46 @@ impl Graph {
     /// Set the width node labels wrap at ([`Graph::wrapping_width`]);
     /// `None` (or a width that is not a positive finite number) keeps
     /// every label on the lines it was written with, as flowmaid did
-    /// before labels wrapped.
+    /// before labels wrapped. A markdown node label (``"`…`"``), whose
+    /// lines are broken as it is lowered, is lowered again at the new
+    /// width — unless its label was changed since.
     pub fn set_wrapping_width(&mut self, width: Option<f64>) {
+        let md: Vec<usize> = (0..self.nodes.len())
+            .filter(|&v| self.md_label(v).is_some())
+            .collect();
+        self.set_wrap(width);
+        for v in md {
+            let low =
+                crate::markdown::lower_text(&self.md_labels[&v], self.wrapping_width(), false);
+            self.nodes[v].label = low;
+        }
+    }
+
+    /// The markdown body node `v`'s label was lowered from, while the
+    /// label is still that body lowered at the graph's width (a label
+    /// set some other way since has none).
+    pub(crate) fn md_label(&self, v: usize) -> Option<&str> {
+        let body = self.md_labels.get(&v)?;
+        let node = self.nodes.get(v)?;
+        (crate::markdown::lower_text(body, self.wrapping_width(), false) == node.label)
+            .then_some(body.as_str())
+    }
+
+    /// Record (`Some`) or forget (`None`) the markdown body node `v`'s
+    /// label was just lowered from ([`Graph::md_label`]).
+    pub(crate) fn set_md_label(&mut self, v: usize, body: Option<String>) {
+        match body {
+            Some(b) => {
+                self.md_labels.insert(v, b);
+            }
+            None => {
+                self.md_labels.remove(&v);
+            }
+        }
+    }
+
+    /// [`Graph::set_wrapping_width`]'s width alone.
+    fn set_wrap(&mut self, width: Option<f64>) {
         match width.filter(|w| w.is_finite() && *w > 0.0) {
             Some(w) => {
                 self.wrap_width = Some(w);

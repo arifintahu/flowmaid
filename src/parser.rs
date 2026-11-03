@@ -1230,6 +1230,7 @@ fn apply_node_meta(
                     } else {
                         markdown::lower_text(&text, g.wrapping_width(), false)
                     };
+                    g.set_md_label(n, (!plain).then_some(text));
                 }
             }
             _ => {}
@@ -2679,13 +2680,15 @@ fn parse_node(
         None
     };
 
-    let (shape, label) = match parsed {
-        Some((s, (l, true))) => (
-            Some(s),
-            Some(md_node_label(&l, lineno, g.wrapping_width())?),
-        ),
-        Some((s, (l, false))) => (Some(s), Some(clean_label(&l))),
-        None => (None, None),
+    // `md`: the markdown body a label was lowered from (`Some(None)`: a
+    // plain label, which forgets an earlier markdown one).
+    let (shape, label, md) = match parsed {
+        Some((s, (l, true))) => {
+            let low = md_node_label(&l, lineno, g.wrapping_width())?;
+            (Some(s), Some(low), Some(Some(l)))
+        }
+        Some((s, (l, false))) => (Some(s), Some(clean_label(&l)), Some(None)),
+        None => (None, None, None),
     };
     // An id that names a declared subgraph (pre-scanned, so
     // forward references work) is an edge endpoint on the whole
@@ -2703,6 +2706,9 @@ fn parse_node(
         }
     }
     let n = g.ensure_node(&id, label, shape);
+    if let Some(md) = md {
+        g.set_md_label(n, md);
+    }
     // A bracket shape replaces whatever an earlier `@{ shape: … }` set,
     // borderless text included.
     if shape.is_some() {

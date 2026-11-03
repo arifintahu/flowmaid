@@ -646,6 +646,11 @@ pub(crate) fn title_extra(title: &str) -> f64 {
 pub fn text_width(s: &str) -> f64 {
     s.split('\n')
         .map(|l| {
+            // No tag and no `$$` fence: one plain run (what `spans`
+            // would return), measured without building it.
+            if !l.contains(['<', '$']) {
+                return line_width(l);
+            }
             spans(l)
                 .iter()
                 .map(|(t, b, _)| line_width(t) * if *b { 1.06 } else { 1.0 })
@@ -843,56 +848,117 @@ pub const WRAP_WIDTH: f64 = 200.0;
 /// Node `node`'s label as it shows when labels wrap at `width` px
 /// (`measure`: a line's width at [`TEXT_CALIBRATION`], as for
 /// [`intrinsic_size_with`]; report M7). A label that breaks its own
-/// lines (`<br/>`, a markdown string's newlines — already `\n`), fits
-/// on one line, or carries `<b>` / `<i>` markup comes back as it is; any
-/// other is broken at its spaces into as few lines as keep each within
-/// `width`, the lines evened out so no word is left stranded on the
-/// last. A word wider than `width` keeps a line to itself, unsplit
-/// (mermaid does the same). A decision diamond
-/// that wraps takes a line more while that keeps its rhombus within
-/// [`DIAMOND_ASPECT_MAX`] without growing it taller than its text needs
-/// — a narrower, deeper block of text fills a rhombus better than a
-/// wide one. The label in the model never changes: this is what
-/// [`intrinsic_size_wrapped`] sizes the node for and what the scene's
+/// lines (`<br/>`, a markdown string's newlines — already `\n`) or fits
+/// comes back as it is; any other is broken at its spaces (and between
+/// CJK characters, which break without them) into as few lines as keep
+/// each within `width`, the lines evened out so no word is left
+/// stranded on the last. `<b>` / `<i>` markup is kept, re-opened on
+/// each line it spans. A word wider than `width` is never split (mermaid
+/// does the same): its line sets the width the others may fill to, and
+/// a lone word beside it joins it.
+///
+/// Shapes that grow both ways with their text — decision diamonds,
+/// circles — wrap at `width` / [`DIAMOND_ASPECT_MAX`]: a rhombus is 1.6
+/// times as wide as its text, so a decision is then no wider than a box
+/// wrapping at `width` (and a long label no longer swells a circle).
+/// A diamond that wraps takes as many lines as make its rhombus the
+/// smallest, never flatter than [`DIAMOND_ASPECT_MAX`]
+/// ([`intrinsic_size_wrapped`]); one whose label fits keeps its compact
+/// one-line rhombus. The label in the model never changes: this is what
+/// [`intrinsic_size_wrapped`] sizes the node for, and what the scene's
 /// node label and the SVG show.
 pub fn wrap_label(node: &Node, width: f64, measure: impl Fn(&str) -> f64) -> String {
-    let label = node.label.as_str();
-    if label.contains('\n') || has_markup(label) || measure(label) <= width {
-        return label.to_string();
-    }
-    let words: Vec<&str> = label.split(' ').filter(|w| !w.is_empty()).collect();
-    let line_w = |i: usize, j: usize| measure(&words[i..j].join(" "));
-    let mut starts = crate::wrap::balanced(words.len(), width, line_w);
-    if node.shape == Shape::Diamond && starts.len() > 1 {
-        let widest = |st: &[usize]| {
-            (0..st.len())
-                .map(|k| line_w(st[k], st.get(k + 1).copied().unwrap_or(words.len())))
-                .fold(0.0, f64::max)
-        };
-        let fits = |st: &[usize]| {
-            let w = (widest(st) + 24.0) * 1.6;
-            let h = (BASE_H + (st.len() - 1) as f64 * LINE_H) * 1.7;
-            w <= h * DIAMOND_ASPECT_MAX
-        };
-        let mut k = starts.len();
-        while !fits(&starts) {
-            k += 1;
-            match crate::wrap::into_lines(words.len(), k, width, line_w) {
-                Some(st) => starts = st,
-                None => break,
-            }
-        }
-    }
-    lines_at(&words, &starts).join("\n")
+    fit_label(node, Some(width), &measure).text
 }
 
-/// Whether a label line carries `<b>` / `<i>` styling (see [`spans`]):
-/// breaking inside a styled run would split its tags across lines.
-fn has_markup(label: &str) -> bool {
-    let low = label.to_ascii_lowercase();
-    ["<b>", "<i>", "<strong>", "<em>"]
-        .iter()
-        .any(|t| low.contains(t))
+/// A node label as [`wrap_label`] lays it out.
+#[derive(Clone)]
+pub(crate) struct Fit {
+    /// The lines as drawn (`\n`-separated markup).
+    pub(crate) text: String,
+    /// The label was too long for its shape's wrapping width (wrapped,
+    /// or a word too long to wrap): a diamond then keeps within
+    /// [`DIAMOND_ASPECT_MAX`] ([`intrinsic_size_wrapped`]).
+    long: bool,
+}
+
+/// Most lines a wrapping diamond takes past what its width needs, in
+/// search of its smallest rhombus ([`fit_label`]).
+const DIAMOND_DEEPEN_MAX: usize = 3;
+
+/// [`wrap_label`] at `width` (`None`: never wrap), and whether the
+/// label was long for its shape.
+pub(crate) fn fit_label(node: &Node, width: Option<f64>, measure: &dyn Fn(&str) -> f64) -> Fit {
+    let label = node.label.as_str();
+    let keep = |long| Fit {
+        text: label.to_string(),
+        long,
+    };
+    // `$$…$$` math reads as one italic run without its fences
+    // ([`spans`]): kept whole rather than rebuilt without them.
+    let Some(width) = width.filter(|_| !label.contains('\n') && !label.contains("$$")) else {
+        return keep(false);
+    };
+    let width = match node.shape {
+        Shape::Diamond | Shape::Circle | Shape::DoubleCircle => width / DIAMOND_ASPECT_MAX,
+        _ => width,
+    };
+    if measure(label) <= width {
+        return keep(false);
+    }
+    let text = if label.contains('<') {
+        wrap_runs(node.shape, &spans(label), width, measure)
+    } else {
+        wrap_runs(node.shape, &[(label, false, false)], width, measure)
+    };
+    Fit { text, long: true }
+}
+
+/// The styled runs of a one-line label wrapped at `width` for a node
+/// of shape `shape` ([`fit_label`]), as `\n`-separated markup.
+fn wrap_runs<S: AsRef<str>>(
+    shape: Shape,
+    runs: &[(S, bool, bool)],
+    width: f64,
+    measure: &dyn Fn(&str) -> f64,
+) -> String {
+    let toks = crate::wrap::Tokens::new(runs);
+    let w = toks.widths(measure);
+    let mut starts = crate::wrap::wrap(&w, width);
+    if shape == Shape::Diamond && starts.len() > 1 {
+        // The rhombus `intrinsic_size_wrapped` draws round lines starting
+        // at `st` (its width, and its height at its text's): fewer,
+        // wider lines make it flat. The question takes a line more while
+        // that keeps it within [`DIAMOND_ASPECT_MAX`] at its text's
+        // height — a narrower, deeper block fills a rhombus better than
+        // a wide one; when no depth up to [`DIAMOND_DEEPEN_MAX`] lines
+        // more does, the one whose capped rhombus is smallest.
+        let rhombus = |st: &[usize]| {
+            let dw = ((w.widest_line(st) + 24.0) * 1.6).max(80.0);
+            (dw, (BASE_H + (st.len() - 1) as f64 * LINE_H) * 1.7)
+        };
+        let fits = |(dw, dh): (f64, f64)| dw <= dh * DIAMOND_ASPECT_MAX;
+        let area = |(dw, dh): (f64, f64)| dw * dh.max(dw / DIAMOND_ASPECT_MAX);
+        let room = width.max(w.widest_line(&starts));
+        let k0 = starts.len();
+        let mut best = (area(rhombus(&starts)), starts.clone());
+        let mut k = k0;
+        while !fits(rhombus(&starts)) && k < k0 + DIAMOND_DEEPEN_MAX {
+            k += 1;
+            let Some(st) = crate::wrap::into_lines(w.len(), k, room, |i, j| w.line(i, j)) else {
+                break;
+            };
+            let a = area(rhombus(&st));
+            if a < best.0 {
+                best = (a, st.clone());
+            }
+            starts = st;
+        }
+        if !fits(rhombus(&starts)) {
+            starts = best.1;
+        }
+    }
+    toks.lines(&starts).join("\n")
 }
 
 /// Width of a single line (Helvetica at [`TEXT_CALIBRATION`] px)
@@ -929,9 +995,12 @@ fn line_width(s: &str) -> f64 {
 /// the estimated widest-line width, and the number of label lines.
 ///
 /// Uses the built-in Helvetica estimate ([`text_width`]). Embedders
-/// whose renderer uses a REAL font should use [`intrinsic_size_with`]
-/// and feed the sizes to `scene::scene_sized` — that is the documented
-/// path for accurate node boxes (issue #14).
+/// whose renderer uses a REAL font should size nodes with
+/// [`intrinsic_size_wrapped`] (or [`intrinsic_size_with`] at the default
+/// width) and feed the sizes, with the same measure, to
+/// `scene::scene_sized_with` / `scene::route_sized_with` — that is the
+/// documented path for accurate node boxes (issue #14), whose label
+/// lines are the ones the boxes were sized for.
 pub fn intrinsic_size(node: &Node) -> (f64, f64) {
     intrinsic_size_with(node, text_width)
 }
@@ -971,19 +1040,24 @@ pub fn intrinsic_size_with(node: &Node, measure: impl Fn(&str) -> f64) -> (f64, 
 /// ([`Graph::wrapping_width`]: `None` keeps every label on the lines it
 /// was written with): the node sized for its label as [`wrap_label`]
 /// breaks it. For a diagram's own width, as its scene lays it out:
-/// `intrinsic_size_wrapped(&g.nodes[v], g.wrapping_width(), measure)`.
+/// `intrinsic_size_wrapped(&g.nodes[v], g.wrapping_width(), measure)`
+/// — and pass the same `measure` to `scene::scene_sized_with` /
+/// `scene::route_sized_with`, so the lines the scene hands out for each
+/// node are the ones its box was sized for.
 pub fn intrinsic_size_wrapped(
     node: &Node,
     wrapping_width: Option<f64>,
     measure: impl Fn(&str) -> f64,
 ) -> (f64, f64) {
-    let label = match wrapping_width {
-        Some(w) => wrap_label(node, w, &measure),
-        None => node.label.clone(),
-    };
-    let tw = label.split('\n').map(&measure).fold(0.0, f64::max);
+    fit_size(node, &fit_label(node, wrapping_width, &measure), &measure)
+}
+
+/// The size of node `node` drawn with its label laid out as `fit`.
+pub(crate) fn fit_size(node: &Node, fit: &Fit, measure: &dyn Fn(&str) -> f64) -> (f64, f64) {
+    let label = fit.text.as_str();
+    let tw = label.split('\n').map(measure).fold(0.0, f64::max);
     // Height grows with extra label lines beyond the first.
-    let extra = (line_count(&label) - 1) as f64 * LINE_H;
+    let extra = (line_count(label) - 1) as f64 * LINE_H;
     let base_h = BASE_H + extra;
     match node.shape {
         Shape::Rect | Shape::Rounded => ((tw + 2.0 * PAD_X).max(MIN_W), base_h),
@@ -1002,14 +1076,22 @@ pub fn intrinsic_size_wrapped(
         // A diamond with nothing to say is a branch point (a state
         // `<<choice>>`, or a flowchart `A{ }`): compact, mermaid-style.
         Shape::Diamond if is_branch_point(node.shape, &node.label) => (CHOICE_SIZE, CHOICE_SIZE),
-        // Diamonds need extra room so the text fits in the middle, and
-        // are never flatter than [`DIAMOND_ASPECT_MAX`]: a long label
-        // wraps, and what stays wide (a short label, one long word)
-        // grows the rhombus taller instead of into a sliver (report
-        // §2.12: 616 x 65 on long-labels).
+        // Diamonds need extra room so the text fits in the middle. One
+        // whose label was too long for it ([`fit_label`]: wrapped, or a
+        // word too long to) is never flatter than [`DIAMOND_ASPECT_MAX`]
+        // (report §2.12: 616 x 65 on long-labels), while a short label
+        // keeps its compact one-line rhombus (report §6).
         Shape::Diamond => {
             let w = ((tw + 24.0) * 1.6).max(80.0);
-            (w, (base_h * 1.7).max(w / DIAMOND_ASPECT_MAX))
+            let h = base_h * 1.7;
+            (
+                w,
+                if fit.long {
+                    h.max(w / DIAMOND_ASPECT_MAX)
+                } else {
+                    h
+                },
+            )
         }
         Shape::Circle => {
             let d = (tw + 24.0).max(52.0).max(base_h);
@@ -1033,23 +1115,83 @@ pub fn layout(g: &Graph) -> LayoutResult {
 /// Widest a decision diamond gets for its height: a 1.6 : 1 rhombus.
 pub const DIAMOND_ASPECT_MAX: f64 = 1.6;
 
-/// Every node's intrinsic size with the built-in text estimate, its
-/// label wrapped at the graph's width ([`intrinsic_size_wrapped`]):
-/// what `scene()`, `route()` and the compact fold lay out.
-pub(crate) fn node_sizes(g: &Graph) -> Vec<(f64, f64)> {
-    g.nodes
-        .iter()
-        .map(|n| intrinsic_size_wrapped(n, g.wrapping_width(), text_width))
-        .collect()
+/// Every node's label as drawn and its intrinsic size, with the
+/// built-in text estimate, each label wrapped once at the graph's width
+/// ([`wrap_label`], [`intrinsic_size_wrapped`]): what `scene()`,
+/// `route()`, `route_partial()` and the compact fold lay out.
+pub(crate) fn node_texts(g: &Graph) -> (Vec<String>, Vec<(f64, f64)>) {
+    let ww = g.wrapping_width();
+    WRAP_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() > WRAP_MEMO_MAX {
+            memo.clear();
+        }
+        g.nodes
+            .iter()
+            .map(|n| {
+                // What the wrap depends on besides the text: the width, and
+                // whether the shape wraps narrower (round) or deepens (a
+                // diamond, see `fit_label`).
+                let how = (
+                    ww.map_or(u64::MAX, f64::to_bits),
+                    match n.shape {
+                        Shape::Diamond => 2u8,
+                        Shape::Circle | Shape::DoubleCircle => 1,
+                        _ => 0,
+                    },
+                );
+                let fit = match memo
+                    .get(n.label.as_str())
+                    .and_then(|v| v.iter().find(|(k, _)| *k == how))
+                {
+                    Some((_, fit)) => fit.clone(),
+                    None => {
+                        let fit = fit_label(n, ww, &text_width);
+                        memo.entry(n.label.clone())
+                            .or_default()
+                            .push((how, fit.clone()));
+                        fit
+                    }
+                };
+                let size = fit_size(n, &fit, &text_width);
+                (fit.text, size)
+            })
+            .unzip()
+    })
 }
 
-/// Node `n`'s label as the scene and the SVG show it: wrapped at the
-/// graph's width ([`wrap_label`]) with the built-in text estimate.
-pub(crate) fn display_label(g: &Graph, n: &Node) -> String {
-    match g.wrapping_width() {
-        Some(w) => wrap_label(n, w, text_width),
-        None => n.label.clone(),
-    }
+/// Most labels [`WRAP_MEMO`] holds before it starts over.
+const WRAP_MEMO_MAX: usize = 4096;
+
+/// A wrapping key: the graph's width (bits; `u64::MAX` for none) and the
+/// shape's wrapping class.
+type WrapKey = (u64, u8);
+
+thread_local! {
+    /// Node labels [`node_texts`] already wrapped with the built-in
+    /// estimate, by their text: every `route` / `route_partial` frame of
+    /// a drag lays out the same labels as the one before, and wrapping a
+    /// long label costs more than the edges round it. A memo of
+    /// [`fit_label`] — the answer is the same either way, so output stays
+    /// deterministic — dropped whole once it holds [`WRAP_MEMO_MAX`]
+    /// labels.
+    static WRAP_MEMO: std::cell::RefCell<std::collections::HashMap<String, Vec<(WrapKey, Fit)>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Every node's intrinsic size ([`node_texts`]).
+pub(crate) fn node_sizes(g: &Graph) -> Vec<(f64, f64)> {
+    node_texts(g).1
+}
+
+/// Every node's label as drawn when lines are measured by `measure`:
+/// wrapped at the graph's width ([`wrap_label`]).
+pub(crate) fn node_labels(g: &Graph, measure: &dyn Fn(&str) -> f64) -> Vec<String> {
+    let ww = g.wrapping_width();
+    g.nodes
+        .iter()
+        .map(|n| fit_label(n, ww, measure).text)
+        .collect()
 }
 
 /// Same as [`layout`] but with caller-provided node sizes (width,
@@ -4324,22 +4466,41 @@ mod tests {
         // Balanced: "Return documents | to the applicant", no lone word.
         let d = sc.nodes.iter().find(|n| n.id == "D").unwrap();
         assert_eq!(d.label, "Return documents\nto the applicant");
-        // Short labels, explicit breaks and markup stay as written.
+        // Short labels and explicit breaks stay as written.
         let c = sc.nodes.iter().find(|n| n.id == "C").unwrap();
         assert_eq!(c.label, "Issue the certificate");
         let g2 = crate::parser::parse(
             "flowchart TD\nA[a fairly long first line that goes on<br/>and a second one]\n\
-             B[<b>bold text</b> that is long enough to wrap if it were plain]\n\
-             C[Pneumonoultramicroscopicsilicovolcanoconiosis_is_one_very_long_word x]",
+             B[<b>a bold run long enough to go over two lines</b> and a <i>plain</i> tail]\n\
+             C[Pneumonoultramicroscopicsilicovolcanoconiosis_is_one_very_long_word x]\n\
+             D[x Pneumonoultramicroscopicsilicovolcanoconiosis_is_one_very_long_word]\n\
+             E[Pneumonoultramicroscopicsilicovolcanoconiosis_is_one_very_long_word and a few more words]",
         )
         .unwrap();
         let sc2 = crate::scene::scene(&g2);
         assert_eq!(sc2.nodes[0].label, g2.nodes[0].label);
-        assert_eq!(sc2.nodes[1].label, g2.nodes[1].label);
+        // Markup wraps too, its tags closed and re-opened on each line.
         assert_eq!(
-            sc2.nodes[2].label,
-            "Pneumonoultramicroscopicsilicovolcanoconiosis_is_one_very_long_word\nx",
-            "an over-long word keeps a line to itself, unsplit"
+            sc2.nodes[1].label,
+            "<b>a bold run long enough to go</b>\n<b>over two lines</b> and a <i>plain</i> tail"
+        );
+        assert!(sc2.nodes[1]
+            .label
+            .lines()
+            .all(|l| text_width(l) <= WRAP_WIDTH));
+        // An over-long word is never split; a lone word beside it joins
+        // its line instead of being stranded under it (or over it), and
+        // the other lines may fill up to its width.
+        for v in [2, 3] {
+            assert_eq!(sc2.nodes[v].label, g2.nodes[v].label, "one line");
+        }
+        let e: Vec<&str> = sc2.nodes[4].label.lines().collect();
+        assert_eq!(
+            e,
+            [
+                "Pneumonoultramicroscopicsilicovolcanoconiosis_is_one_very_long_word",
+                "and a few more words"
+            ]
         );
         // The source round-trips without the layout's breaks.
         let text = crate::to_mermaid(&g);
@@ -4426,45 +4587,119 @@ mod tests {
         assert_eq!(g.wrapping_width(), None);
     }
 
-    /// Report §2.12 / M7: no decision diamond is flatter than 1.6 : 1 — a
-    /// long question wraps into a deeper block, a short one keeps its
-    /// one line and only grows taller — and a label-less branch point
-    /// keeps its compact square.
+    /// Report §2.12 / M7 / §6: a long decision wraps — at the graph's
+    /// width over 1.6, so it is no wider than a box wrapping there — into
+    /// a block no flatter than 1.6 : 1, while a short one keeps its
+    /// compact one-line rhombus (fanout's "All succeeded?", shapes'
+    /// "Diamond": not grown taller to the cap), and a label-less branch
+    /// point keeps its small square. A longer question never draws a
+    /// bigger rhombus than a shorter one wraps into.
     #[test]
-    fn diamonds_are_never_flatter_than_the_aspect_cap() {
+    fn long_diamonds_wrap_within_the_cap_and_short_ones_stay_compact() {
         let src = "flowchart TD\nA{ok?} --> B{Is it valid?}\n\
                    B --> C{Are all documents complete and compliant with the rules?}\n\
-                   C --> D{Supercalifragilisticexpialidocious} --> E{ }";
+                   C --> D{Supercalifragilisticexpialidocious} --> E{ }\n\
+                   F{All succeeded?} --> G{Diamond} --> H{Payment approved?}\n\
+                   H --> I{Is the user logged in?} --> J{Retry the charge once more?}\n\
+                   J --> K{Is the payment valid for this order?}";
         let g = crate::parser::parse(src).unwrap();
         let sc = crate::scene::scene(&g);
-        for n in sc.nodes.iter().filter(|n| n.shape == Shape::Diamond) {
-            assert!(
-                n.w <= n.h * DIAMOND_ASPECT_MAX + 1e-9,
-                "{}: {} x {}",
-                n.id,
-                n.w,
-                n.h
-            );
+        let ww = g.wrapping_width().unwrap() / DIAMOND_ASPECT_MAX;
+        for (n, m) in sc.nodes.iter().zip(&g.nodes) {
+            let tw = text_width(&m.label);
+            if n.shape != Shape::Diamond || tw == 0.0 {
+                continue;
+            }
+            if tw <= ww {
+                // Short: one line, the rhombus fitted to it, uncapped.
+                assert_eq!(n.label, m.label, "{}", n.id);
+                assert!(
+                    (n.w - ((tw + 24.0) * 1.6).max(80.0)).abs() < 1e-9 && n.h == BASE_H * 1.7,
+                    "{}: {} x {}",
+                    n.id,
+                    n.w,
+                    n.h
+                );
+            } else {
+                assert!(
+                    n.w <= n.h * DIAMOND_ASPECT_MAX + 1e-9,
+                    "{}: {} x {}",
+                    n.id,
+                    n.w,
+                    n.h
+                );
+            }
         }
         let node = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
-        assert_eq!((node("A").w, node("A").h), (80.0, BASE_H * 1.7), "compact");
-        assert_eq!(
-            node("B").label.lines().count(),
-            1,
-            "a short question stays one line"
-        );
-        let c = node("C");
-        assert!(
-            c.label.lines().count() >= 3 && c.w < 220.0,
-            "{:?} {}",
-            c.label,
-            c.w
-        );
-        // The wrapped question fills its rhombus: its height is its
+        assert_eq!((node("A").w, node("A").h), (80.0, BASE_H * 1.7));
+        for (id, w) in [("F", 192.0), ("G", 128.0)] {
+            assert!((node(id).w - w).abs() < 1e-9 && node(id).h == BASE_H * 1.7);
+        }
+        for id in ["C", "H", "I", "J", "K"] {
+            assert!(node(id).label.lines().count() > 1, "{id} wraps");
+        }
+        // A wrapped question fills its rhombus: its height is its
         // text's, not the cap's.
-        let lines = c.label.lines().count() as f64;
-        assert_eq!(c.h, (BASE_H + (lines - 1.0) * LINE_H) * 1.7);
+        for id in ["C", "H", "I", "J", "K"] {
+            let n = node(id);
+            let lines = n.label.lines().count() as f64;
+            assert_eq!(n.h, (BASE_H + (lines - 1.0) * LINE_H) * 1.7, "{id}");
+        }
+        assert_eq!(node("C").label.lines().count(), 4);
+        // Longer text, no smaller rhombus.
+        let area = |id: &str| node(id).w * node(id).h;
+        assert!(area("J") <= area("K"), "{} {}", area("J"), area("K"));
+        // One word too long to wrap: capped, not a sliver.
+        let d = node("D");
+        assert!((d.w / d.h - DIAMOND_ASPECT_MAX).abs() < 1e-9);
         assert_eq!((node("E").w, node("E").h), (CHOICE_SIZE, CHOICE_SIZE));
+    }
+
+    /// Circles grow both ways with their text: a long label wraps at the
+    /// same narrower width as a diamond's (mermaid wraps both of these),
+    /// a short one keeps its line.
+    #[test]
+    fn long_circle_labels_wrap_narrower() {
+        let g = crate::parser::parse(
+            "flowchart TD\nA((A circle with a long label inside)) --> \
+             B((Is this a long circle label here)) --> C(((A double circle with a long label)))\n\
+             C --> D((short))",
+        )
+        .unwrap();
+        let sc = crate::scene::scene(&g);
+        for v in 0..3 {
+            let n = &sc.nodes[v];
+            assert_eq!(n.label.lines().count(), 2, "{}: {:?}", n.id, n.label);
+            assert!(n.w < 140.0 && n.w == n.h, "{}: {} x {}", n.id, n.w, n.h);
+        }
+        assert_eq!(sc.nodes[3].label, "short");
+    }
+
+    /// CJK text breaks between characters (mermaid breaks a long
+    /// Japanese label anywhere), never before closing punctuation or a
+    /// small kana, and never after an opening bracket.
+    #[test]
+    fn cjk_labels_break_between_characters() {
+        let g = crate::parser::parse(
+            "flowchart TD\nA[日本語のラベルはとても長いのでここで折り返されるべきでしょうか テスト]\n\
+             B[「東京」から「大阪」まで、新幹線で移動します。とても速いです。ありがとう。]",
+        )
+        .unwrap();
+        let sc = crate::scene::scene(&g);
+        for (n, m) in sc.nodes.iter().zip(&g.nodes) {
+            let lines: Vec<&str> = n.label.lines().collect();
+            assert!(lines.len() > 1, "{}: {:?}", n.id, n.label);
+            for l in &lines {
+                assert!(text_width(l) <= WRAP_WIDTH, "{l}");
+            }
+            // Nothing lost or added but the breaks (the one space kept).
+            assert_eq!(n.label.replace(['\n', ' '], ""), m.label.replace(' ', ""));
+            for (a, b) in lines.iter().zip(&lines[1..]) {
+                let first = b.chars().next().unwrap();
+                assert!(!"、。」）っゃゅょー".contains(first), "{b}");
+                assert!(!"「（".contains(a.chars().last().unwrap()), "{a}");
+            }
+        }
     }
 
     #[test]
@@ -4632,16 +4867,18 @@ mod tests {
         };
         let c = &g.nodes[g.node_index("c").unwrap()];
         assert_eq!(intrinsic_size(c), (CHOICE_SIZE, CHOICE_SIZE));
-        // Labelled diamonds keep the text-fitting rule and its minimum,
-        // never flatter than DIAMOND_ASPECT_MAX (report §2.12): a wider
-        // one-line label grows the rhombus taller.
+        // Labelled diamonds keep the text-fitting rule and its minimum;
+        // a label too long for one line wraps, never flatter than
+        // DIAMOND_ASPECT_MAX (report §2.12).
         let g = crate::parser::parse("flowchart TD\nA{ok?} --> B{a much longer question}").unwrap();
         let (wa, ha) = intrinsic_size(&g.nodes[0]);
         assert_eq!((wa, ha), (80.0, BASE_H * 1.7), "short label: the minimum");
         let (wb, hb) = intrinsic_size(&g.nodes[1]);
-        let tw = text_width("a much longer question");
-        assert_eq!(wb, (tw + 24.0) * 1.6, "long label: text-fitted");
-        assert_eq!(hb, wb / DIAMOND_ASPECT_MAX, "capped at 1.6 : 1");
+        let shown = wrap_label(&g.nodes[1], WRAP_WIDTH, text_width);
+        assert_eq!(shown, "a much\nlonger\nquestion");
+        let tw = text_width("question");
+        assert_eq!(wb, (tw + 24.0) * 1.6, "long label: fitted to its lines");
+        assert_eq!(hb, (BASE_H + 2.0 * LINE_H) * 1.7);
         // The compact choice still lays out and anchors on its border.
         let sc = crate::scene::scene(&crate::parser::parse("flowchart TD\nA{ } --> B").unwrap());
         assert_eq!((sc.nodes[0].w, sc.nodes[0].h), (CHOICE_SIZE, CHOICE_SIZE));

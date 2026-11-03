@@ -110,9 +110,15 @@ pub struct SceneNode {
     pub shape: Shape,
     /// The label as drawn: `\n` line breaks — the source's own and, in
     /// a label without any, the automatic wrap at the graph's
-    /// [`Graph::wrapping_width`] (`layout::wrap_label`), which the node's
-    /// size is fitted to — and `<b>` / `<i>` markup. The model's
-    /// `Node::label` keeps the text as written.
+    /// [`Graph::wrapping_width`] ([`crate::layout::wrap_label`]) — and
+    /// `<b>` / `<i>` markup. [`scene`], [`route`] and [`route_partial`]
+    /// size the node for exactly these lines; [`scene_sized`] /
+    /// [`route_sized`] wrap with the same built-in text estimate whatever
+    /// sizes they are given, and [`scene_sized_with`] /
+    /// [`route_sized_with`] with the embedder's own measure, so the lines
+    /// are the ones a box sized by
+    /// [`crate::layout::intrinsic_size_wrapped`] with that measure holds.
+    /// The model's `Node::label` keeps a plain label as written.
     pub label: String,
     /// Custom colors from `style`/`classDef`; empty = shape theme.
     pub style: NodeStyle,
@@ -2885,7 +2891,8 @@ fn point_seg_dist(px: f64, py: f64, a: (f64, f64), b: (f64, f64)) -> f64 {
 /// to final coordinates. This is the source of truth that
 /// `render::render` uses as well.
 pub fn scene(g: &Graph) -> Scene {
-    scene_sized(g, &crate::layout::node_sizes(g))
+    let (labels, sizes) = crate::layout::node_texts(g);
+    scene_labelled(g, &sizes, &labels)
 }
 
 /// Same as [`scene`] but with caller-provided node sizes — for
@@ -2894,7 +2901,30 @@ pub fn scene(g: &Graph) -> Scene {
 /// (laid across the flow and spanning them, see `fit_bars`); every
 /// other valid size is used as given, and a negative or non-finite
 /// width or height counts as 0, as in [`route_sized`].
+///
+/// Each node's label (`SceneNode::label`) is wrapped at the graph's
+/// width with the built-in text estimate, as [`scene`] wraps it; sizes
+/// measured with a real font go with [`scene_sized_with`].
 pub fn scene_sized(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
+    scene_labelled(g, sizes, &crate::layout::node_texts(g).0)
+}
+
+/// [`scene_sized`] for an embedder that measures text with its own
+/// font: each node's label is wrapped at the graph's width
+/// ([`Graph::wrapping_width`]) by `measure` — a label line's width at
+/// [`crate::layout::TEXT_CALIBRATION`], as
+/// [`crate::layout::intrinsic_size_wrapped`] takes it — so
+/// `SceneNode::label` holds exactly the lines a box sized by
+/// `intrinsic_size_wrapped(&g.nodes[i], g.wrapping_width(), measure)`
+/// was fitted to. [`scene_sized`] wraps with the built-in estimate,
+/// whose lines a real font's boxes may not hold.
+pub fn scene_sized_with(g: &Graph, sizes: &[(f64, f64)], measure: impl Fn(&str) -> f64) -> Scene {
+    scene_labelled(g, sizes, &crate::layout::node_labels(g, &measure))
+}
+
+/// [`scene_sized`] with each node's drawn label given (index-parallel
+/// with `g.nodes`).
+fn scene_labelled(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene {
     assert_eq!(
         sizes.len(),
         g.nodes.len(),
@@ -2903,19 +2933,19 @@ pub fn scene_sized(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
     let sizes = sane_sizes(sizes);
     let sizes = &fit_bars(g, &sizes)[..];
     let mut sc = if g.subgraphs.is_empty() {
-        scene_flat(g, sizes)
+        scene_flat(g, sizes, labels)
     } else {
-        scene_clustered(g, sizes)
+        scene_clustered(g, sizes, labels)
     };
     crate::edgepass::finish(g, &mut sc, crate::edgepass::Mode::Static);
     sc
 }
 
 /// The classic single-level pipeline (no subgraphs).
-fn scene_flat(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
+fn scene_flat(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene {
     let lo = layout_sized(g, sizes);
     let lanes = static_lanes(g, &lo, None, g.edges.len());
-    let mut sc = scene_from_layout(g, sizes, lo, &lanes, g.edges.len());
+    let mut sc = scene_from_layout(g, sizes, labels, lo, &lanes, g.edges.len());
     let moved = avoid_label_overlaps(&sc.nodes, &[], &mut sc.edges, LABEL_STATIC_WORK);
     fit_moved_labels(&mut sc, &moved);
     sc
@@ -2991,6 +3021,7 @@ fn static_lanes(
 fn scene_from_layout(
     g: &Graph,
     sizes: &[(f64, f64)],
+    labels: &[String],
     lo: LayoutResult,
     lanes: &[Option<crate::lanes::Lane>],
     real: usize,
@@ -3217,7 +3248,7 @@ fn scene_from_layout(
                 w,
                 h,
                 shape: n.shape,
-                label: crate::layout::display_label(g, n),
+                label: labels[i].clone(),
                 style: n.style.clone(),
                 link: g.links.get(&i).and_then(NodeLink::sanitized),
             }
@@ -3272,7 +3303,7 @@ const GRID_MIN_EDGELESS: usize = 4;
 /// contiguous, then wrap each subgraph around its final members. This
 /// keeps cross-cluster edges ordered globally so they route through the
 /// gaps between boxes instead of tangling straight through them.
-fn scene_clustered(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
+fn scene_clustered(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene {
     let node_cluster = node_cluster_paths(g);
     let grid = grid_pairs(g, &node_cluster);
     let proxies = sub_edge_proxies(g, &node_cluster, &grid);
@@ -3333,7 +3364,7 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
     };
     let (lo, groups) = layout_clustered_ranked(&ga, sizes, &node_cluster, &rank_only);
     let lanes = static_lanes(&ga, &lo, Some(&node_cluster), ne);
-    let mut sc = scene_from_layout(&ga, sizes, lo, &lanes, ne);
+    let mut sc = scene_from_layout(&ga, sizes, labels, lo, &lanes, ne);
     let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
 
     // Wrap boxes around the laid-out members, then widen each box to
@@ -4158,8 +4189,8 @@ pub(crate) fn shift_scene(sc: &mut Scene, dx: f64, dy: f64) {
 /// diagram doesn't "swim" while dragging; `to_svg` handles
 /// translation at export time.
 pub fn route(g: &Graph, centers: &[(f64, f64)]) -> Scene {
-    let sizes: Vec<(f64, f64)> = crate::layout::node_sizes(g);
-    route_sized(g, centers, &sizes)
+    let (labels, sizes) = crate::layout::node_texts(g);
+    route_labelled(g, centers, &sizes, &labels)
 }
 
 /// Same as [`route`] but with caller-provided node sizes (a fork/join
@@ -4172,7 +4203,34 @@ pub fn route(g: &Graph, centers: &[(f64, f64)]) -> Scene {
 /// where it lies). Nodes may also share a centre. For finite centres
 /// the returned geometry (every bezier point, waypoint and label spot)
 /// is finite whatever the sizes; valid sizes are used exactly as given.
+///
+/// Labels are wrapped with the built-in text estimate, as in
+/// [`scene_sized`]; sizes measured with a real font go with
+/// [`route_sized_with`].
 pub fn route_sized(g: &Graph, centers: &[(f64, f64)], sizes: &[(f64, f64)]) -> Scene {
+    route_labelled(g, centers, sizes, &crate::layout::node_texts(g).0)
+}
+
+/// [`route_sized`] with each node's label wrapped by `measure`, as
+/// [`scene_sized_with`] wraps it: the drag counterpart for an embedder
+/// that sizes its nodes with its own font.
+pub fn route_sized_with(
+    g: &Graph,
+    centers: &[(f64, f64)],
+    sizes: &[(f64, f64)],
+    measure: impl Fn(&str) -> f64,
+) -> Scene {
+    route_labelled(g, centers, sizes, &crate::layout::node_labels(g, &measure))
+}
+
+/// [`route_sized`] with each node's drawn label given (index-parallel
+/// with `g.nodes`).
+fn route_labelled(
+    g: &Graph,
+    centers: &[(f64, f64)],
+    sizes: &[(f64, f64)],
+    labels: &[String],
+) -> Scene {
     assert_eq!(
         centers.len(),
         g.nodes.len(),
@@ -4185,7 +4243,7 @@ pub fn route_sized(g: &Graph, centers: &[(f64, f64)], sizes: &[(f64, f64)]) -> S
     );
     let sizes = sane_sizes(sizes);
     let sizes = &fit_bars(g, &sizes)[..];
-    let mut sc = route_built(g, centers, sizes, true);
+    let mut sc = route_built(g, centers, sizes, labels, true);
     crate::edgepass::finish(g, &mut sc, crate::edgepass::Mode::Routed);
     sc
 }
@@ -4199,6 +4257,7 @@ fn route_built(
     g: &Graph,
     centers: &[(f64, f64)],
     sizes: &[(f64, f64)],
+    labels: &[String],
     place_labels: bool,
 ) -> Scene {
     let placed: Vec<Placed> = (0..g.nodes.len())
@@ -4222,7 +4281,7 @@ fn route_built(
             w: sizes[i].0,
             h: sizes[i].1,
             shape: n.shape,
-            label: crate::layout::display_label(g, n),
+            label: labels[i].clone(),
             style: n.style.clone(),
             link: g.links.get(&i).and_then(NodeLink::sanitized),
         })
@@ -4646,14 +4705,15 @@ pub fn route_partial(
     if !moved.iter().any(|&m| m) {
         return base.clone();
     }
-    let sizes: Vec<(f64, f64)> = crate::layout::node_sizes(g);
-    let sizes = fit_bars(g, &sizes);
+    // Each label wrapped once for the frame (the fallbacks below reuse it).
+    let (labels, raw_sizes) = crate::layout::node_texts(g);
+    let sizes = fit_bars(g, &raw_sizes);
     // No builder label pass: a redrawn edge's label starts at its spot
     // on the new line and the label stage moves it only if it covers
     // something. route() slides every label first so the router can
     // price paths round them; that second pass costs 3-4 ms of a dense
     // drag frame and is left out here (G13).
-    let mut sc = route_built(g, centers, &sizes, false);
+    let mut sc = route_built(g, centers, &sizes, &labels, false);
     // A kept edge is copied from `base` whole (style, end glyphs,
     // label text), and a node's box follows its text: an edit to any of
     // them must not keep stale geometry.
@@ -4674,7 +4734,7 @@ pub fn route_partial(
             .all(|(a, b)| a.id == b.id && a.label == b.label && a.shape == b.shape)
         && clusters_line_up(g, base);
     if !lines_up {
-        return route(g, centers);
+        return route_labelled(g, centers, &raw_sizes, &labels);
     }
     type R = (f64, f64, f64, f64);
     let node_rect = |nd: &SceneNode| -> R {
@@ -4782,7 +4842,7 @@ pub fn route_partial(
     // Most of the drawing redrawn afresh (not merely near the drag): a
     // full route() costs about the same and draws it better.
     if redrawn as f64 > PARTIAL_ROUTE_SHARE * fixed.len() as f64 {
-        return route(g, centers);
+        return route_labelled(g, centers, &raw_sizes, &labels);
     }
     sc.clusters = clusters;
     // The base canvas already covers the kept geometry; the pipeline's
@@ -13249,8 +13309,8 @@ mod tests {
         // straight labelled edge is no taller than its nodes and a chip
         // beside them (the label's 300 px width made it 350 px tall).
         let g = parse("flowchart LR\nA -->|a very very long label for one short edge| B").unwrap();
-        let sizes = g.nodes.iter().map(intrinsic_size).collect::<Vec<_>>();
-        let sc = scene_flat(&g, &sizes);
+        let (labels, sizes) = crate::layout::node_texts(&g);
+        let sc = scene_flat(&g, &sizes, &labels);
         let tallest = sc.nodes.iter().map(|n| n.h).fold(0.0, f64::max);
         assert!(
             sc.height <= tallest + LABEL_BOX_H + 2.0 * MARGIN,
@@ -15681,6 +15741,64 @@ mod tests {
         svg.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
             .find(|t| t.parse::<f64>().is_ok_and(|v| !v.is_finite()))
             .map(|t| format!("svg writes {t:?}"))
+    }
+
+    /// Report M7, the host contract: an embedder that measures text with
+    /// its own font sizes its nodes with `intrinsic_size_wrapped` and
+    /// hands the same measure to `scene_sized_with` / `route_sized_with`,
+    /// and every label line it gets back is one its box was sized for —
+    /// with the built-in estimate's lines, a 15 % wider font's boxes
+    /// (two lines tall) got one 218 px line into 124 px of room.
+    #[test]
+    fn an_embedders_measure_gives_the_lines_its_boxes_hold() {
+        use crate::layout::{intrinsic_size_wrapped, wrap_label, BASE_H, PAD_X};
+        let labels = [
+            "Escalate the ticket to level two",
+            "Notify the account manager",
+            "Send the invoice to customer",
+            "Check stock in the warehouse",
+        ];
+        let mut src = String::from("flowchart TD\n");
+        for (i, l) in labels.iter().enumerate() {
+            src += &format!("N{i}[{l}]\n");
+        }
+        src += "N0 --> Q{Is the payment valid for this order?} --> N1\nN2 --> N3\n";
+        let g = parse(&src).unwrap();
+        let ww = g.wrapping_width().unwrap();
+        let real = |s: &str| text_width(s) * 1.15;
+        let sizes: Vec<(f64, f64)> = g
+            .nodes
+            .iter()
+            .map(|n| intrinsic_size_wrapped(n, Some(ww), real))
+            .collect();
+        let sc = scene_sized_with(&g, &sizes, real);
+        let centers: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let rt = route_sized_with(&g, &centers, &sizes, real);
+        for s in [&sc, &rt] {
+            for (n, m) in s.nodes.iter().zip(&g.nodes) {
+                assert_eq!(n.label, wrap_label(m, ww, real), "{}", n.id);
+                let widest = n.label.lines().map(real).fold(0.0, f64::max);
+                let lines = n.label.lines().count() as f64;
+                match n.shape {
+                    Shape::Rect => {
+                        assert!(widest + 2.0 * PAD_X <= n.w + 1e-9, "{}", n.id);
+                        assert_eq!(n.h, BASE_H + (lines - 1.0) * LINE_H, "{}", n.id);
+                    }
+                    Shape::Diamond => {
+                        assert!(lines > 1.0);
+                        assert!(((widest + 24.0) * 1.6 - n.w).abs() < 1e-9, "{}", n.id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // The built-in estimate breaks a 15 % wider font's labels in
+        // other places: its lines do not fit these boxes.
+        let est = scene_sized(&g, &sizes);
+        assert!(est
+            .nodes
+            .iter()
+            .any(|n| n.label.lines().map(real).fold(0.0, f64::max) + 2.0 * PAD_X > n.w + 1.0));
     }
 
     #[test]

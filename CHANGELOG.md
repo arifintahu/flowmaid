@@ -165,40 +165,59 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Changed
 
-- **Long node labels wrap** (report M7, §2.12). A plain flowchart or
-  state label that breaks none of its own lines now wraps at 200 px
-  (mermaid's `flowchart.wrappingWidth` default) instead of stretching its
-  node into a banner: long-labels was 672 px wide with a 616 × 65 sliver
-  of a diamond, and is 406 px now (mermaid: 358). Words are never split
-  (an over-long word keeps a line to itself) and the lines are evened
-  out, so no word is stranded on the last ("Return documents / to the
-  applicant"). A label with a `<br/>` keeps exactly its own lines, so the
-  dense diagrams mermaid turns into 4–8-line towers stay as written (one
-  node of the dense fixtures wraps, into two lines). The width is set
-  with `%%{init: {"flowchart": {"wrappingWidth": N}}}%%` or `wrappingWidth:
-  N` under `config.flowchart` in the frontmatter (mermaid 12.2 draws its
-  node labels at 120; at 120 or 150 a dense drawing's three- and
-  four-word labels wrap too and reshuffle its layering), and survives
-  `to_mermaid`. Markdown node labels wrap the same way at the same width
-  (a fixed 175 px before). The wrap is layout only: the model's
-  `Node::label` and `to_mermaid` keep the text as written, the scene's
-  node label (`SceneNode::label`, what hosts paint) carries the drawn
-  lines, and the node is sized for them — by `layout::intrinsic_size` /
-  `intrinsic_size_with` (an embedder's real font wraps by its own
-  measure) at the default width, `layout::intrinsic_size_wrapped` at a
-  graph's own. New: `layout::WRAP_WIDTH`, `layout::wrap_label`,
-  `layout::intrinsic_size_wrapped`, `Graph::wrapping_width`,
-  `Graph::set_wrapping_width` (`None` keeps every label on its written
-  lines, as class and ER boxes do). Edge labels and subgraph titles stay
-  on one line.
-- **Decision diamonds are never flatter than 1.6 : 1** (report §2.12,
-  `layout::DIAMOND_ASPECT_MAX`). A diamond's height is at least its width
-  over 1.6, so a wide one-line label grows the rhombus taller instead of
-  into a sliver, and a wrapping question takes a line more while that
-  keeps the rhombus within the cap at its text's own height (long-labels'
-  question: four even lines in a 220 × 151 rhombus). Short labels keep
-  their compact diamonds (`A{ok?}` is still 80 × 65), and a label-less
-  branch point its small square.
+- **Long node labels wrap** (report M7, §2.12). A flowchart or state
+  label that breaks none of its own lines now wraps at 200 px (mermaid's
+  `flowchart.wrappingWidth` default) instead of stretching its node into
+  a banner: long-labels was 672 px wide with a 616 × 65 sliver of a
+  diamond, and is 406 px now (mermaid: 358). It breaks at its spaces,
+  and between CJK characters, which need none (never before closing
+  punctuation or a small kana); a word is never split — one wider than
+  the width keeps its line, the other lines may fill up to it, and a
+  lone word beside it joins it instead of being stranded. The lines are
+  evened out, so no word is left alone on the last ("Return documents /
+  to the applicant"), and `<b>` / `<i>` markup wraps too, its tags
+  re-opened on each line. A label with a `<br/>` keeps exactly its own
+  lines, so the dense diagrams mermaid turns into 4–8-line towers stay as
+  written (one node of the dense fixtures wraps, into two lines). The
+  width is set with `%%{init: {"flowchart": {"wrappingWidth": N}}}%%` or
+  `wrappingWidth: N` under `config.flowchart` in the frontmatter (mermaid
+  12.2 draws its node labels at 120; at 120 or 150 a dense drawing's
+  three- and four-word labels wrap too and reshuffle its layering), and
+  survives `to_mermaid`. Circles grow both ways with their text, so they
+  wrap at the width / 1.6, as diamonds do (below): "A circle with a long
+  label inside" is a 126 px circle of two lines, not a 238 px one. The
+  wrap is layout only: the model's `Node::label` and `to_mermaid` keep a
+  plain label as written, the scene's node label (`SceneNode::label`,
+  what hosts paint) carries the drawn lines, and the node is sized for
+  them. An embedder measuring with a real font sizes nodes with
+  `layout::intrinsic_size_wrapped(node, g.wrapping_width(), measure)`
+  and passes the same measure to the new `scene::scene_sized_with` /
+  `scene::route_sized_with`, whose label lines are the ones its boxes
+  were sized for (`scene_sized` / `route_sized` wrap with the built-in
+  estimate). Markdown node labels wrap the same way at the same width
+  (a fixed 175 px greedy before), each of their lines on its own; their
+  lines are broken as they are lowered, so `Node::label` holds them, but
+  `to_mermaid` writes the markdown back as written and
+  `Graph::set_wrapping_width` lowers it again at the new width. Each
+  label is wrapped once per `scene()` / `route()` / `route_partial()`
+  call, and a drag's frames reuse the wrapped labels, so dragging long
+  labels costs no more than before. New: `layout::WRAP_WIDTH`,
+  `layout::wrap_label`, `layout::intrinsic_size_wrapped`,
+  `scene::scene_sized_with`, `scene::route_sized_with`,
+  `Graph::wrapping_width`, `Graph::set_wrapping_width` (`None` keeps
+  every label on its written lines, as class and ER boxes do). Edge
+  labels and subgraph titles stay on one line.
+- **Long decision labels wrap into diamonds no flatter than 1.6 : 1**
+  (report §2.12, `layout::DIAMOND_ASPECT_MAX`). A rhombus is 1.6 times
+  as wide as its text, so a diamond's label wraps at the width / 1.6
+  (125 px by default: a decision is then no wider than a box wrapping at
+  200), and takes a line more while that keeps the rhombus within 1.6 : 1
+  at its text's own height (long-labels' question: four even lines in a
+  220 × 151 rhombus; "Payment approved?" two lines in 145 × 94). Short
+  labels keep their compact one-line diamonds, as before (`A{ok?}` 80 ×
+  65, fanout's "All succeeded?" 192 × 65), and a label-less branch point
+  its small square; only a single word too long to wrap grows the
+  rhombus taller to the cap instead of into a sliver.
 - **Back-edges run in orthogonal lanes, as in mermaid** (report §2.2,
   Q4 + M4). A flowchart or state edge running against the flow used to be
   one wide cubic "bow" round every node on the layers it spans, its own
