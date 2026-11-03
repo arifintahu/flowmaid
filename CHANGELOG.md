@@ -157,7 +157,9 @@ Minor, not patch: several class structs gain public fields (see
   `rollback` into `Check queue` in an RL chart, `Check -> c` in an LR
   state choice). A lane meets a hexagon or parallelogram on the flat run
   of its side, off the slant (advanced's `fail` lane put its head half
-  over Developer's corner). The
+  over Developer's corner), and its end stays on its side when the side
+  is over-full: the ports stage moves other ends round the corner, never
+  a lane's, whose last leg it would swing in at a slant. The
   router takes the lanes first, so the forward edges route round them,
   and in `scene()` an edge it searches for riding a frame border or
   cramped searches on past a first candidate that does not beat it

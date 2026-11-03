@@ -872,6 +872,11 @@ fn spill(sc: &Scene, groups: &mut BTreeMap<(EndRef, Side), Vec<PortEnd>>) {
         // side.
         let (lo, hi, _, _) = span(sc, end, side);
         let hard_cap = (((hi - lo).max(0.0) / PORT_HARD_SPACING).floor() as usize + 1).max(cap);
+        // A back-edge's lane (an orthogonal path into this side, square to
+        // it) never goes round the corner: `turn_end` would swing its last
+        // leg into the neighbouring side at a slant (q10: a lane into an
+        // over-full side entered the top at 34 deg).
+        let lane = |p: &PortEnd| p.back && sc.edges[p.edge].waypoints.len() > 2;
         let mut out: Vec<(Side, PortEnd)> = Vec::new();
         loop {
             let n = ports.len();
@@ -879,8 +884,8 @@ fn spill(sc: &Scene, groups: &mut BTreeMap<(EndRef, Side), Vec<PortEnd>>) {
                 break;
             }
             let any = n > hard_cap;
-            let can_low = low_room > 0 && (any || !ports[0].back);
-            let can_high = high_room > 0 && (any || !ports[n - 1].back);
+            let can_low = low_room > 0 && !lane(&ports[0]) && (any || !ports[0].back);
+            let can_high = high_room > 0 && !lane(&ports[n - 1]) && (any || !ports[n - 1].back);
             if !(can_low || can_high) {
                 break;
             }

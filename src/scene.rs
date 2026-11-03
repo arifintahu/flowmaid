@@ -13520,6 +13520,38 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_into_an_over_full_side_stays_on_it() {
+        // q10 (LR): n11's right side holds more ends than fit 5 px apart,
+        // so the ports stage spilled its outermost round the corner — a
+        // lane's end, whose last leg `turn_end` swung into n11's top at
+        // 34 deg. A lane's end stays on its side; every lane's head
+        // enters square.
+        let src = "flowchart LR\nn6 --- n6\nn11 -->|lbl| n3\nn8 --x n10\nn9 o--o n11\n\
+                   n9 x--x n12\nn1 x--x n0\nn11 -.-> n4\nn2 -.-> n8\nn12 --- n11\n\
+                   n1 -.->|dot| n11\nn10 x--x n11\nn0 <-.-> n9\nn0 --o n4\nn1 <-.-> n3\n\
+                   n4 ==>|thick lbl| n3\nn3 <==> n5\nn1 --- n10\nn0 <-.-> n5\n\
+                   n3 o--o n11\nn4 --- n0\nn9 -.->|dot| n8\nn5 --o n12\nn0 o--o n1\n\
+                   n7 -->|lbl| n5\nn1 <==> n8\nn12 x--x n1";
+        for sc in static_and_routed(src) {
+            let g = parse(src).unwrap();
+            for (i, e) in g.edges.iter().enumerate() {
+                let se = &sc.edges[i];
+                let (a, b) = (&sc.nodes[e.from], &sc.nodes[e.to]);
+                if e.from == e.to || se.waypoints.len() < 3 || b.x >= a.x {
+                    continue;
+                }
+                assert!(
+                    end_skew(se, false) <= 10.0,
+                    "{} -> {}: head {:.1} deg",
+                    a.id,
+                    b.id,
+                    end_skew(se, false)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_short_bowed_twin_leaves_and_enters_near_square() {
         // State lr_right: the labelled return edge of a 2-cycle across a
         // 74 px LR gap bowed its full TWIN_LABEL_BOW at its source (35 deg
