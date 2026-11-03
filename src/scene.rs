@@ -19,6 +19,7 @@ use crate::model::{
     Direction, Edge, EdgeAnimation, EdgeCurve, EdgeEnds, EdgeKind, EdgeMeta, End, Graph, Marker,
     NodeLink, NodeStyle, Shape, SubEdge,
 };
+use crate::style::{Palette, Theme, ThemeVars};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -5069,8 +5070,28 @@ pub fn box_edge_bezier(
     )
 }
 
-/// The `<marker>` id of an unstyled edge end's glyph. The end arrow
-/// keeps its historical `#arrow` id so marker-free output is unchanged.
+/// The `<marker>` id of an unstyled edge end's glyph drawn in `line`,
+/// the theme's edge colour. The end arrow keeps its historical `#arrow`
+/// id in the default colour, so the default output is unchanged; in any
+/// other colour every id carries it (`arrow_d0d0d0`), as a `linkStyle`
+/// stroke's does — marker ids are page-global, and two diagrams of
+/// different themes inlined on one page must not draw each other's
+/// heads.
+fn themed_marker_id(start: bool, m: Marker, line: &str) -> String {
+    let base = marker_base_id(start, m);
+    if line == EDGE_COLOR {
+        return base.to_string();
+    }
+    let mut id = base.to_string();
+    id.push('_');
+    id.extend(
+        line.chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' }),
+    );
+    id
+}
+
+/// [`themed_marker_id`] in the default edge colour.
 fn marker_base_id(start: bool, m: Marker) -> &'static str {
     match (start, m) {
         (false, Marker::Arrow) => "arrow",
@@ -5291,7 +5312,7 @@ struct EdgeMarkers {
     defs: String,
 }
 
-fn edge_markers(edges: &[SceneEdge], heads: &[[Head; 2]]) -> EdgeMarkers {
+fn edge_markers(edges: &[SceneEdge], heads: &[[Head; 2]], line: &str) -> EdgeMarkers {
     let mut made: Vec<(MarkerVariant, String)> = Vec::new();
     let mut defs = String::new();
     let mut id_for = |i: usize, e: &SceneEdge, start: bool| -> Option<String> {
@@ -5320,12 +5341,18 @@ fn edge_markers(edges: &[SceneEdge], heads: &[[Head; 2]]) -> EdgeMarkers {
             len: head.len,
         };
         if v.color.is_none() && Head::PLAIN == head {
-            return Some(marker_base_id(start, m).to_string());
+            return Some(themed_marker_id(start, m, line));
         }
         if let Some((_, id)) = made.iter().find(|(w, _)| *w == v) {
             return Some(id.clone());
         }
-        let mut id = marker_base_id(start, m).to_string();
+        // A styled stroke's colour names its own ids; an unstyled
+        // variant's carries the theme's.
+        let mut id = if v.color.is_some() {
+            marker_base_id(start, m).to_string()
+        } else {
+            themed_marker_id(start, m, line)
+        };
         if v.trim != ARROW_TRIM {
             id.push_str("-t");
             id.push_str(&format!("{}", v.trim).replace('.', "_"));
@@ -5351,7 +5378,7 @@ fn edge_markers(edges: &[SceneEdge], heads: &[[Head; 2]]) -> EdgeMarkers {
             n += 1;
             id = format!("{base}_{n}");
         }
-        let color = style_attr(v.color.as_deref(), EDGE_COLOR);
+        let color = style_attr(v.color.as_deref(), line);
         defs.push_str(&marker_def_sized(
             &id, m, start, &color, v.trim, v.width, v.len,
         ));
@@ -5479,8 +5506,8 @@ pub(crate) fn edge_stroke_width(e: &SceneEdge) -> f64 {
 /// `<marker>` defs beyond the classic end arrow, emitted only for the
 /// glyphs some drawn edge actually uses — a diagram without `<-->`,
 /// `--x` or `--o` gets just `#arrow`. Same geometry as the styled
-/// variants ([`marker_def`]), in the theme's edge colour.
-fn extra_marker_defs(ids: &[(Option<String>, Option<String>)]) -> String {
+/// variants ([`marker_def`]), in the theme's edge colour `line`.
+fn extra_marker_defs(ids: &[(Option<String>, Option<String>)], line: &str) -> String {
     let mut out = String::new();
     for (start, m) in [
         (true, Marker::Arrow),
@@ -5489,13 +5516,13 @@ fn extra_marker_defs(ids: &[(Option<String>, Option<String>)]) -> String {
         (false, Marker::Circle),
         (true, Marker::Circle),
     ] {
-        let base = marker_base_id(start, m);
+        let base = themed_marker_id(start, m, line);
         let used = ids.iter().any(|(s, e)| {
             let got = if start { s } else { e };
-            got.as_deref() == Some(base)
+            got.as_deref() == Some(base.as_str())
         });
         if used {
-            out.push_str(&marker_def(base, m, start, EDGE_COLOR, ARROW_TRIM));
+            out.push_str(&marker_def(&base, m, start, line, ARROW_TRIM));
         }
     }
     out
@@ -5647,6 +5674,7 @@ pub fn to_svg_titled_with(sc: &Scene, title: &str, opts: &SvgOptions) -> String 
 pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &SvgOptions) -> String {
     let (title, desc) = a11y.resolve(default_title);
     let title = title.as_str();
+    let pal = opts.palette();
     let mut bb = Bbox::new();
     grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
     let (minx, maxx, miny, maxy) = bb.finish();
@@ -5692,7 +5720,7 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
         .map(|(e, p)| p.as_ref().map(|p| painted_path(e, p, t)))
         .collect();
     let whole: Vec<Option<f64>> = paths.iter().map(|p| p.as_ref().and_then(|p| p.1)).collect();
-    let markers = edge_markers(&sc.edges, &head_sizes(sc, &painted, &whole));
+    let markers = edge_markers(&sc.edges, &head_sizes(sc, &painted, &whole), &pal.line);
     let line_of = |i: usize| match &painted[i] {
         Some(p) => painted_polyline(&sc.edges[i], p),
         None => edge_polyline(&sc.edges[i]),
@@ -5701,13 +5729,13 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
     s.push_str(&format!(
         "<defs>{}{}{}{}{}</defs>\n",
         marker_def(
-            marker_base_id(false, Marker::Arrow),
+            &themed_marker_id(false, Marker::Arrow, &pal.line),
             Marker::Arrow,
             false,
-            EDGE_COLOR,
+            &pal.line,
             ARROW_TRIM
         ),
-        extra_marker_defs(&markers.ids),
+        extra_marker_defs(&markers.ids, &pal.line),
         markers.defs,
         edge_animation_css(&sc.edges, dom_id),
         casing.defs
@@ -5718,15 +5746,15 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
     // passing the header strip never strike through the text — each
     // gets a translucent chip, mermaid-style.
     let mut cluster_titles = String::new();
-    // Each nesting depth a step deeper (style::cluster_style), its
+    // Each nesting depth a step deeper (Palette::cluster_style), its
     // border readable on the canvas and on the frame round it (Q6).
     for (ci, c) in sc.clusters.iter().enumerate() {
         let (x, y) = t((c.x, c.y));
-        let cs = crate::style::cluster_style(c.depth);
+        let (cs_fill, cs_stroke) = pal.cluster_style(c.depth);
         s.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"8\" \
              fill=\"{}\" stroke=\"{}\" stroke-width=\"1.4\"/>\n",
-            x, y, c.w, c.h, cs.fill, cs.stroke
+            x, y, c.w, c.h, cs_fill, cs_stroke
         ));
         let title = fit_cluster_title(&sc.clusters, ci, maxx + MARGIN);
         let tw = text_width(&title) * TITLE_SCALE;
@@ -5745,7 +5773,7 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
                     format!("{h:.1}")
                 }
             },
-            cs.fill
+            cs_fill
         ));
         for (k, line) in title.split('\n').enumerate() {
             cluster_titles.push_str(&format!(
@@ -5754,7 +5782,7 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
                 x + 10.0,
                 y + 17.0 + k as f64 * TITLE_LINE_H,
                 crate::layout::TITLE_FONT,
-                crate::style::CLUSTER_TITLE,
+                pal.cluster_title,
                 rich(line)
             ));
         }
@@ -5811,7 +5839,7 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
              <title>{}</title></path>\n",
             path_d,
             style_attr(st.fill.as_deref(), "none"),
-            style_attr(st.stroke.as_deref(), EDGE_COLOR),
+            style_attr(st.stroke.as_deref(), &pal.line),
             sw,
             dash,
             marker,
@@ -5820,8 +5848,8 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
             escape(&edge_title)
         ));
         if let Some((text, m, w)) = &e.label {
-            let fill = style_attr(st.color.as_deref(), TEXT_COLOR);
-            svg_label_box_with(&mut edge_labels, text, t(*m), *w, &fill);
+            let fill = style_attr(st.color.as_deref(), &pal.text);
+            svg_label_box_with(&mut edge_labels, text, t(*m), *w, &fill, &pal);
         }
     }
 
@@ -5868,12 +5896,27 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
         // Shape theme, overridden by any custom style/classDef colors.
         // The width applies to the strokes drawn with the outline too:
         // a cylinder's lid, a subroutine's bars, a final state's ring.
-        let ss = crate::style::shape_style(n.shape);
+        // A state note card's colours are the parser's mark of a card,
+        // not the author's: it takes the theme's note paint.
+        let note = is_note_card(n);
+        let (fill, stroke, ink) = if note {
+            (&*pal.note_fill, &*pal.note_stroke, &*pal.note_text)
+        } else {
+            let (f, s) = pal.node_style(n.shape);
+            (f, s, &*pal.node_text)
+        };
+        let (own_fill, own_stroke) = if note {
+            (None, None)
+        } else {
+            (n.style.fill.as_deref(), n.style.stroke.as_deref())
+        };
+        let ink = pal.ink_on_fill(own_fill, ink);
         let sw = n.style.stroke_width.unwrap_or(NODE_STROKE_WIDTH);
+        let stroke = style_attr(own_stroke, stroke);
         let style = format!(
             "fill=\"{}\" stroke=\"{}\" stroke-width=\"{}\"",
-            style_attr(n.style.fill.as_deref(), ss.fill),
-            style_attr(n.style.stroke.as_deref(), ss.stroke),
+            style_attr(own_fill, fill),
+            stroke,
             sw
         );
         match n.shape {
@@ -5943,7 +5986,7 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
                     by = b - ry,
                     rx = w / 2.0,
                     ry = ry,
-                    stroke = style_attr(n.style.stroke.as_deref(), ss.stroke),
+                    stroke = stroke,
                     style = style,
                 ));
             }
@@ -5954,7 +5997,7 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
                      <line x1=\"{l1:.1}\" y1=\"{t:.1}\" x2=\"{l1:.1}\" y2=\"{b:.1}\" stroke=\"{stroke}\" stroke-width=\"{sw}\"/>\n\
                      <line x1=\"{r1:.1}\" y1=\"{t:.1}\" x2=\"{r1:.1}\" y2=\"{b:.1}\" stroke=\"{stroke}\" stroke-width=\"{sw}\"/>\n",
                     l = l, t = t, w = w, h = h, b = t + h, l1 = l + 8.0, r1 = l + w - 8.0,
-                    stroke = style_attr(n.style.stroke.as_deref(), ss.stroke), style = style,
+                    stroke = stroke, style = style,
                 ));
             }
             Shape::Hexagon => {
@@ -6009,12 +6052,12 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
             Shape::StateEnd => {
                 // Outer ring + filled core (UML final-state notation).
                 s.push_str(&format!(
-                    "<circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{r:.1}\" fill=\"#ffffff\" \
+                    "<circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{r:.1}\" fill=\"{hole}\" \
                      stroke=\"{stroke}\" stroke-width=\"{sw}\"/>\n\
                      <circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{ri:.1}\" {style}/>\n",
                     r = w / 2.0,
                     ri = w / 2.0 - 4.0,
-                    stroke = style_attr(n.style.stroke.as_deref(), ss.stroke),
+                    hole = pal.surface,
                 ));
             }
             Shape::ForkBar => {
@@ -6038,7 +6081,7 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
             &mut s,
             cx,
             ly,
-            &style_attr(n.style.color.as_deref(), TEXT_COLOR),
+            &style_attr(n.style.color.as_deref(), ink),
             &n.label,
         );
         s.push_str("</g>\n");
@@ -8216,11 +8259,12 @@ fn cubic_mid(p0: (f64, f64), c1: (f64, f64), c2: (f64, f64), p3: (f64, f64)) -> 
     )
 }
 
-/// Viewport / responsive rendering options for [`crate::render_svg_advanced`].
+/// Viewport, background and colour-theme options for
+/// [`crate::render_svg_advanced`] and every `*_with` writer.
 ///
 /// Defaults reproduce the historical fixed-pixel output byte-for-byte, so
 /// existing callers (and `render_svg`) are unaffected. More options
-/// (theme, scale, max width, …) can be added here without new entry
+/// (scale, max width, …) can be added here without new entry
 /// points. The struct is `#[non_exhaustive]`, so outside this crate build
 /// it from [`Default`] and set the fields you need; adding a field then
 /// never breaks a caller:
@@ -8246,13 +8290,74 @@ pub struct SvgOptions {
     /// Overrides the SVG `preserveAspectRatio` attribute. `None` keeps the
     /// SVG default `xMidYMid meet` (uniform scale, letterboxed).
     pub preserve_aspect_ratio: Option<&'static str>,
-    /// When true, the full-canvas white background `<rect>` is omitted so
+    /// When true, the full-canvas background `<rect>` is omitted so
     /// the diagram sits on whatever is behind it (e.g. a dark page).
-    /// Shapes, label boxes and text keep their own fills.
-    /// Text and edge colours are unchanged (still dark, tuned for a light
-    /// background), so on a dark page they can be hard to read; theming
-    /// is tracked in issue #57.
+    /// Shapes, label boxes and text keep their own fills, in the
+    /// theme's colours: on a dark page pick [`Theme::Dark`] as well,
+    /// whose text and lines are light.
     pub transparent: bool,
+    /// The colour theme (report M10). `None`, the default: the theme
+    /// the diagram's source asks for — `%%{init: {"theme": …,
+    /// "themeVariables": {…}}}%%` or `theme:` / `themeVariables:` under
+    /// a YAML frontmatter's `config:` — when the source has been read
+    /// ([`crate::render_svg_advanced`] does, or see
+    /// [`SvgOptions::with_source_theme`]), else [`Theme::Flowmaid`].
+    /// `Some(theme)` always paints in `theme`, whatever the source
+    /// says: an explicit option beats the source's directive, its
+    /// theme name and its `themeVariables` alike (`Some(Flowmaid)`
+    /// renders a themed source in flowmaid's own colours).
+    ///
+    /// ```
+    /// use flowmaid::style::Theme;
+    /// let src = "%%{init: {\"theme\": \"neutral\"}}%%\nflowchart TD\nA --> B";
+    /// // The source's theme: white nodes with a #333333 border.
+    /// let svg = flowmaid::render_svg_advanced(src, &Default::default()).unwrap();
+    /// assert!(svg.contains("fill=\"#ffffff\" stroke=\"#333333\""));
+    /// // An explicit theme wins.
+    /// let mut opts = flowmaid::SvgOptions::default();
+    /// opts.theme = Some(Theme::Dark);
+    /// let dark = flowmaid::render_svg_advanced(src, &opts).unwrap();
+    /// assert!(dark.contains("fill=\"#1e1f22\"/>")); // the dark canvas
+    /// ```
+    pub theme: Option<Theme>,
+    /// The theme the source asked for, read by
+    /// [`SvgOptions::with_source_theme`]; used while `theme` is `None`.
+    pub(crate) source_theme: Option<Theme>,
+    /// The source's `themeVariables`, likewise.
+    pub(crate) theme_vars: ThemeVars,
+}
+
+impl SvgOptions {
+    /// These options with the colour theme `source` asks for: its
+    /// `%%{init}%%` directives' `theme` and `themeVariables`
+    /// (`background`, `primaryColor`, `primaryBorderColor`,
+    /// `primaryTextColor`, `lineColor`, `textColor`) and those under a
+    /// YAML frontmatter's `config:`, the directives winning. A theme
+    /// name [`Theme::from_name`] does not know paints the default
+    /// theme, as in mermaid; colours that do not parse are ignored.
+    /// Has no effect while [`SvgOptions::theme`] is set — an explicit
+    /// theme beats the source. [`crate::render_svg_advanced`] calls
+    /// this itself; callers that parse a document and render it with a
+    /// `render::*_with` writer (as the CLI does) call it to honour the
+    /// source's theme too.
+    pub fn with_source_theme(mut self, source: &str) -> SvgOptions {
+        if self.theme.is_none() {
+            let (theme, vars) = crate::parser::theme_directive(source);
+            self.source_theme = theme;
+            self.theme_vars = vars;
+        }
+        self
+    }
+
+    /// The colours these options paint with: [`SvgOptions::theme`],
+    /// else the source's theme and `themeVariables` (see
+    /// [`SvgOptions::with_source_theme`]), else [`Theme::Flowmaid`].
+    pub fn palette(&self) -> Palette {
+        match self.theme {
+            Some(theme) => Palette::new(theme),
+            None => Palette::with_vars(self.source_theme.unwrap_or_default(), &self.theme_vars),
+        }
+    }
 }
 
 /// Opening `<svg>` tag + white background (unless
@@ -8381,21 +8486,31 @@ fn svg_open_root(
     if let (Some(d), Some(id)) = (desc, &desc_id) {
         s.push_str(&format!("<desc id=\"{id}\">{}</desc>\n", escape(d)));
     }
-    // The white canvas is opt-out (issue #62) so output can sit on a
-    // dark page; the default keeps it for byte-identical output.
+    // The canvas is opt-out (issue #62) so output can sit on a page of
+    // its own colour; the default keeps it for byte-identical output.
+    // Its colour is the theme's (white unless a theme says otherwise).
     if !opts.transparent {
         s.push_str(&format!(
-            "<rect width=\"{:.0}\" height=\"{:.0}\" fill=\"#ffffff\"/>\n",
-            width, height
+            "<rect width=\"{:.0}\" height=\"{:.0}\" fill=\"{}\"/>\n",
+            width,
+            height,
+            opts.palette().background
         ));
     }
 }
 
-/// White label box with centred text — used for flowchart edge
-/// labels and ER relationship labels alike. `center` is in final
-/// (already translated) coordinates.
-pub(crate) fn svg_label_box(s: &mut String, text: &str, center: (f64, f64), box_w: f64) {
-    svg_label_box_with(s, text, center, box_w, TEXT_COLOR);
+/// Label chip with centred text — used for flowchart edge labels and
+/// ER / class / architecture relationship labels alike: the theme's
+/// chip ([`Palette::label_fill`], white in the default theme) and text.
+/// `center` is in final (already translated) coordinates.
+pub(crate) fn svg_label_box(
+    s: &mut String,
+    text: &str,
+    center: (f64, f64),
+    box_w: f64,
+    pal: &Palette,
+) {
+    svg_label_box_with(s, text, center, box_w, &pal.text, pal);
 }
 
 /// [`svg_label_box`] with the text colour given (an already-escaped
@@ -8406,14 +8521,16 @@ pub(crate) fn svg_label_box_with(
     center: (f64, f64),
     box_w: f64,
     fill: &str,
+    pal: &Palette,
 ) {
     s.push_str(&format!(
         "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"20\" rx=\"4\" \
-         fill=\"#ffffff\" stroke=\"{}\"/>\n",
+         fill=\"{}\" stroke=\"{}\"/>\n",
         center.0 - box_w / 2.0,
         center.1 - 10.0,
         box_w,
-        LABEL_BORDER
+        pal.label_fill,
+        pal.label_border
     ));
     s.push_str(&format!(
         "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" text-anchor=\"middle\" \

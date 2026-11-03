@@ -93,12 +93,17 @@ pub fn render_svg(source: &str) -> Result<String, ParseError> {
     render_svg_advanced(source, &SvgOptions::default())
 }
 
-/// [`render_svg`] with explicit viewport options — opt in to a responsive
-/// root `<svg>` (`width="100%"`), a custom `preserveAspectRatio`, and/or a
-/// transparent background (no white canvas `<rect>`).
-/// Dispatches on the same diagram-type headers as [`render_svg`].
+/// [`render_svg`] with explicit options — opt in to a responsive root
+/// `<svg>` (`width="100%"`), a custom `preserveAspectRatio`, a
+/// transparent background (no canvas `<rect>`), and/or a colour theme
+/// ([`SvgOptions::theme`]). The theme the source asks for
+/// (`%%{init: {"theme": …}}%%` or YAML frontmatter, see
+/// [`SvgOptions::with_source_theme`]) applies unless `opts.theme` is
+/// set. Dispatches on the same diagram-type headers as [`render_svg`].
 pub fn render_svg_advanced(source: &str, opts: &SvgOptions) -> Result<String, ParseError> {
-    match parser::parse_document(source)? {
+    let doc = parser::parse_document(source)?;
+    let opts = &opts.with_source_theme(source);
+    match doc {
         // State diagrams live on the same Graph as flowcharts.
         Document::Flowchart(g) => Ok(render::render_with(&g, opts)),
         Document::State(g) => Ok(render::render_titled_with(&g, "State diagram", opts)),

@@ -2162,6 +2162,14 @@ pub fn to_svg(ms: &MindScene) -> String {
 
 /// [`to_svg`] with explicit viewport options (see [`SvgOptions`]).
 pub fn to_svg_with(ms: &MindScene, opts: &SvgOptions) -> String {
+    // Branches keep their accents in every theme. The root, the
+    // strongest colour on the canvas, takes another theme's node border
+    // (lavender, ink, light grey on the dark canvas, deep green), its
+    // label white or dark by contrast; every other label is already on
+    // its own fill.
+    let pal = opts.palette();
+    let root_fill = pal.tuned(ROOT_FILL, pal.node_style(crate::model::Shape::Rect).1);
+    let root_ink = text_on(root_fill);
     let mut s = String::new();
     svg_open(&mut s, ms.width, ms.height, FONT, "Mind map", opts);
 
@@ -2182,11 +2190,18 @@ pub fn to_svg_with(ms: &MindScene, opts: &SvgOptions) -> String {
         if group {
             s.push_str(&format!("<g class=\"{}\">\n", escape(&n.classes.join(" "))));
         }
-        s.push_str(&shape_svg(n));
+        // Only an unstyled root is recoloured: a `classDef` keeps its own.
+        let root = n.fill == ROOT_FILL && n.style.fill.is_none() && root_fill != ROOT_FILL;
+        let (fill, ink) = if root {
+            (root_fill, n.style.color.as_deref().unwrap_or(root_ink))
+        } else {
+            (n.paint(), n.ink())
+        };
+        s.push_str(&shape_svg(n, fill));
         if let Some(lines) = icon_strokes(n) {
-            s.push_str(&icon_svg(n, &lines));
+            s.push_str(&icon_svg(n, &lines, ink));
         }
-        s.push_str(&label_svg(n));
+        s.push_str(&label_svg(n, ink));
         if group {
             s.push_str("</g>\n");
         }
@@ -2196,9 +2211,10 @@ pub fn to_svg_with(ms: &MindScene, opts: &SvgOptions) -> String {
     s
 }
 
-/// `fill` (and a `classDef` stroke) attributes for a node outline.
-fn paint_attrs(n: &MindNodeBox) -> String {
-    let mut a = format!("fill=\"{}\"", escape(n.paint()));
+/// `fill` (and a `classDef` stroke) attributes for a node outline
+/// painted `fill` (its [`MindNodeBox::paint`], or a theme's root).
+fn paint_attrs(n: &MindNodeBox, fill: &str) -> String {
+    let mut a = format!("fill=\"{}\"", escape(fill));
     if let Some(stroke) = &n.style.stroke {
         a.push_str(&format!(
             " stroke=\"{}\" stroke-width=\"{:.1}\"",
@@ -2209,10 +2225,10 @@ fn paint_attrs(n: &MindNodeBox) -> String {
     a
 }
 
-/// SVG for a node's filled outline.
-fn shape_svg(n: &MindNodeBox) -> String {
+/// SVG for a node's filled outline, painted `fill`.
+fn shape_svg(n: &MindNodeBox, fill: &str) -> String {
     let (x, y, w, h) = (n.x, n.y, n.w, n.h);
-    let paint = paint_attrs(n);
+    let paint = paint_attrs(n, fill);
     if let Some(pts) = perimeter(n) {
         let points = pts
             .iter()
@@ -2274,8 +2290,9 @@ fn shape_svg(n: &MindNodeBox) -> String {
     }
 }
 
-/// SVG for a node's icon glyph, with the icon name as its tooltip.
-fn icon_svg(n: &MindNodeBox, lines: &[Vec<(f64, f64)>]) -> String {
+/// SVG for a node's icon glyph in `ink`, with the icon name as its
+/// tooltip.
+fn icon_svg(n: &MindNodeBox, lines: &[Vec<(f64, f64)>], ink: &str) -> String {
     let mut d = String::new();
     for line in lines {
         for (k, (x, y)) in line.iter().enumerate() {
@@ -2292,13 +2309,13 @@ fn icon_svg(n: &MindNodeBox, lines: &[Vec<(f64, f64)>]) -> String {
         "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"1.5\" \
          stroke-linecap=\"round\" stroke-linejoin=\"round\"><title>{}</title></path>\n",
         d.trim_end(),
-        escape(n.ink()),
+        escape(ink),
         escape(n.icon.as_deref().unwrap_or(""))
     )
 }
 
-/// SVG for a node's centred (possibly multi-line) label.
-fn label_svg(n: &MindNodeBox) -> String {
+/// SVG for a node's centred (possibly multi-line) label, in `ink`.
+fn label_svg(n: &MindNodeBox, ink: &str) -> String {
     let lines: Vec<&str> = n.text.split('\n').collect();
     let mut attrs = String::new();
     if (n.font_size - FONT as f64).abs() > 1e-9 {
@@ -2326,7 +2343,7 @@ fn label_svg(n: &MindNodeBox) -> String {
         "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" fill=\"{}\"{}>{}</text>\n",
         cx,
         cy,
-        escape(n.ink()),
+        escape(ink),
         attrs,
         spans
     )

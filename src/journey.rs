@@ -55,7 +55,8 @@ const TITLE_FONT: f64 = 17.0;
 /// Width factor of bold text over regular (as `text_width` counts
 /// `<b>` runs).
 const BOLD: f64 = 1.06;
-/// The line linking the faces (the journey path).
+/// The line linking the faces (the journey path), in the default theme
+/// ([`crate::style::Palette::guide`] in any other).
 pub const PATH_COLOR: &str = "#c2c8dc";
 /// Face outline stroke.
 pub const FACE_STROKE: &str = "#2f3550";
@@ -386,6 +387,9 @@ pub fn to_svg_with(js: &JourneyScene, opts: &SvgOptions) -> String {
 /// accessible name, then "User journey".
 pub(crate) fn to_svg_a11y_with(js: &JourneyScene, a11y: &A11y, opts: &SvgOptions) -> String {
     let (title, desc) = a11y.resolve(js.title.as_deref().unwrap_or("User journey"));
+    // Bands, faces and actor dots keep their colours in every theme;
+    // the path, labels, title and legend follow it.
+    let pal = opts.palette();
     let mut s = String::new();
     svg_open_a11y(&mut s, js.width, js.height, FONT, &title, desc, opts);
 
@@ -418,7 +422,8 @@ pub(crate) fn to_svg_a11y_with(js: &JourneyScene, a11y: &A11y, opts: &SvgOptions
             .join(" ");
         s.push_str(&format!(
             "<polyline points=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"2\"/>\n",
-            pts, PATH_COLOR
+            pts,
+            pal.tuned(PATH_COLOR, &pal.guide)
         ));
     }
 
@@ -444,7 +449,7 @@ pub(crate) fn to_svg_a11y_with(js: &JourneyScene, a11y: &A11y, opts: &SvgOptions
             &mut s,
             t.label_pos.0,
             t.label_pos.1 + (lines - 1.0) * LINE_H / 2.0,
-            TEXT_COLOR,
+            &pal.text,
             &t.label,
             "",
             true,
@@ -459,7 +464,7 @@ pub(crate) fn to_svg_a11y_with(js: &JourneyScene, a11y: &A11y, opts: &SvgOptions
             js.title_pos.0,
             js.title_pos.1,
             TITLE_FONT,
-            TEXT_COLOR,
+            pal.text,
             escape(title)
         ));
     }
@@ -477,7 +482,7 @@ pub(crate) fn to_svg_a11y_with(js: &JourneyScene, a11y: &A11y, opts: &SvgOptions
             "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" fill=\"{}\">{}</text>\n",
             it.x + 2.0 * DOT_R + 6.0,
             it.y,
-            TEXT_COLOR,
+            pal.text,
             escape(&it.name)
         ));
     }

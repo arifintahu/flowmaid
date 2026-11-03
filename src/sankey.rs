@@ -12,7 +12,7 @@
 
 use crate::layout::{text_width, TEXT_CALIBRATION};
 use crate::model::{SankeyAlignment, SankeyDiagram, SankeyLabelStyle, SankeyLinkColor};
-use crate::scene::{escape, svg_open, SvgOptions, TEXT_COLOR};
+use crate::scene::{escape, svg_open, SvgOptions};
 use crate::style::{accent_wide, css_rgb, ACCENTS, ACCENTS_DEEP};
 
 /// Canvas margin around the plot area.
@@ -1191,6 +1191,9 @@ pub fn to_svg(ss: &SankeyScene) -> String {
 }
 
 pub fn to_svg_with(ss: &SankeyScene, opts: &SvgOptions) -> String {
+    // Nodes and ribbons keep their colours in every theme; labels and
+    // their outline follow it.
+    let pal = opts.palette();
     let mut s = String::new();
     svg_open(&mut s, ss.width, ss.height, FONT, "Sankey diagram", opts);
 
@@ -1250,9 +1253,9 @@ pub fn to_svg_with(ss: &SankeyScene, opts: &SvgOptions) -> String {
         ));
     }
     // Labels last, above every node and ribbon. An `outlined` label is
-    // drawn twice — a white stroked copy, then the text — rather than
-    // with `paint-order`, which older SVG renderers ignore (they would
-    // paint the white stroke OVER the glyphs).
+    // drawn twice — a stroked copy in the canvas colour, then the text —
+    // rather than with `paint-order`, which older SVG renderers ignore
+    // (they would paint the stroke OVER the glyphs).
     for n in &ss.nodes {
         let (x, y) = n.label_pos;
         let lines = n.label_lines.len();
@@ -1290,11 +1293,12 @@ pub fn to_svg_with(ss: &SankeyScene, opts: &SvgOptions) -> String {
         };
         if ss.label_style == SankeyLabelStyle::Outlined {
             s.push_str(&format!(
-                "<text {at} fill=\"#ffffff\" stroke=\"#ffffff\" stroke-width=\"4\" \
-                 stroke-linejoin=\"round\" aria-hidden=\"true\">{text}</text>\n"
+                "<text {at} fill=\"{bg}\" stroke=\"{bg}\" stroke-width=\"4\" \
+                 stroke-linejoin=\"round\" aria-hidden=\"true\">{text}</text>\n",
+                bg = pal.background
             ));
         }
-        s.push_str(&format!("<text {at} fill=\"{TEXT_COLOR}\">{text}</text>\n"));
+        s.push_str(&format!("<text {at} fill=\"{}\">{text}</text>\n", pal.text));
     }
 
     s.push_str("</svg>\n");

@@ -38,6 +38,7 @@ The goal: **mermaid.js functionality, pure-Rust edition.** Progress board with a
 - [x] Markdown strings ``"`**bold** _italic_`"`` in node, edge and subgraph labels — real newlines, automatic word wrap for node labels at mermaid 11's 200px width
 - [x] `style` / `classDef` / `class` / `:::` custom colors *(v0.4.0)*
 - [x] Semantic color theme (shape-based) + stable accent palette shared by ER / class / sequence / pie, with text on accent fills picked for WCAG AA contrast (`style::text_on`)
+- [x] Mermaid's themes as options — `default`, `neutral`, `dark`, `forest` — from `SvgOptions::theme`, `--theme`, `%%{init: {"theme": …}}%%` or frontmatter `config: theme:` (plus the main `themeVariables`), for all twelve diagram types; text 4.5:1 and lines 3:1 in every theme
 - [x] Interactive scene API — drag nodes, edges re-route live; stable node/edge identity (`SceneNode.id`, `SceneEdge.from`/`to`) and local drag re-routing (`scene`, `route`, `route_partial`, `box_edge_bezier`) *(v0.18.0)*
 - [x] Hit-testing / picking — `Scene::{hit_test, node_at, edge_at, cluster_at, hits_in_rect, nearest_node}`, shape-precise, pick-matches-render; completes pick → drag → route for editors *(v0.19.0)*
 - [x] Graph → mermaid serializer — `to_mermaid(g)`, the inverse of `parse`: lossless editor round-trip via mermaid entity codes (`#quot;`, `#124;`), valid standard mermaid out; completes pick → drag → route → **persist** *(v0.20.0)*
@@ -56,7 +57,7 @@ The goal: **mermaid.js functionality, pure-Rust edition.** Progress board with a
 - [x] Mermaid v11 node metadata `A@{ shape: cyl, label: "DB" }` — every registry shape name accepted (exact geometry for 15 families, nearest look-alike for the rest), mermaid's exact "No such shape" errors, one-line and multi-line YAML forms
 - [x] `linkStyle <n>[,<n>…]` / `linkStyle default`, with optional `interpolate <curve>` — per-edge stroke, width, dash, fill and label colour; arrow, cross and circle markers take the stroke colour
 - [x] `click` — `href` links with tooltips and `_self`/`_blank`/`_parent`/`_top` targets wrap the node in an SVG `<a>`; urls are sanitised like mermaid's default `strict` level; callbacks parse and are ignored (static SVG runs no script)
-- [ ] Frontmatter themes, `$$math$$` — see the board
+- [ ] `$$math$$` — see the board
 
 **Why flowmaid?** Zero dependencies, `wasm32` out of the box (all twelve diagram types fit in a compact wasm bundle — mermaid.js is ~2.5 MB), sub-millisecond renders, line-numbered parse errors, and one geometry source shared by SVG export and interactive canvases. Input is forgiving where it should be: UTF-8 BOMs are stripped, CRLF is fine, and every known-but-unsupported Mermaid header fails with an explicit message instead of a confusing parse error.
 
@@ -91,6 +92,11 @@ cat examples/lr.mmd | ./target/release/flowmaid > lr.svg
 # (combines with --compact, --advance and --advance-text)
 ./target/release/flowmaid examples/demo.mmd --transparent -o demo.svg
 
+# paint in one of mermaid's themes: default, neutral, dark or forest
+# (flowmaid, the default, is the semantic palette); beats a theme the
+# source names, which applies otherwise
+./target/release/flowmaid examples/demo.mmd --theme neutral -o demo.svg
+
 # during development
 cargo run -- examples/demo.mmd -o demo.svg
 cargo test
@@ -113,7 +119,30 @@ opts.responsive = true;  // width="100%" instead of a fixed pixel size
 let svg = flowmaid::render_svg_advanced("flowchart TD\nA --> B", &opts)?;
 ```
 
-Transparent output keeps the default dark text and edge colours, so it reads best on light-to-mid backgrounds; dark-page theming is tracked in [#57](https://github.com/go-routine-id/flowmaid/issues/57).
+Transparent output keeps the theme's text and edge colours: on a dark page, pick the dark theme too.
+
+### Themes
+
+flowmaid's own palette — nodes coloured by shape, class / ER / sequence items in an accent each — is the default and does not change. Mermaid's looks are options, set from code, the CLI or the diagram itself:
+
+| theme | `Theme::` | look |
+|---|---|---|
+| `flowmaid` (default) | `Flowmaid` | semantic palette: stadium green, diamond amber, …; an accent per class, entity and participant |
+| `default` | `Mermaid` | mermaid's default: lavender `#ececff` nodes with a `#9370db` border, `#333333` lines and text, pale yellow frames |
+| `neutral` | `Neutral` | white nodes, one `#333333` ink for borders, lines and text, grey frames |
+| `dark` | `Dark` | light text, lines and borders on a near-black `#1e1f22` canvas |
+| `forest` | `Forest` | green `#cde498` nodes with a deep green border, black lines |
+
+```rust
+use flowmaid::style::Theme;
+let mut opts = flowmaid::SvgOptions::default();
+opts.theme = Some(Theme::Dark);
+let svg = flowmaid::render_svg_advanced("flowchart TD\nA --> B", &opts)?;
+```
+
+A diagram can name its theme the way mermaid reads it — `%%{init: {"theme": "neutral"}}%%` (or `%%{initialize: …}%%`, on one line or several) or `theme:` under a YAML frontmatter's `config:` — and `render_svg` / `render_svg_advanced` honour it; the directive wins over the frontmatter, as in mermaid. Its `themeVariables` `background`, `primaryColor` (node fill), `primaryBorderColor`, `primaryTextColor`, `lineColor` and `textColor` recolour those roles; other variables are ignored. An unknown theme name is the default theme, without error (mermaid does the same); `base` reads as `default`, `neo` as `neutral`, `neo-dark` as `dark`. **An explicit `SvgOptions::theme` (or `--theme`) beats the source** — its theme name and variables alike — so `Some(Theme::Flowmaid)` renders a themed file in flowmaid's colours. If you parse first and render through a `render::*_with` writer, call `opts.with_source_theme(source)` to honour the source's theme as the CLI does.
+
+Every theme applies to all twelve diagram types: flowchart and state nodes, frames (still a shade deeper per nesting level), edges, arrowheads, labels and notes; class boxes, ER tables and sequence participants take the theme's node paint, as mermaid draws them; the charts (pie, journey, timeline, git graph, sankey, mindmap, architecture) keep their categorical colours while their text, lines and canvas follow the theme. Every theme keeps text at 4.5:1 and lines and borders at 3:1 on what they are drawn over — the dark one included, where mermaid's own frame borders and label chips fall short. `style`, `classDef` and `linkStyle` colours always win over the theme; a `style` fill without a `color` gets text that reads on it when the theme's ink would not. Hosts painting a `Scene` get the exact colours from `opts.palette()` (`style::Palette`). Marker ids carry a non-default edge colour, so diagrams of different themes can share a page.
 
 ## Supported syntax
 
@@ -131,7 +160,7 @@ Edges are styled with mermaid's `linkStyle`: `linkStyle 3 stroke:#ff3,stroke-wid
 
 Links use mermaid's `click` statement: `click A "https://example.com"`, `click A href "https://example.com" "Tooltip" _blank` (url, then optional tooltip, then optional `_self` / `_blank` / `_parent` / `_top`, in that order), and `click A,B "url"` for several nodes. The SVG wraps the node in `<a href=… xlink:href=…>` (with `rel="noopener noreferrer"` on `_blank`; no `target` means the same tab, as in mermaid), and a tooltip becomes the node's `<title>`. Urls are checked like mermaid's default `strict` security level (a port of `@braintree/sanitize-url`): after decoding percent escapes, HTML and mermaid entities and dropping control and invisible characters, a `javascript:`, `data:` or `vbscript:` url is not linked at all (mermaid would write `about:blank`); relative, scheme-less, `mailto:`, `https:` and other urls stay exactly as written. Callbacks (`click A callback`, `click A call fn(args) "tooltip"`) are accepted for compatibility and ignored, since a static SVG runs no script, but their tooltip still applies. As in mermaid, a link only lands on a node that already exists: an unknown id, a subgraph or edge id, or a node declared further down is ignored without creating a node, while a tooltip reaches a node declared later. Keywords are case-sensitive (`Click A` is a node), and flowmaid is lenient about extra spaces (`click A  href  "u"`), which mermaid rejects. Scene consumers get the link and tooltip on `SceneNode::link`.
 
-Custom colors use mermaid's styling syntax: `style A fill:#f9f,stroke:#333,stroke-width:4px,color:#fff`, reusable classes via `classDef hot fill:#ffe3e3,stroke:#e03131` + `class A,B hot` or the inline shorthand `A:::hot`, and `classDef default …` styles every node, as in mermaid (a node's own classes and `style` lines win per property; a borderless `text` shape takes only its colour). Supported properties: `fill`, `stroke`, `stroke-width` (0 to 1000px; a cylinder's lid, a subroutine's bars and a final state's ring take it too), `color` (label text); unknown properties are ignored, and so is a bare item after a property (mermaid splits values on every comma, so `stroke-dasharray: 9,5` leaves a stray `5`); a statement starting with a bare item is an error. Unstyled nodes fall back to a semantic theme — shape determines color (stadium green, diamond amber, circle violet, ...; see the `style` module) — and ER entities cycle through a stable accent palette.
+Custom colors use mermaid's styling syntax: `style A fill:#f9f,stroke:#333,stroke-width:4px,color:#fff`, reusable classes via `classDef hot fill:#ffe3e3,stroke:#e03131` + `class A,B hot` or the inline shorthand `A:::hot`, and `classDef default …` styles every node, as in mermaid (a node's own classes and `style` lines win per property; a borderless `text` shape takes only its colour). Supported properties: `fill`, `stroke`, `stroke-width` (0 to 1000px; a cylinder's lid, a subroutine's bars and a final state's ring take it too), `color` (label text); unknown properties are ignored, and so is a bare item after a property (mermaid splits values on every comma, so `stroke-dasharray: 9,5` leaves a stray `5`); a statement starting with a bare item is an error. Unstyled nodes fall back to a semantic theme — shape determines color (stadium green, diamond amber, circle violet, ...; see the `style` module) — and ER entities cycle through a stable accent palette; a [theme](#themes) paints them in mermaid's colours instead.
 
 Complete examples live in `examples/` — `demo.mmd` and `lr.mmd` for the basics, `advanced.mmd` for everything at once (nested subgraphs, all shapes and link types, `<br/>`, custom colors), plus one showcase per diagram type (`er`, `class`, `sequence`, `pie`, `state`).
 
@@ -236,7 +265,7 @@ pie showData
     "Iron" : 6
 ```
 
-Supported subset: all header forms (`pie`, `pie showData`, `pie title …`, `pie showData title …`), a standalone `title …` line, and `"Quoted Label" : value` data rows with non-negative numbers. `showData` appends the raw value to each legend entry (`Calcium [42.96]`). Every slice of at least 1% gets a percentage label, as in mermaid: inside its wedge when the text fits there, otherwise just outside the rim on a short leader line (thinner slices keep their legend row). Percentages round halves up like mermaid's `toFixed(0)`. Zero-value slices are legend-only, a single 100% slice renders as a full circle, and an all-zero total draws an empty outline instead of NaN geometry. A duplicate label keeps one slice — the last value wins. Colors come from the same stable accent palette as ER/class diagrams, extended to sixteen colours before they repeat. `accTitle` / `accDescr` become the SVG's accessible name and `<desc>` (the value stops at `%%`, as in mermaid's langium grammar); without `accTitle`, the chart's title is the accessible name. Not supported: config/theme directives (`%%{init: …}%%`). See `examples/pie.mmd`.
+Supported subset: all header forms (`pie`, `pie showData`, `pie title …`, `pie showData title …`), a standalone `title …` line, and `"Quoted Label" : value` data rows with non-negative numbers. `showData` appends the raw value to each legend entry (`Calcium [42.96]`). Every slice of at least 1% gets a percentage label, as in mermaid: inside its wedge when the text fits there, otherwise just outside the rim on a short leader line (thinner slices keep their legend row). Percentages round halves up like mermaid's `toFixed(0)`. Zero-value slices are legend-only, a single 100% slice renders as a full circle, and an all-zero total draws an empty outline instead of NaN geometry. A duplicate label keeps one slice — the last value wins. Colors come from the same stable accent palette as ER/class diagrams, extended to sixteen colours before they repeat. `accTitle` / `accDescr` become the SVG's accessible name and `<desc>` (the value stops at `%%`, as in mermaid's langium grammar); without `accTitle`, the chart's title is the accessible name. Slices keep their colours in every [theme](#themes); `%%{init}%%` config other than the theme is ignored. See `examples/pie.mmd`.
 
 ## State diagrams
 

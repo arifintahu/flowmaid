@@ -2,6 +2,7 @@
 //!
 //! Pipeline: .mmd text  ->  parser  ->  layout  ->  SVG.
 
+use flowmaid::style::Theme;
 use flowmaid::{fold, parser, render, Document, SvgOptions};
 use std::env;
 use std::fs;
@@ -23,6 +24,9 @@ fn print_help() {
          \x20 --advance             render advance / swimlane JSON input\n\
          \x20 --advance-text        render advance / swimlane text DSL input\n\
          \x20 --transparent         omit the white background rect (transparent SVG)\n\
+         \x20 --theme <name>        colour theme: flowmaid (default), default (mermaid's),\n\
+         \x20                       neutral, dark or forest; beats a theme the source\n\
+         \x20                       names (%%{{init}}%% or frontmatter)\n\
          \x20 -h, --help            show this help\n\n\
          Syntax example:\n\
          \x20 flowchart TD\n\
@@ -74,6 +78,26 @@ fn main() {
             }
             "--transparent" => {
                 svg_opts.transparent = true;
+            }
+            "--theme" => {
+                i += 1;
+                let Some(name) = args.get(i) else {
+                    eprintln!("option --theme requires a theme name, e.g. --theme neutral");
+                    process::exit(2);
+                };
+                // An unknown name paints the default theme, as an
+                // unknown name in a diagram's own directive does
+                // (mermaid's rule) — with a warning, since here it is
+                // most likely a typo.
+                svg_opts.theme = Some(Theme::from_name(name).unwrap_or_else(|| {
+                    let known: Vec<&str> = Theme::ALL.iter().map(|t| t.name()).collect();
+                    eprintln!(
+                        "unknown theme '{}', using the default (known: {})",
+                        name,
+                        known.join(", ")
+                    );
+                    Theme::default()
+                }));
             }
             "-h" | "--help" => {
                 print_help();
@@ -153,6 +177,8 @@ fn main() {
             process::exit(1);
         }
     };
+    // The theme the source names applies unless --theme is given.
+    let svg_opts = svg_opts.with_source_theme(&source);
     let svg = match &doc {
         Document::Flowchart(g) if g.nodes.is_empty() => {
             eprintln!("empty diagram: no nodes defined");
