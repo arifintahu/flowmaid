@@ -628,6 +628,24 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Fixed
 
+- **Edge ends touch every shape's outline** (report M6, P0 #9). The edge
+  stages met a parallelogram, a trapezoid (drawn as one), a hexagon and a
+  cylinder as their bounding box, so ends floated 7–10 px beside a
+  slanted flank or a hexagon's point and up to 4–9 px beside a drum's
+  shoulder; a self-loop's ends sat on the box side of any shape, a
+  diamond's included. A final stage now puts every end on the outline as
+  painted, along its stroke's final run (a run leaving at more than 60°
+  to its side goes straight in from it instead; an end on a drum's
+  shoulder goes to the shoulder's nearest point), in `scene()`, `route()`
+  and every `route_partial()` drag frame, so hosts painting the scene's
+  geometry get it too. Ends spread over a hexagon's or a parallelogram's
+  top or bottom keep to its straight run, off the slants, and a hexagon's
+  point spreads its ends like a diamond's corner. `Scene::node_at` /
+  `hit_test` now pick hexagons, parallelograms, cylinders, stadiums and
+  rounded boxes by the outline those ends sit on (their empty box
+  corners are no longer the node); plain boxes still pick by their box.
+  `quality::Metrics::end_gaps` counts self-loop ends too. The advance
+  writer is unchanged.
 - **A `%%{ … }%%` directive written over several lines parses.** Its inner
   lines were read as diagram statements — `%%{\n  init: {\n    "theme":
   "dark"\n  }\n}%%` failed every diagram type with "expected a node id".

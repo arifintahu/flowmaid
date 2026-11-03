@@ -110,7 +110,7 @@ pub(crate) fn port_span(shape: Shape, p: &Placed) -> (f64, f64) {
         // (advanced's `fail` lane: its tip past Developer's bottom-right
         // vertex, its tail off Security scan's top-right one).
         Shape::Hexagon | Shape::Parallelogram | Shape::ParallelogramAlt => {
-            p.bsize / 2.0 - 12.0f64.max(crate::scene::SLANT_MAX.min(p.bsize / 4.0) + PORT_INSET)
+            crate::scene::slant_flat_half(p.bsize)
         }
         _ => p.bsize / 2.0 - 12.0,
     }

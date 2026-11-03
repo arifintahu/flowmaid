@@ -310,8 +310,21 @@ pub(crate) fn finish_fixed(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool]
         *f = x;
     }
     let mut moved = vec![false; sc.edges.len()];
+    let dbg = |sc: &Scene, w: &str| {
+        if let Ok(v) = std::env::var("FMDBG") {
+            let (a, b) = v.split_once(',').unwrap();
+            for e in &sc.edges {
+                if e.from == a && e.to == b {
+                    eprintln!("{w} {:?} {:?}", e.waypoints, e.bezier);
+                }
+            }
+        }
+    };
+    dbg(sc, "in");
     crate::ports::assign(g, sc, &cx, mode, &mut moved);
+    dbg(sc, "assign");
     crate::router::repair(g, sc, &cx, mode, &mut moved);
+    dbg(sc, "repair");
     // A rerouted end may have switched to another side of its node and
     // landed on a port another edge already holds: space those groups
     // again. Groups the router left alone are already spaced and stay
@@ -320,9 +333,13 @@ pub(crate) fn finish_fixed(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool]
     // After the ports are spaced again, so the channel nudge sees (and
     // keeps) the final ends; in the static scene it ends by putting each
     // side's ends in the order their paths now head (G9).
+    dbg(sc, "respace");
     crate::router::nudge(g, sc, &cx, mode, &mut moved);
+    dbg(sc, "nudge");
     glyph_stubs(sc, &cx, &mut moved);
-    cap_ends(sc, &cx);
+    dbg(sc, "stubs");
+    snap_ends(sc, &cx);
+    dbg(sc, "snap");
     let budget = match mode {
         Mode::Static => crate::labels::LABEL_STATIC_WORK,
         Mode::Routed => crate::labels::LABEL_ROUTE_WORK,
@@ -381,7 +398,13 @@ fn glyph_stubs(sc: &mut Scene, cx: &Ctx, moved: &mut [bool]) {
             }
             let n = wps.len();
             let p = wps[n - 1];
-            let out = normal(side_of(end_rect(sc, end), p));
+            // A drag's kept edge may end on its node's outline, inside
+            // the box (`snap_ends`): the outline decides its side.
+            let rect = end_rect(sc, end);
+            let out = normal(match end {
+                EndRef::Node(v) => crate::ports::outline_side(sc.nodes[v].shape, rect, p),
+                EndRef::Frame(_) => side_of(rect, p),
+            });
             // How far out along the normal, and how far off its line.
             let along = |q: (f64, f64)| (q.0 - p.0) * out.0 + (q.1 - p.1) * out.1;
             let off = |q: (f64, f64)| ((q.0 - p.0) * out.1 - (q.1 - p.1) * out.0).abs();
@@ -429,94 +452,148 @@ fn glyph_stubs(sc: &mut Scene, cx: &Ctx, moved: &mut [bool]) {
     }
 }
 
-/// Put every end on a cylinder onto its outline as painted (report Q7,
-/// §2.5). The stages above meet a cylinder as its box: an end off the
-/// middle of its top floats above the lid's back arc, one under its
-/// bottom hangs below the bottom arc, by `ry (1 − √(1 − (dx / rx)²))`,
-/// and one on a flank within a cap's height of the top or bottom floats
-/// beside the arc where the side curves in — up to 4 px under the old
-/// fixed 8 px lid, more under a wide drum's deeper one
-/// ([`crate::scene::cylinder_ry`]). Such an end moves onto the arc (a
-/// cap end along its side's normal, a flank end to the arc's nearest
-/// point), the stroke coming in with it: a waypoint path's
-/// end point (the stub into the side stays straight, [`glyph_stubs`]
-/// runs first), a single curve's end along its tangent, and the chord's
-/// end in `bezier`. Geometry, not paint, so hosts drawing the
-/// scene, picking and the SVG agree, in `scene()`, `route()` and every
-/// drag frame alike. Idempotent: an end on the arc is off the box side
-/// (or, at the arc's middle, on both).
-fn cap_ends(sc: &mut Scene, cx: &Ctx) {
+/// Put every end on a node onto its outline as painted (report M6, §2.5,
+/// P0 #9; Q7 for cylinders). The stages above meet most shapes as their
+/// box: an end on a parallelogram's flank floats beside the slant (7 px
+/// at mid height), one on a hexagon's point beside the V, one off the
+/// middle of a cylinder's top above the lid's back arc and one under its
+/// bottom below the bottom arc, one near a rounded box's or a stadium's
+/// corner off the arc there; a self-loop's ends sit on the box's side.
+/// Each such end moves along its stroke's final run (the waypoint path's
+/// last leg, a single curve's end tangent) onto the outline
+/// ([`crate::scene::outline_along`]), so the run keeps its line and its
+/// glyph its heading: a waypoint path's end point (the stub into the
+/// side stays straight, [`glyph_stubs`] runs first), a single curve's
+/// end (its control stays, so the curve keeps its course and only its
+/// end lengthens or shortens; a control on the end itself goes with
+/// it), and the chord's end in `bezier`. Geometry, not paint, so hosts
+/// drawing the scene, picking and the SVG agree, in `scene()`, `route()`
+/// and every drag frame alike — and the outline is the one
+/// [`crate::scene::Scene::node_at`] picks by. Ends on frames and plain
+/// boxes, and ends off their node's box by more than [`SNAP_REACH`],
+/// stay. Idempotent: an end on the outline stays put.
+fn snap_ends(sc: &mut Scene, cx: &Ctx) {
     for i in 0..sc.edges.len() {
-        let (Some((from, to)), true) = (cx.ends[i], cx.drawn[i]) else {
+        let Some((from, to)) = cx.ends[i] else {
             continue;
         };
+        // Self-loops too: the stages leave them alone, but their ends
+        // sit on the box side like any other.
+        if !cx.drawn[i] && !(from == to && edge_drawn(&sc.edges[i])) {
+            continue;
+        }
         for (end, at_start) in [(from, true), (to, false)] {
             let EndRef::Node(v) = end else { continue };
-            let n = &sc.nodes[v];
-            if n.shape != crate::model::Shape::Cylinder {
+            let Some(q) = snapped_end(&sc.nodes[v], &sc.edges[i], at_start) else {
                 continue;
-            }
-            let e = &sc.edges[i];
-            let p = match (e.waypoints.is_empty(), at_start) {
-                (false, true) => e.waypoints[0],
-                (false, false) => e.waypoints[e.waypoints.len() - 1],
-                (true, true) => e.bezier[0],
-                (true, false) => e.bezier[3],
             };
-            let Some(d) = cap_shift(n, p) else { continue };
             let e = &mut sc.edges[i];
-            let shift = |q: &mut Pt| *q = (q.0 + d.0, q.1 + d.1);
             if e.waypoints.is_empty() {
-                // The end slides along its tangent (the side's normal),
-                // so its control stays: the curve keeps its course, only
-                // its end lengthens or shortens. A control on the end
-                // itself (a straight chord) goes with it.
                 let (a, b) = if at_start { (0, 1) } else { (3, 2) };
                 if e.bezier[b] == e.bezier[a] {
-                    shift(&mut e.bezier[b]);
+                    e.bezier[b] = q;
                 }
-                shift(&mut e.bezier[a]);
+                e.bezier[a] = q;
             } else {
                 let k = if at_start { 0 } else { e.waypoints.len() - 1 };
-                shift(&mut e.waypoints[k]);
+                e.waypoints[k] = q;
                 let a = if at_start { 0 } else { 3 };
-                e.bezier[a] = e.waypoints[k];
+                e.bezier[a] = q;
             }
             // Not `moved`: the end slides a few px along its own line,
             // which leaves the label stage nothing to re-place (and a
-            // drag frame no label search per drum end).
+            // drag frame no label search per end).
         }
     }
 }
 
-/// How far (px) end point `p` on cylinder `n`'s box moves to reach the
-/// drum's outline: down (or up) onto the lid (or the bottom arc) from
-/// the box top (or bottom), onto the nearest point of the arc from a
-/// flank within a cap's height of the top or bottom. `None` for an end
-/// off the box ([`CAP_ON_SIDE`]), on a flank's straight run, or on the
-/// outline already.
-fn cap_shift(n: &crate::scene::SceneNode, p: Pt) -> Option<Pt> {
-    let (rx, ry) = (n.w / 2.0, crate::scene::cylinder_ry(n.w, n.h));
-    if !(rx > 0.0 && ry > 0.0) {
+/// Where [`snap_ends`] puts one end of edge `e` on node `n`: on the
+/// outline along the stroke's final run, `None` where it stays. The run
+/// is the waypoint path's last leg or the cubic's end tangent — what the
+/// painter's spline or cubic leaves the end along; a mermaid `curve`
+/// (step, bump, natural, …) leaves it along its own heading, which
+/// [`crate::scene::edge_end_tangent`] reads off the painted path.
+fn snapped_end(
+    n: &crate::scene::SceneNode,
+    e: &crate::scene::SceneEdge,
+    at_start: bool,
+) -> Option<Pt> {
+    let pts: &[Pt] = if e.waypoints.is_empty() {
+        &e.bezier
+    } else {
+        &e.waypoints
+    };
+    let p = if at_start { pts[0] } else { pts[pts.len() - 1] };
+    // Only an end on or in its node's box: one the builders left off it
+    // is not this stage's to pull in. Within the box an end beside the
+    // shape (in a slanted shape's empty corner) is followed in along its
+    // run, and one sunk into it comes out by at most
+    // `scene::OUTLINE_SINK` (a router path's end can stop a little past
+    // a lid, inside the drum).
+    let (gx, gy) = ((p.0 - n.x).abs() - n.w / 2.0, (p.1 - n.y).abs() - n.h / 2.0);
+    if gx.max(0.0).hypot(gy.max(0.0)) > SNAP_REACH {
         return None;
     }
-    let (dx, (top, bottom)) = (p.0 - n.x, (n.y - n.h / 2.0, n.y + n.h / 2.0));
-    // Inset of an ellipse quadrant `k` (0 at its axis, 1 at its rim)
-    // across its radius `r`.
-    let inset = |k: f64, r: f64| r * (1.0 - (1.0 - k * k).max(0.0).sqrt());
-    let d: Pt = if dx.abs() < rx && (p.1 - top).abs() <= CAP_ON_SIDE {
-        (0.0, top + inset(dx / rx, ry) - p.1)
-    } else if dx.abs() < rx && (p.1 - bottom).abs() <= CAP_ON_SIDE {
-        (0.0, bottom - inset(dx / rx, ry) - p.1)
+    // The run out of the end; `(0, 0)` for a curve without length (two
+    // nodes whose boxes touch), which goes in from its box side.
+    let out = if e.meta.curve.is_some() {
+        // The heading INTO the end at the target, out of it at the
+        // source: the way out of the node is its reverse at the target.
+        let (_, h) = crate::scene::edge_end_tangent(e, at_start);
+        if at_start {
+            h
+        } else {
+            (-h.0, -h.1)
+        }
     } else {
-        return None;
+        let apart = |q: &&Pt| (q.0 - p.0).hypot(q.1 - p.1) > 1e-9;
+        let q = if at_start {
+            pts.iter().find(apart)
+        } else {
+            pts.iter().rev().find(apart)
+        };
+        q.map_or((0.0, 0.0), |q| {
+            let l = (q.0 - p.0).hypot(q.1 - p.1);
+            ((q.0 - p.0) / l, (q.1 - p.1) / l)
+        })
     };
-    (d.0.abs() + d.1.abs() > 1e-9).then_some(d)
+    // A drum's shoulder meets a run along its flank's normal side-on:
+    // the end goes to the nearest point of it instead, keeping its place
+    // among the flank's ends.
+    if n.shape == crate::model::Shape::Cylinder {
+        if let Some(q) = crate::scene::cylinder_shoulder_point(n, p) {
+            return ((q.0 - p.0).hypot(q.1 - p.1) > 1e-6).then_some(q);
+        }
+    }
+    let rect = (
+        n.x - n.w / 2.0,
+        n.y - n.h / 2.0,
+        n.x + n.w / 2.0,
+        n.y + n.h / 2.0,
+    );
+    let side = normal(crate::ports::outline_side(n.shape, rect, p));
+    // A run that leaves its side at a slant past [`SNAP_GRAZE`] — a
+    // single curve setting off sideways from a lid, along the arc — would
+    // carry the end far along the outline: it goes straight in from its
+    // box side instead, as does one whose run misses the shape (a router
+    // leg leaving a lid's corner across the drum's shoulder).
+    let run = if out.0 * side.0 + out.1 * side.1 >= SNAP_GRAZE {
+        out
+    } else {
+        side
+    };
+    crate::scene::outline_along(n, p, run).or_else(|| crate::scene::outline_along(n, p, side))
 }
 
-/// How near (px) a cylinder's box side an end must lie for [`cap_ends`]
-/// to put it on the outline: the stages put an end exactly on the side.
-const CAP_ON_SIDE: f64 = 0.5;
+/// Least cosine between an end's run and its side's outward normal for
+/// [`snap_ends`] to follow the run onto the outline (60°): a flatter run
+/// meets a shallow outline (a lid's arc) nearly along it.
+const SNAP_GRAZE: f64 = 0.5;
+
+/// How far (px) outside its node's box an end may lie for [`snap_ends`]
+/// to put it on the outline: the stages put an end exactly on the box
+/// side (or on the outline already).
+const SNAP_REACH: f64 = 0.5;
 
 /// Whether edge `i` drawn through the stubbed waypoints `new`
 /// ([`glyph_stubs`]) stays as clear of the scene as it was: where its

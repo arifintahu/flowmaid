@@ -242,9 +242,12 @@ impl Scene {
 
     /// Index of the topmost node whose shape contains `(x, y)`. Nodes
     /// are tested back-to-front (later-drawn wins, as painted), and the
-    /// test is shape-precise for diamonds and (double) circles — their
-    /// bounding box would over-select the empty corners — and the
-    /// bounding rectangle for every other shape.
+    /// test is shape-precise for every shape whose outline leaves its
+    /// box's corners empty — diamonds, (double) circles, hexagons,
+    /// parallelograms, cylinders, stadiums and rounded boxes, as the
+    /// flowchart painter draws them, on whose outline every edge end
+    /// sits — and the bounding rectangle for plain boxes (`Rect`,
+    /// `Subroutine`, a fork bar).
     pub fn node_at(&self, x: f64, y: f64) -> Option<usize> {
         self.nodes.iter().rposition(|n| node_contains(n, x, y))
     }
@@ -366,13 +369,37 @@ impl Scene {
     }
 }
 
-/// Whether a node's SHAPE (not just its bounding box) contains a point.
+/// Whether a node's SHAPE (not just its bounding box) contains a point:
+/// the region inside the outline `to_svg` paints ([`node_outline`],
+/// exactly rather than flattened), which is also where
+/// [`crate::edgepass`] puts every edge end ([`outline_along`]). Plain
+/// boxes (`Rect`, `Subroutine`, a fork bar) are their bounding
+/// rectangle: other diagrams' painters draw their `Rect` nodes with
+/// corners of their own (a git commit's square, a class card), and a
+/// 3 px corner is nothing to pick round.
 fn node_contains(n: &SceneNode, x: f64, y: f64) -> bool {
     let (hw, hh) = (n.w / 2.0, n.h / 2.0);
     if hw <= 0.0 || hh <= 0.0 {
         return false;
     }
     let (dx, dy) = ((x - n.x).abs(), (y - n.y).abs());
+    let circle = matches!(
+        n.shape,
+        Shape::Circle | Shape::DoubleCircle | Shape::StateStart | Shape::StateEnd
+    );
+    // A circle is a disc of radius w/2 whatever its height; every other
+    // outline lies within its box.
+    if !circle && (dx > hw || dy > hh) {
+        return false;
+    }
+    // Inside a box whose corners are elliptic arcs of radii (rx, ry),
+    // each clamped to its half extent as an SVG `<rect rx>` draws it.
+    let rounded = |rx: f64| {
+        let (rx, ry) = (rx.min(hw), rx.min(hh));
+        let (ox, oy) = (dx - (hw - rx), dy - (hh - ry));
+        ox <= 0.0 || oy <= 0.0 || (ox / rx).powi(2) + (oy / ry).powi(2) <= 1.0
+    };
+    let k = SLANT_MAX.min(n.w / 4.0);
     match n.shape {
         // Rhombus: |dx|/hw + |dy|/hh <= 1.
         Shape::Diamond => dx / hw + dy / hh <= 1.0,
@@ -382,8 +409,34 @@ fn node_contains(n: &SceneNode, x: f64, y: f64) -> bool {
         Shape::Circle | Shape::DoubleCircle | Shape::StateStart | Shape::StateEnd => {
             dx * dx + dy * dy <= hw * hw
         }
-        // Everything else: bounding rectangle.
-        _ => dx <= hw && dy <= hh,
+        Shape::Rounded => rounded(ROUNDED_RX),
+        Shape::Stadium => rounded(hh),
+        // The side points sit `k` in from the box at the top and bottom
+        // and on it at mid height.
+        Shape::Hexagon => dx <= hw - k * dy / hh,
+        // Each flank runs `k` across over the full height: `/ /` has
+        // its top edge `k` in from the left and its bottom edge `k` in
+        // from the right, `\ \` the mirror image.
+        Shape::Parallelogram | Shape::ParallelogramAlt => {
+            let (sx, sy) = (x - n.x, y - n.y);
+            // How far in from the left (and from the right) the outline
+            // is at this height: `k` at one edge, 0 at the other.
+            let down = (sy + hh) / (2.0 * hh);
+            let (left, right) = if n.shape == Shape::Parallelogram {
+                (k * (1.0 - down), k * down)
+            } else {
+                (k * down, k * (1.0 - down))
+            };
+            sx >= -hw + left && sx <= hw - right
+        }
+        // The lid's back arc above, the bottom arc below, both of the
+        // cap ellipse (`rx` = the half width) round the cap centres.
+        Shape::Cylinder => {
+            let ry = cylinder_ry(n.w, n.h);
+            let over = dy - (hh - ry);
+            over <= 0.0 || ry <= 0.0 || (dx / hw).powi(2) + (over / ry).powi(2) <= 1.0
+        }
+        Shape::Rect | Shape::Subroutine | Shape::ForkBar => true,
     }
 }
 
@@ -5194,6 +5247,43 @@ pub(crate) const SLANT_MAX: f64 = 14.0;
 pub(crate) fn cylinder_ry(w: f64, h: f64) -> f64 {
     crate::layout::cylinder_cap_ry(w).min(h / 4.0)
 }
+/// The point of cylinder `n`'s shoulder nearest `p`, for an end on its
+/// flank past the straight run (within a cap's height of its top or
+/// bottom): on the cap ellipse's quarter there, which curves in so flatly
+/// that a run along the flank's normal meets it side-on, far in (a hub's
+/// crowded flank: 19 px along a horizontal run, landing among the lid's
+/// own ends). `None` for an end on the straight run or off the flank.
+/// Golden-section search on the quarter's angle, exact to far below a
+/// pixel (the distance to an outside point is unimodal along it).
+pub(crate) fn cylinder_shoulder_point(n: &SceneNode, p: (f64, f64)) -> Option<(f64, f64)> {
+    let (rx, ry) = (n.w / 2.0, cylinder_ry(n.w, n.h));
+    let (dx, dy) = (p.0 - n.x, p.1 - n.y);
+    let run = n.h / 2.0 - ry;
+    if !(rx > 0.0 && ry > 0.0) || dy.abs() <= run || dx.abs() < rx - 0.5 {
+        return None;
+    }
+    // The quarter facing `p`: centre (x, cap centre), angle 0 at the
+    // flank, PI/2 at the lid's (or bottom's) middle.
+    let (sx, sy) = (dx.signum(), dy.signum());
+    let (ox, oy) = (n.x, n.y + sy * run);
+    let at = |a: f64| (ox + sx * rx * a.cos(), oy + sy * ry * a.sin());
+    let d2 = |a: f64| {
+        let q = at(a);
+        (q.0 - p.0).powi(2) + (q.1 - p.1).powi(2)
+    };
+    let g = (5f64.sqrt() - 1.0) / 2.0;
+    let (mut a, mut b) = (0.0, std::f64::consts::FRAC_PI_2);
+    while b - a > 1e-12 {
+        let (c, d) = (b - g * (b - a), a + g * (b - a));
+        if d2(c) <= d2(d) {
+            b = d;
+        } else {
+            a = c;
+        }
+    }
+    Some(at((a + b) / 2.0))
+}
+
 /// How far (in cap radii) below the box centre a cylinder's label sits:
 /// in the middle of the body under the lid, where mermaid sets it, not
 /// up against the lid's front rim (the box centre is a cap radius above
@@ -5275,6 +5365,92 @@ pub(crate) fn node_outline(n: &SceneNode) -> Vec<(f64, f64)> {
         }
     }
 }
+
+/// Step (px) [`outline_along`] marches along its line to find a point
+/// on the other side of the outline: finer than any sliver of a shape a
+/// line could cross between two steps unseen.
+const OUTLINE_MARCH: f64 = 0.5;
+/// How close (px) [`outline_along`] brackets the outline: far below what
+/// any writer prints, so the end it returns is the outline's point.
+const OUTLINE_EXACT: f64 = 1e-9;
+
+/// Where the line through `p` along `out` (a unit vector pointing out of
+/// node `n`, back along the stroke from its end at `p`) crosses the
+/// outline `to_svg` paints, on the side the stroke comes in from: the
+/// end point that keeps the stroke's final run on its line while it
+/// touches the outline (report §2.5: the stages meet a slanted or round
+/// shape as its box, so an end floated beside a parallelogram's flank,
+/// a hexagon's point or a cylinder's lid). The outline is
+/// [`node_contains`]'s, so the end is on the border picking sees.
+/// From outside the line is followed in to where it meets the shape;
+/// from inside (an end sunk into it) out by at most [`OUTLINE_SINK`],
+/// so a run that heads back across the shape — a spilled end's leg
+/// leaving a lid over the drum's shoulder — never carries its end
+/// through the node to the far side. `None` when `p` already lies on
+/// the outline, for a plain box (its outline is its box, where the
+/// stages put the ends), or when the line misses the shape. Exact to
+/// [`OUTLINE_EXACT`].
+pub(crate) fn outline_along(n: &SceneNode, p: (f64, f64), out: (f64, f64)) -> Option<(f64, f64)> {
+    if matches!(n.shape, Shape::Rect | Shape::Subroutine | Shape::ForkBar) {
+        return None;
+    }
+    let contains = |q: (f64, f64)| node_contains(n, q.0, q.1);
+    // `s` px into the node from `p` along the line.
+    let at = |s: f64| (p.0 - s * out.0, p.1 - s * out.1);
+    let inside = |s: f64| contains(at(s));
+    // A bracket (outside, inside) of the crossing, marching from `p`:
+    // outwards from a point inside, inwards from one outside.
+    let (mut lo, mut hi) = if inside(0.0) {
+        let e = OUTLINE_EXACT;
+        let near = [(e, 0.0), (-e, 0.0), (0.0, e), (0.0, -e)];
+        if near.iter().any(|d| !contains((p.0 + d.0, p.1 + d.1))) {
+            return None;
+        }
+        let mut s = 0.0;
+        loop {
+            let next = (s - OUTLINE_MARCH).max(-OUTLINE_SINK);
+            if !inside(next) {
+                break (next, s);
+            }
+            if next <= -OUTLINE_SINK {
+                return None;
+            }
+            s = next;
+        }
+    } else {
+        let reach = n.w.max(0.0) + n.h.max(0.0) + OUTLINE_MARCH;
+        let mut s = 0.0;
+        loop {
+            let next = s + OUTLINE_MARCH;
+            if inside(next) {
+                break (s, next);
+            }
+            if next > reach {
+                return None;
+            }
+            s = next;
+        }
+    };
+    while hi - lo > OUTLINE_EXACT {
+        let mid = (lo + hi) / 2.0;
+        if inside(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let q = at(hi);
+    ((q.0 - p.0).hypot(q.1 - p.1) > OUTLINE_SNAP_EPS).then_some(q)
+}
+
+/// Most (px) [`outline_along`] carries an end sunk into its node back out
+/// to the outline: the stages leave an end on its box, so one inside the
+/// shape by more is not a sunk end but a run heading back in.
+const OUTLINE_SINK: f64 = 1.0;
+
+/// An end [`outline_along`] would move less than this (px) is on the
+/// outline already and keeps its exact bytes.
+const OUTLINE_SNAP_EPS: f64 = 1e-6;
 
 /// A marker variant a `linkStyle`d edge end needs: the glyph in the
 /// edge's stroke colour, and an arrowhead set further ahead of a stroke
@@ -6991,10 +7167,23 @@ fn toward(me: (&Placed, Shape, bool), far: (&Placed, Shape, bool)) -> f64 {
 pub(crate) fn port_lean(shape: Shape, size: (f64, f64), toward: f64, off: f64) -> f64 {
     let flat = match shape {
         Shape::Stadium => size.0 / 2.0 - size.1 / 2.0 - 4.0,
+        Shape::Hexagon | Shape::Parallelogram | Shape::ParallelogramAlt => slant_flat_half(size.0),
         _ => size.0 / 2.0 - 12.0,
     }
     .max(0.0);
     (toward * 0.35 + off).clamp(-flat, flat)
+}
+
+/// How far either way from its middle an end may lean along the side of
+/// a hexagon or a parallelogram `bsize` px across that faces along the
+/// flow: the straight run between the slants (a slant at most
+/// [`SLANT_MAX`] in from each corner), a port inset short of them. An
+/// end leaned further lands on the slant, its head half over the
+/// outline's corner (advanced's `fail` lane: its tip past Developer's
+/// bottom-right vertex). Shared by [`port_lean`] and
+/// [`crate::lanes::port_span`]; may be negative on a narrow node.
+pub(crate) fn slant_flat_half(bsize: f64) -> f64 {
+    bsize / 2.0 - 12.0f64.max(SLANT_MAX.min(bsize / 4.0) + crate::ports::PORT_INSET)
 }
 
 /// Edge exit/entry point on a node's border.
@@ -9297,6 +9486,106 @@ mod tests {
     }
 
     #[test]
+    fn picking_takes_the_painted_outline_of_every_shape() {
+        // Report M6: what `node_at` picks is the outline the painter draws
+        // and the edge ends sit on — a box corner a hexagon, a
+        // parallelogram, a drum, a pill or a rounded box leaves empty is
+        // not the node; plain boxes stay their box.
+        let sc = scene(
+            &parse(
+                "flowchart TD\nA[rect]-->B(rounded)-->C([stadium])-->F[(cylinder)]\n\
+                 F-->H{{hexagon}}-->I[/lean right/]-->J[\\lean left\\]-->G[[sub]]",
+            )
+            .unwrap(),
+        );
+        for n in &sc.nodes {
+            assert!(node_contains(n, n.x, n.y), "{} centre", n.id);
+            let o = node_outline(n);
+            // Each painted vertex is inside up to rounding; a point a px
+            // beyond it, away from the centre, is outside.
+            for &(px, py) in &o {
+                let (dx, dy) = (px - n.x, py - n.y);
+                let l = dx.hypot(dy);
+                let at = |s: f64| (n.x + dx * (1.0 + s / l), n.y + dy * (1.0 + s / l));
+                let inner = at(-0.01);
+                assert!(node_contains(n, inner.0, inner.1), "{} at {px},{py}", n.id);
+                let outer = at(1.0);
+                let boxy = matches!(n.shape, Shape::Rect | Shape::Subroutine);
+                assert!(
+                    boxy || !node_contains(n, outer.0, outer.1),
+                    "{} past {px},{py}",
+                    n.id
+                );
+            }
+            // Box corners: all four a plain box's, the two a
+            // parallelogram's slants keep, none of the others'.
+            let (hw, hh) = (n.w / 2.0 - 0.5, n.h / 2.0 - 0.5);
+            let inside = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+                .iter()
+                .filter(|c| node_contains(n, n.x + c.0, n.y + c.1))
+                .count();
+            let want = match n.shape {
+                Shape::Rect | Shape::Subroutine => 4,
+                Shape::Parallelogram | Shape::ParallelogramAlt => 2,
+                _ => 0,
+            };
+            assert_eq!(inside, want, "{} box corners", n.id);
+        }
+    }
+
+    #[test]
+    fn outline_along_puts_an_end_on_the_painted_outline() {
+        let sc = scene(&parse("flowchart LR\nA[/lean/] --> B[(db)] --> C{{hex}}").unwrap());
+        let node = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap().clone();
+        let a = node("A");
+        let (l, r, t) = (a.x - a.w / 2.0, a.x + a.w / 2.0, a.y - a.h / 2.0);
+        let k = SLANT_MAX.min(a.w / 4.0);
+        // `/ /`'s right flank runs from (r, t) to (r - k, b): an end on
+        // the box side at mid height, run leaving to the right, goes in
+        // k/2 along its run.
+        let q = outline_along(&a, (r, a.y), (1.0, 0.0)).expect("moves in");
+        assert!(
+            (q.0 - (r - k / 2.0)).abs() < 1e-6 && (q.1 - a.y).abs() < 1e-9,
+            "{q:?}"
+        );
+        // On the outline already, it stays.
+        assert_eq!(outline_along(&a, q, (1.0, 0.0)), None);
+        assert_eq!(outline_along(&a, (l + k, t), (0.0, -1.0)), None);
+        // An end sunk half a px comes back out; a run heading back across
+        // the shape (leaving a point deep inside) never carries the end
+        // through the node to its far side.
+        let sunk = outline_along(&a, (q.0 - 0.5, q.1), (1.0, 0.0)).expect("comes out");
+        assert!((sunk.0 - q.0).abs() < 1e-6, "{sunk:?}");
+        assert_eq!(outline_along(&a, (a.x, a.y), (1.0, 0.0)), None);
+        // A run that misses the shape leaves the end where it is.
+        assert_eq!(outline_along(&a, (r + 0.2, t - 0.2), (0.0, -1.0)), None);
+        // The drum's lid: an end on the box top, a quarter of the way in,
+        // goes down onto the back arc.
+        let b = node("B");
+        let (rx, ry) = (b.w / 2.0, cylinder_ry(b.w, b.h));
+        let x = b.x + rx / 2.0;
+        let q = outline_along(&b, (x, b.y - b.h / 2.0), (0.0, -1.0)).expect("onto the lid");
+        let want = b.y - b.h / 2.0 + ry * (1.0 - (1.0f64 - 0.25).sqrt());
+        assert!(
+            (q.0 - x).abs() < 1e-9 && (q.1 - want).abs() < 1e-6,
+            "{q:?} vs {want}"
+        );
+        // A plain box is its outline.
+        let mut boxed = a.clone();
+        boxed.shape = Shape::Rect;
+        assert_eq!(outline_along(&boxed, (r, a.y), (1.0, 0.0)), None);
+        // The shoulder's nearest point lies on the cap ellipse, nearer
+        // than the box corner beside it.
+        let p = (b.x + rx, b.y - b.h / 2.0 + ry / 3.0);
+        let s = cylinder_shoulder_point(&b, p).expect("on the shoulder");
+        let cap = (b.y - b.h / 2.0) + ry;
+        let on = ((s.0 - b.x) / rx).powi(2) + ((s.1 - cap) / ry).powi(2);
+        assert!((on - 1.0).abs() < 1e-6, "{s:?} off the ellipse ({on})");
+        assert!((s.0 - p.0).hypot(s.1 - p.1) < ry, "{s:?}");
+        assert_eq!(cylinder_shoulder_point(&b, (b.x + rx, b.y)), None);
+    }
+
+    #[test]
     fn curved_edges_pick_and_bound_what_is_drawn() {
         let g = parse("flowchart TD\n  A e1@--> B\n  e1@{ curve: stepBefore }\n").unwrap();
         let sc = scene(&g);
@@ -10834,8 +11123,11 @@ mod tests {
         moved[ci].1 = draft.y;
         let r = route(&g, &moved);
         let (_, e, draft, _) = link(&r);
+        // On the flank — near its corner, on the rounded corner's arc
+        // (`edgepass::snap_ends`), within 1.5 px of the box side.
         assert!(
-            (e.bezier[0].0 - (draft.x + draft.w / 2.0)).abs() < 0.5,
+            (e.bezier[0].0 - (draft.x + draft.w / 2.0)).abs() < 1.5
+                && (e.bezier[0].1 - draft.y).abs() < draft.h / 2.0,
             "flow side: {e:?}"
         );
         // `note right of S` lands past S's own fan, a transition from S

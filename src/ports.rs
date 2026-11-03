@@ -15,7 +15,7 @@ use crate::layout::LABEL_BOX_H;
 use crate::model::{Graph, Marker, Shape};
 use crate::scene::{
     edge_drawn, edge_polyline, grow_scene, title_head, Bbox, Scene, SceneEdge, GLYPH_PORT_GAP,
-    MARGIN,
+    MARGIN, SLANT_MAX,
 };
 use std::collections::BTreeMap;
 
@@ -73,16 +73,88 @@ enum Profile {
     /// A diamond corner: `n` = centre, `hn`/`ht` = half sizes along the
     /// normal / tangent; `sgn` = the outward direction.
     Diamond { n: f64, hn: f64, ht: f64, sgn: f64 },
+    /// A straight slanted side (a parallelogram's flank): normal
+    /// coordinate `n` at the side's centre, moving `slope` px along the
+    /// normal per px along the tangent; `edge` = the box side's.
+    Line { n: f64, slope: f64, edge: f64 },
+    /// A pointed side (a hexagon's flank): its tip at normal coordinate
+    /// `n` (the side's centre), each half falling back inwards `slope`
+    /// px per px along the tangent; `sgn` = the outward direction.
+    Point { n: f64, slope: f64, sgn: f64 },
+    /// Half an ellipse (a cylinder's lid or bottom arc) round normal
+    /// coordinate `n`, radii `rt` / `rn` along the tangent / normal;
+    /// `sgn` = the outward direction.
+    Arc { n: f64, rt: f64, rn: f64, sgn: f64 },
+    /// A drum's flank: straight at normal coordinate `n` (the box side)
+    /// for `flat` px either way of the side's centre, then the shoulder,
+    /// a quarter of the cap ellipse with radii `rt` / `rn` along the
+    /// tangent / normal; `sgn` = the outward direction.
+    Drum {
+        n: f64,
+        flat: f64,
+        rt: f64,
+        rn: f64,
+        sgn: f64,
+    },
 }
 
 impl Profile {
-    /// Normal coordinate of the border at tangent offset `dt` from the
-    /// side's centre.
+    /// Normal coordinate of the outline at tangent offset `dt` from the
+    /// side's centre, as `scene::to_svg` paints it.
     fn normal_at(self, dt: f64) -> f64 {
         match self {
             Profile::Flat { n } => n,
             Profile::Round { n, r, sgn } => n + sgn * (r * r - dt * dt).max(0.0).sqrt(),
             Profile::Diamond { n, hn, ht, sgn } => n + sgn * hn * (1.0 - dt.abs() / ht).max(0.0),
+            Profile::Line { n, slope, .. } => n + slope * dt,
+            Profile::Point { n, slope, sgn } => n - sgn * slope * dt.abs(),
+            Profile::Arc { n, rt, rn, sgn } => {
+                let k = if rt > 0.0 { dt / rt } else { 0.0 };
+                n + sgn * rn * (1.0 - k * k).max(0.0).sqrt()
+            }
+            Profile::Drum {
+                n,
+                flat,
+                rt,
+                rn,
+                sgn,
+            } => {
+                let over = dt.abs() - flat;
+                if over <= 0.0 || rt <= 0.0 {
+                    n
+                } else {
+                    let k = (over / rt).min(1.0);
+                    n - sgn * rn * (1.0 - (1.0 - k * k).sqrt())
+                }
+            }
+        }
+    }
+
+    /// Normal coordinate an end at tangent offset `dt` is placed at: on
+    /// the outline for the shapes every stage meets as drawn (diamonds,
+    /// circles, a stadium's caps: the router never slides their ports),
+    /// on the box side for a slanted flank, a hexagon's point or a
+    /// drum's arc — the router's stubs and slides run along box sides,
+    /// so an end there must sit on one until the final stage puts it on
+    /// the outline along its stub (`edgepass::snap_ends`).
+    fn placed_at(self, dt: f64) -> f64 {
+        match self {
+            Profile::Point { n, .. } => n,
+            _ => self.straight().unwrap_or_else(|| self.normal_at(dt)),
+        }
+    }
+
+    /// The normal coordinate of a side whose ends are placed along a
+    /// straight box side (a frame's, a box's, a slanted flank's, a drum's
+    /// lid or flank), `None` for a round, a diamond's or a hexagon's
+    /// pointed side: a straight side takes a title chip's shadow and
+    /// lends a crowd of ends its corners.
+    fn straight(self) -> Option<f64> {
+        match self {
+            Profile::Flat { n } | Profile::Drum { n, .. } => Some(n),
+            Profile::Line { edge, .. } => Some(edge),
+            Profile::Arc { n, rn, sgn, .. } => Some(n + sgn * rn),
+            Profile::Round { .. } | Profile::Diamond { .. } | Profile::Point { .. } => None,
         }
     }
 }
@@ -152,29 +224,78 @@ fn heading(dt: f64, dn: f64) -> f64 {
 }
 
 /// The side a point on a node's border belongs to. Diamonds and round
-/// shapes have no flat sides: their quadrant decides.
+/// shapes have no flat sides: their quadrant decides; a slanted or
+/// capped shape's end may sit on its outline, inside the box
+/// ([`outline_side`]).
 fn end_side(sc: &Scene, end: EndRef, p: Pt) -> Side {
     let rect = end_rect(sc, end);
     if let EndRef::Node(v) = end {
         let n = &sc.nodes[v];
-        if is_round(n.shape) || n.shape == Shape::Diamond {
-            let qx = (p.0 - n.x) / (n.w / 2.0).max(1e-9);
-            let qy = (p.1 - n.y) / (n.h / 2.0).max(1e-9);
-            return if qx.abs() > qy.abs() {
-                if qx > 0.0 {
-                    Side::Right
-                } else {
-                    Side::Left
-                }
-            } else if qy > 0.0 {
-                Side::Bottom
-            } else {
-                Side::Top
-            };
+        if !is_round(n.shape) && n.shape != Shape::Diamond {
+            return outline_side(n.shape, rect, p);
         }
+        let qx = (p.0 - n.x) / (n.w / 2.0).max(1e-9);
+        let qy = (p.1 - n.y) / (n.h / 2.0).max(1e-9);
+        return if qx.abs() > qy.abs() {
+            if qx > 0.0 {
+                Side::Right
+            } else {
+                Side::Left
+            }
+        } else if qy > 0.0 {
+            Side::Bottom
+        } else {
+            Side::Top
+        };
     }
     side_of(rect, p)
 }
+
+/// The side of a node of `shape` with box `rect` that end `p` belongs
+/// to: the box side nearest it ([`side_of`]) for an end on the box, as
+/// the stages place every end. On a hexagon, a parallelogram or a
+/// cylinder the final stage then puts it on the outline, inside the box
+/// (`edgepass::snap_ends`), and a drag that keeps the edge
+/// (`route_partial`) hands it back so: a parallelogram's flank end near
+/// its bottom corner lies nearer the box's bottom than its side. For
+/// such an end within the box the side whose outline profile
+/// ([`shape_span`]) passes nearest it decides; on a drum's shoulder
+/// (past a flank's straight run, beyond the span the lid's own ends keep
+/// to) the flank does.
+pub(crate) fn outline_side(shape: Shape, rect: (f64, f64, f64, f64), p: Pt) -> Side {
+    let (x0, y0, x1, y1) = rect;
+    let inside = (p.0 - x0).min(x1 - p.0).min(p.1 - y0).min(y1 - p.1);
+    if inside <= ON_BOX
+        || !matches!(
+            shape,
+            Shape::Hexagon | Shape::Parallelogram | Shape::ParallelogramAlt | Shape::Cylinder
+        )
+    {
+        return side_of(rect, p);
+    }
+    if shape == Shape::Cylinder {
+        let ry = crate::scene::cylinder_ry(x1 - x0, y1 - y0);
+        let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        let (hw, hh) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
+        if (p.1 - cy).abs() > hh - ry && (p.0 - cx).abs() > hw - PORT_INSET {
+            return if p.0 < cx { Side::Left } else { Side::Right };
+        }
+    }
+    let mut best = (Side::Top, f64::INFINITY);
+    for side in [Side::Top, Side::Bottom, Side::Left, Side::Right] {
+        let (_, _, tc, prof) = shape_span(Some(shape), rect, side);
+        let (t, n) = split(side, p);
+        let d = (n - prof.normal_at(t - tc)).abs();
+        if d < best.1 {
+            best = (side, d);
+        }
+    }
+    best.0
+}
+
+/// How far (px) inside its box an end still counts as on it for
+/// [`outline_side`]: the stages put ends exactly on a box side.
+const ON_BOX: f64 = 0.5;
 
 /// Shapes whose border is a circle (see `scene::border`).
 fn is_round(s: Shape) -> bool {
@@ -187,7 +308,21 @@ fn is_round(s: Shape) -> bool {
 /// The usable tangent span `[lo, hi]` of `side` of `end`, its centre
 /// and the border profile along it.
 fn span(sc: &Scene, end: EndRef, side: Side) -> (f64, f64, f64, Profile) {
-    let (x0, y0, x1, y1) = end_rect(sc, end);
+    let shape = match end {
+        EndRef::Node(v) => Some(sc.nodes[v].shape),
+        EndRef::Frame(_) => None,
+    };
+    shape_span(shape, end_rect(sc, end), side)
+}
+
+/// The usable tangent span `[lo, hi]` of `side` of a node of `shape`
+/// (`None`: a frame) with box `(x0, y0, x1, y1)`, its centre and the
+/// outline's profile along it, as `scene::to_svg` paints the outline.
+fn shape_span(
+    shape: Option<Shape>,
+    (x0, y0, x1, y1): (f64, f64, f64, f64),
+    side: Side,
+) -> (f64, f64, f64, Profile) {
     let (t0, t1) = split_range(side, (x0, y0, x1, y1));
     let (n0, n1) = match side {
         Side::Top | Side::Bottom => (y0, y1),
@@ -208,19 +343,19 @@ fn span(sc: &Scene, end: EndRef, side: Side) -> (f64, f64, f64, Profile) {
             (tc, tc, tc, flat)
         }
     };
-    let EndRef::Node(v) = end else {
+    let Some(shape) = shape else {
         return rect();
     };
-    let n = &sc.nodes[v];
+    let (w, h) = (x1 - x0, y1 - y0);
     let round = |half: f64| (tc - half, tc + half, tc);
-    match n.shape {
+    match shape {
         Shape::Diamond => {
             let (lo, hi, c) = round(PORT_ROUND_SPAN * ht);
             (lo, hi, c, Profile::Diamond { n: nc, hn, ht, sgn })
         }
         s if is_round(s) => {
             // `scene::border` uses the width as the diameter.
-            let r = n.w / 2.0;
+            let r = w / 2.0;
             let (lo, hi, c) = round(PORT_ROUND_SPAN * r);
             (lo, hi, c, Profile::Round { n: nc, r, sgn })
         }
@@ -237,7 +372,135 @@ fn span(sc: &Scene, end: EndRef, side: Side) -> (f64, f64, f64, Profile) {
                 (lo, hi, c, Profile::Round { n, r, sgn })
             }
         }
+        // The outlines `scene::to_svg` paints (report M6, §2.5): ends
+        // spread on these sides sit on the slant, the point or the arc,
+        // not on the box, and a top or bottom keeps them on its straight
+        // run, off the slants.
+        Shape::Hexagon | Shape::Parallelogram | Shape::ParallelogramAlt => {
+            let k = SLANT_MAX.min(w / 4.0);
+            match side {
+                // The straight run between the slants: a hexagon's is
+                // `k` in at both ends; `/ /` runs `k` in from the left
+                // along its top and from the right along its bottom,
+                // `\ \` the other way round.
+                Side::Top | Side::Bottom => {
+                    let top = side == Side::Top;
+                    let (cut_lo, cut_hi) = match shape {
+                        Shape::Hexagon => (k, k),
+                        Shape::Parallelogram if top => (k, 0.0),
+                        Shape::Parallelogram => (0.0, k),
+                        _ if top => (0.0, k),
+                        _ => (k, 0.0),
+                    };
+                    let (lo, hi) = (t0 + cut_lo + PORT_INSET, t1 - cut_hi - PORT_INSET);
+                    if lo <= hi {
+                        (lo, hi, tc, flat)
+                    } else {
+                        let c = (t0 + cut_lo + t1 - cut_hi) / 2.0;
+                        (c, c, tc, flat)
+                    }
+                }
+                // A hexagon's point: like a diamond's corner, the ends
+                // keep to the part facing the side.
+                _ if shape == Shape::Hexagon => {
+                    let slope = if ht > 0.0 { k / ht } else { 0.0 };
+                    let (lo, hi, c) = round(PORT_ROUND_SPAN * ht);
+                    let tip = if sgn > 0.0 { n1 } else { n0 };
+                    (lo, hi, c, Profile::Point { n: tip, slope, sgn })
+                }
+                // A parallelogram's flank: straight, slanted `k` over
+                // the height, its middle `k / 2` in from the box.
+                _ => {
+                    let slope = if ht > 0.0 { k / (2.0 * ht) } else { 0.0 };
+                    let slope = if shape == Shape::Parallelogram {
+                        -slope
+                    } else {
+                        slope
+                    };
+                    let (mid, edge) = if sgn > 0.0 {
+                        (n1 - k / 2.0, n1)
+                    } else {
+                        (n0 + k / 2.0, n0)
+                    };
+                    let (lo, hi, c, _) = rect();
+                    (
+                        lo,
+                        hi,
+                        c,
+                        Profile::Line {
+                            n: mid,
+                            slope,
+                            edge,
+                        },
+                    )
+                }
+            }
+        }
+        Shape::Cylinder => {
+            let ry = crate::scene::cylinder_ry(w, h);
+            match side {
+                // The lid's back arc / the bottom arc.
+                Side::Top | Side::Bottom => {
+                    let (lo, hi, c, _) = rect();
+                    let n = nc + sgn * (hn - ry);
+                    (
+                        lo,
+                        hi,
+                        c,
+                        Profile::Arc {
+                            n,
+                            rt: ht,
+                            rn: ry,
+                            sgn,
+                        },
+                    )
+                }
+                // A flank: the box's span. Past the straight run between
+                // the caps the drum's shoulder curves in, flatly (a wide,
+                // shallow lid), so a crowded flank's corner ends land
+                // beside it; the final stage puts them on its arc
+                // (`edgepass::snap_ends`). Keeping them off the shoulders
+                // instead spilled a hub's ends round its corners and
+                // rerouted its fan (dense-lr: more crossings and border
+                // runs).
+                _ => {
+                    let (lo, hi, c, _) = rect();
+                    let n = if sgn > 0.0 { n1 } else { n0 };
+                    let flat = (ht - ry).max(0.0);
+                    let drum = Profile::Drum {
+                        n,
+                        flat,
+                        rt: ry,
+                        rn: hn,
+                        sgn,
+                    };
+                    (lo, hi, c, drum)
+                }
+            }
+        }
         _ => rect(),
+    }
+}
+
+/// The tangent range a router leg's port may slide along on `side` of a
+/// node of `shape` with box `rect` and stay where the ports stage would
+/// put it ([`shape_span`]): `None` on a pointed side (a hexagon's point,
+/// a diamond's or a circle's quadrant), where a slid end leaves the part
+/// facing the side.
+pub(crate) fn slide_span(
+    shape: Shape,
+    rect: (f64, f64, f64, f64),
+    side: Side,
+) -> Option<(f64, f64)> {
+    let (lo, hi, _, prof) = shape_span(Some(shape), rect, side);
+    match prof {
+        // A side too short for any span collapses onto its middle:
+        // nothing to slide along there.
+        Profile::Flat { .. }
+        | Profile::Line { .. }
+        | Profile::Arc { .. }
+        | Profile::Drum { .. } => (hi > lo).then_some((lo, hi)),
+        Profile::Round { .. } | Profile::Diamond { .. } | Profile::Point { .. } => None,
     }
 }
 
@@ -489,9 +752,9 @@ fn place_ports(
         // A straight side right under a frame's title: its ends keep
         // out of the chip's shadow, so no edge reaches them past the
         // frame's name (G6).
-        let (lo, hi, shaded) = match prof {
-            Profile::Flat { n } => unshaded(&heads, side, n, lo, hi, ports.len()),
-            _ => (lo, hi, false),
+        let (lo, hi, shaded) = match prof.straight() {
+            Some(n) => unshaded(&heads, side, n, lo, hi, ports.len()),
+            None => (lo, hi, false),
         };
         let shaded = shaded && ports.iter().any(|p| p.want < lo || p.want > hi);
         if ports.len() < 2 && !shaded && !ports.iter().any(|p| p.spilled.is_some()) {
@@ -512,8 +775,8 @@ fn place_ports(
         };
         // A crowded straight side may use more of its length, up to
         // [`PORT_INSET_MIN`] from the corners.
-        let (lo, hi) = match prof {
-            Profile::Flat { .. } if k > 1 && hi - lo < want * (k - 1) as f64 && hi > lo => {
+        let (lo, hi) = match prof.straight() {
+            Some(_) if k > 1 && hi - lo < want * (k - 1) as f64 && hi > lo => {
                 let grow =
                     (PORT_INSET - PORT_INSET_MIN).min((want * (k - 1) as f64 - (hi - lo)) / 2.0);
                 (lo - grow, hi + grow)
@@ -566,7 +829,7 @@ fn place_ports(
         let mut moves: Vec<(usize, usize, Pt)> = Vec::new();
         for (j, p) in ports.iter().enumerate() {
             let old = p.at;
-            let new = join(side, x[j], prof.normal_at(x[j] - tc));
+            let new = join(side, x[j], prof.placed_at(x[j] - tc));
             let delta = (new.0 - old.0, new.1 - old.1);
             if p.spilled.is_none() && delta.0.abs() < PORT_EPS && delta.1.abs() < PORT_EPS {
                 continue;
@@ -1131,6 +1394,80 @@ mod tests {
     use crate::edgepass::{finish, Mode};
     use crate::parser::parse;
     use crate::scene::{edge_polyline, route, scene};
+
+    /// Report M6: each side's profile is the painted outline — every
+    /// point on it sits on the border picking and the final stage use
+    /// (`scene::outline_along` leaves it put) — and an end the final
+    /// stage put there, inside the box, still belongs to its own side.
+    #[test]
+    fn profiles_trace_the_painted_outline_and_keep_their_ends_side() {
+        let sc = scene(
+            &parse(
+                "flowchart TD\nH{{hexagon}} --> P[/lean right/] --> Q[\\lean left\\] --> C[(drum)]",
+            )
+            .unwrap(),
+        );
+        for n in &sc.nodes {
+            let rect = (
+                n.x - n.w / 2.0,
+                n.y - n.h / 2.0,
+                n.x + n.w / 2.0,
+                n.y + n.h / 2.0,
+            );
+            for side in [Side::Top, Side::Bottom, Side::Left, Side::Right] {
+                let (lo, hi, tc, prof) = shape_span(Some(n.shape), rect, side);
+                assert!(lo <= hi, "{} {side:?} span", n.id);
+                for k in 0..=8 {
+                    let t = lo + (hi - lo) * k as f64 / 8.0;
+                    let p = join(side, t, prof.normal_at(t - tc));
+                    let out = normal(side);
+                    assert_eq!(
+                        crate::scene::outline_along(n, p, out),
+                        None,
+                        "{} {side:?} at {t}: {p:?} off the outline",
+                        n.id
+                    );
+                    assert_eq!(outline_side(n.shape, rect, p), side, "{} {p:?}", n.id);
+                    // The port is placed on the box, where the router's
+                    // stubs and slides run, and belongs to the same side.
+                    let b = join(side, t, prof.placed_at(t - tc));
+                    assert_eq!(outline_side(n.shape, rect, b), side, "{} {b:?}", n.id);
+                }
+            }
+        }
+        // A hexagon's top keeps its ends off the slants (a port inset in
+        // from where they start); a parallelogram's top off its one.
+        let hex = sc.nodes.iter().find(|n| n.id == "H").unwrap();
+        let k = SLANT_MAX.min(hex.w / 4.0);
+        let r = (hex.x - hex.w / 2.0, 0.0, hex.x + hex.w / 2.0, hex.h);
+        let (lo, hi, _, _) = shape_span(Some(Shape::Hexagon), r, Side::Top);
+        assert!(
+            (lo - (r.0 + k + PORT_INSET)).abs() < 1e-9
+                && (hi - (r.2 - k - PORT_INSET)).abs() < 1e-9
+        );
+        let (lo, hi, _, _) = shape_span(Some(Shape::Parallelogram), r, Side::Top);
+        assert!(
+            (lo - (r.0 + k + PORT_INSET)).abs() < 1e-9 && (hi - (r.2 - PORT_INSET)).abs() < 1e-9
+        );
+        // A router port slides along a hexagon's top, never its point.
+        assert!(slide_span(Shape::Hexagon, r, Side::Top).is_some());
+        assert_eq!(slide_span(Shape::Hexagon, r, Side::Left), None);
+        // A flank end near a parallelogram's bottom corner, put on the
+        // slant, lies nearer the box's bottom than its side: still a
+        // right-flank end.
+        let p = sc.nodes.iter().find(|n| n.id == "P").unwrap();
+        let rect = (
+            p.x - p.w / 2.0,
+            p.y - p.h / 2.0,
+            p.x + p.w / 2.0,
+            p.y + p.h / 2.0,
+        );
+        let k = SLANT_MAX.min(p.w / 4.0);
+        let y = p.y + p.h / 2.0 - 8.0;
+        let x = rect.2 - k * (y - rect.1) / p.h;
+        assert_eq!(side_of(rect, (x, y)), Side::Bottom);
+        assert_eq!(outline_side(p.shape, rect, (x, y)), Side::Right);
+    }
 
     /// A frame's title chip shades the top side of the node just under
     /// it: its ends keep to the part of the side past the chip, so no

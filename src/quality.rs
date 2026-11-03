@@ -261,7 +261,8 @@ pub struct Metrics {
     pub end_tilt_max: f64,
     /// Edge ends further than [`END_GAP_TOL`] from the outline their
     /// node (or frame) is painted with — a slanted, curved or capped
-    /// side measured as drawn, not as its box (report §2.5).
+    /// side measured as drawn, not as its box (report §2.5); a
+    /// self-loop's two ends count too.
     pub end_gaps: usize,
     /// Largest end-to-outline distance (px).
     pub end_gap_max: f64,
@@ -1704,6 +1705,25 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
                     me.e.from,
                     me.e.to,
                     owner_id(end)
+                ));
+            }
+        }
+    }
+    // A self-loop leaves and re-enters its node's outline as painted too
+    // (report M6: a loop on a parallelogram's or a hexagon's flank used
+    // to start and end on its box, beside the slant).
+    for e in sc.edges.iter().filter(|e| edge_drawn(e) && e.from == e.to) {
+        let Some(&v) = node_idx.get(e.from.as_str()) else {
+            continue;
+        };
+        for (at_start, which) in [(true, "start"), (false, "end")] {
+            let gap = poly_dist(&outlines[v], edge_end_tangent(e, at_start).0);
+            m.end_gap_max = m.end_gap_max.max(gap);
+            if gap > END_GAP_TOL {
+                m.end_gaps += 1;
+                m.details.push(format!(
+                    "{}->{} end_gap {which} on {} {gap:.1}px",
+                    e.from, e.to, e.from
                 ));
             }
         }

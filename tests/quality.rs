@@ -169,7 +169,7 @@ fn quality_gate() {
 /// border_runs 4 -> 5). Ratcheted to just above that: 2070 -> 2065.
 /// B4 (report Q7): 1020 -> 1022 static, as an intended drawing change:
 /// an end on a cylinder's top or bottom now starts on the cap's arc
-/// instead of the box side (`edgepass::cap_ends`), so `dense-lr`'s hub
+/// instead of the box side (`edgepass::snap_ends` since B6), so `dense-lr`'s hub
 /// `n12`'s bottom-corner ends `n12 -> n36` / `n12 -> n38` start 6 px up
 /// the bottom arc and their curves run 1-2 px longer beside g1's and
 /// g2's right borders (1018.7 -> 1021.7); no route changed.
@@ -493,15 +493,23 @@ fn channels_keep_edges_apart_and_off_chips() {
 /// twin instead of sweeping along the gap through 8 edges).
 ///
 /// B4 (report Q7): an end on a cylinder's top or bottom is put onto the
-/// cap's arc (`edgepass::cap_ends`), so the ends floating above a lid or
-/// below a drum are gone (dense-td's 5): end_gaps 11 | 11 -> 2 | 3 and
-/// end_gap_max 4.7 -> 4.5 (what is left is dense-lr's over-full hub,
+/// cap's arc (then `edgepass::cap_ends`), so the ends floating above a
+/// lid or below a drum are gone (dense-td's 5): end_gaps 11 | 11 -> 2 | 3
+/// and end_gap_max 4.7 -> 4.5 (what is left is dense-lr's over-full hub,
 /// whose corner ports sit on its flanks where they curve in).
+///
+/// B6 (report M6, §2.5, P0 #9): every end on a node is put on the
+/// outline as painted, along its stroke's final run
+/// (`edgepass::snap_ends`), a drum's shoulder end on the shoulder's
+/// nearest point, and `end_gaps` counts self-loop ends too: end_gaps
+/// 2 | 3 -> 0 | 0, end_gap_max 4.5 -> 0.05 (the flattening of the
+/// outline polygon the metric measures against, `OUTLINE_FLATNESS`);
+/// ceiling 0.1. No other row moved.
 const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
     ("end_tilt", 8.0, 11.0),
     ("end_tilt_max", 76.8, 128.4),
-    ("end_gaps", 2.0, 3.0),
-    ("end_gap_max", 4.5, 4.5),
+    ("end_gaps", 0.0, 0.0),
+    ("end_gap_max", 0.1, 0.1),
     ("lat_wiggles", 16.0, 16.0),
     ("lat_backtrack", 1_813.0, 696.1),
     ("own_frame_x", 0.0, 0.0),
@@ -581,4 +589,72 @@ fn defect_baseline_gate() {
         "defect baseline regressions:\n{}",
         bad.join("\n")
     );
+}
+
+/// Report M6 / P0 #9 (§2.5): every edge end — self-loops' included — sits
+/// on the outline its node is painted with, whatever the shape
+/// (hexagon, parallelogram, trapezoid, cylinder, circle, diamond,
+/// stadium), in `scene()`, in `route()` over its centres and in every
+/// drag frame `route_partial` draws: ends used to float 7-10 px beside a
+/// parallelogram's or a hexagon's flank (41 ends over the repro corpus,
+/// up to 9.3 px off).
+#[test]
+fn every_shape_end_sits_on_its_outline() {
+    use flowmaid::model::Document;
+    use flowmaid::quality::{drag_frames, measure, END_GAP_TOL};
+    use flowmaid::scene::{route, route_partial, scene};
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/outline");
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .expect("outline corpus")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "mmd"))
+        .collect();
+    files.sort();
+    assert!(files.len() >= 5, "the repro corpus is there");
+    for path in files {
+        let src = std::fs::read_to_string(&path).expect("fixture");
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let g = match flowmaid::parser::parse_document(&src).expect("parses") {
+            Document::Flowchart(g) | Document::State(g) => g,
+            _ => panic!("{name}: not a flowchart"),
+        };
+        let st = scene(&g);
+        let at: Vec<(f64, f64)> = st.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let rt = route(&g, &at);
+        let check = |what: &str, sc: &flowmaid::scene::Scene| {
+            let m = measure(&g, sc);
+            assert!(
+                m.end_gaps == 0 && m.end_gap_max <= 0.1,
+                "{name} {what}: {} ends off the outline, worst {:.2} px (tolerance {END_GAP_TOL}): {:?}",
+                m.end_gaps,
+                m.end_gap_max,
+                m.details.iter().filter(|d| d.contains("end_gap")).collect::<Vec<_>>()
+            );
+        };
+        check("static", &st);
+        check("routed", &rt);
+        // Each frame from the routed drawing, and a drag carried on
+        // from the frame before (fixed edges kept from it). A frame that
+        // drops the node onto another (boxes overlapping, centres even
+        // coincident) has no outline between them to end on: skipped.
+        let (mut prev, mut base) = (at.clone(), rt.clone());
+        let size: Vec<(f64, f64)> = rt.nodes.iter().map(|n| (n.w, n.h)).collect();
+        for (v, centres) in drag_frames(&rt) {
+            let overlaps = (0..centres.len()).any(|u| {
+                u != v
+                    && (centres[u].0 - centres[v].0).abs() < (size[u].0 + size[v].0) / 2.0
+                    && (centres[u].1 - centres[v].1).abs() < (size[u].1 + size[v].1) / 2.0
+            });
+            if overlaps {
+                continue;
+            }
+            check(
+                &format!("drag of node {v}"),
+                &route_partial(&g, &centres, &rt, &at),
+            );
+            let sc = route_partial(&g, &centres, &base, &prev);
+            check(&format!("carried drag of node {v}"), &sc);
+            (prev, base) = (centres, sc);
+        }
+    }
 }
