@@ -2613,6 +2613,10 @@ fn place(
     // the labels then slide along their own (slanted) curves to reach
     // a row, which never lands them exactly side by side. One row =
     // nothing overlaps = no requirement, so only colliding gaps grow.
+    // (Siblings that would read as one phrase are kept apart where the
+    // labels are placed, `labels::label_siblings`: the midpoint spans
+    // here are not where a hub's labels end up, and reserving sibling
+    // rows from them only grew a busy hub's gap.)
     let gap_need: Vec<f64> = short_across
         .iter_mut()
         .map(|spans| {

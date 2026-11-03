@@ -482,6 +482,18 @@ Minor, not patch: several class structs gain public fields (see
   `linkStyle … stroke-width:4px` dotted edge keeps the look (`4 6`) instead
   of turning into stripes; a `linkStyle` / `classDef` `stroke-dasharray`
   still wins. The advance writer draws the same dots.
+- **Sibling edge labels keep 20 px apart** (report Q14). The labels of
+  edges out of one node (or into one) whose other ends sit side by side —
+  a decision's `valid` / `invalid` — could sit 4 px apart and read as one
+  phrase ("valid invalid"). The label stage now keeps such siblings
+  20 px apart, side by side or stacked, as a `<<choice>>`'s fan already
+  kept them, in
+  `scene()`, `route()` and `route_partial()` alike, sliding a label along
+  its line or stepping it just beside it as for any other obstacle; the
+  layout is unchanged. A `<<choice>>`'s fan keeps its own rows, and in a
+  busy hub this ranks with the other soft obstacles (a label still never
+  covers a node, a head or another label to get it), so a dozen labels
+  out of one node can still sit closer.
 - **Breaking** (needs a **minor** bump). Nothing public is removed or
   renamed, and every function keeps its signature. What breaks, and how to
   migrate:
