@@ -15,7 +15,7 @@
 //! l = layer / depth); the renderer maps them to final x,y
 //! according to the diagram direction (TD/LR/BT/RL).
 
-use crate::clearance::NODE_SEP;
+use crate::clearance::{FRAME_SEP, NODE_SEP, TIGHT_RUN_MIN};
 use crate::labels::{FAN_FAR, FAN_SIBLING_GAP, LABEL_SIDE_AIR, LABEL_STRADDLE, STROKE_PAD};
 use crate::model::{Direction, EdgeKind, Graph, Node, Shape};
 use crate::ports::PORT_INSET;
@@ -2942,6 +2942,84 @@ fn place(
         .map(|(need, lines)| fan_rows_gap(lines, need))
         .collect();
     let gap_l = g.rank_gap.unwrap_or(GAP_L);
+    // Per lower layer: the least distance between its line and the one
+    // before it for every edge crossing a frame border in that gap to
+    // cross it clear of its lateral run (B7 review r1 #2, #3; report M8).
+    // A free curve drawn across a gap runs flattest midway between its
+    // ends, and the router's channel legs run there too; a box's title
+    // strip (with its pad) puts the box's border [`FRAME_PAD`] + header
+    // above its first row, which with the strip no longer doubled (M8)
+    // left the border 3 px off mid-gap: advanced's `Gate ==> Job Queue`
+    // rode 122 px along Async Workers' top (and was rerouted into an L
+    // inside it). Such a gap keeps the outermost border an edge's run
+    // crosses — a box entered or left, title strip or pad —
+    // [`FRAME_SEP`] off the run's middle, on the border's own side, when
+    // the run's ends lie more than [`TIGHT_RUN_MIN`] apart sideways (a
+    // steeper run crosses the border too steeply to ride it: Client ->
+    // Platform's straight drop keeps the gap). A border one pad deep
+    // never needs it (2 pads and 2 seps are under GAP_L); flowchart and
+    // state drawings only. (Borders a run only passes beside are left
+    // alone: keeping clear of those too re-laid dense-td 200 px deeper
+    // and bench-75 wider, and their routers then rode more borders.)
+    let cross_need: Vec<f64> = {
+        let mut need = vec![0.0f64; nlayers];
+        if clustered && g.edge_paint_width.is_none() {
+            let span_of = |c: usize| cluster_span.get(&c).copied();
+            let hdr_lo = matches!(g.direction, Direction::TD);
+            let hdr_hi = matches!(g.direction, Direction::BT);
+            for (ei, e) in g.edges.iter().enumerate() {
+                if e.from == e.to || matches!(e.kind, EdgeKind::Invisible) {
+                    continue;
+                }
+                // The edge's path down the layers (its chain is stored
+                // in from -> to order).
+                let chain = &edge_chain[ei];
+                let path: Vec<usize> = if alayer[e.from] <= alayer[e.to] {
+                    std::iter::once(e.from)
+                        .chain(chain.iter().copied())
+                        .chain(std::iter::once(e.to))
+                        .collect()
+                } else {
+                    std::iter::once(e.to)
+                        .chain(chain.iter().rev().copied())
+                        .chain(std::iter::once(e.from))
+                        .collect()
+                };
+                for w in path.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    let l = alayer[a];
+                    // A back-edge's skip is drawn in a lane.
+                    if alayer[b] != l + 1 || (bpos[a] - bpos[b]).abs() <= TIGHT_RUN_MIN {
+                        continue;
+                    }
+                    // How far past each end the outermost border it
+                    // crosses lies: the boxes left closing on `a`'s
+                    // layer and entered opening on `b`'s, a pad each and
+                    // the title strip on the screen-top side.
+                    let depth = |at: usize, from: usize, open: bool| -> f64 {
+                        apath[at]
+                            .iter()
+                            .filter(|c| !apath[from].contains(c))
+                            .filter(|&&c| {
+                                span_of(c)
+                                    .is_some_and(|s| if open { s.0 == l + 1 } else { s.1 == l })
+                            })
+                            .map(|&c| {
+                                let strip = if open { hdr_lo } else { hdr_hi };
+                                FRAME_PAD + if strip { header[c] } else { 0.0 }
+                            })
+                            .sum()
+                    };
+                    let d = depth(a, b, false).max(depth(b, a, true));
+                    if d > 0.0 {
+                        let ends = alsize[a] / 2.0 + alsize[b] / 2.0;
+                        need[l + 1] = need[l + 1].max(ends + 2.0 * (d + FRAME_SEP));
+                    }
+                }
+            }
+        }
+        need
+    };
     // The layer lines and the depth they span. `judged`: as the layout
     // search judges a candidate (crossings, node hits, the ribbon tests)
     // — a title strip's slot grown on both sides, a labelled gap only as
@@ -3033,6 +3111,9 @@ fn place(
                 if cursor - prev < gap_need[li] {
                     cursor = prev + gap_need[li];
                 }
+            }
+            if !judged && li > 0 && cross_need[li] > 0.0 {
+                cursor = cursor.max(lcoord[li - 1] + cross_need[li] - before);
             }
             prev_after = after;
             lcoord[li] = cursor + before;

@@ -198,9 +198,19 @@ Minor, not patch: several class structs gain public fields (see
   box's title strip now takes its room only above the box's first row
   (below it in BT, the screen top), so the next row inside follows at the
   usual layer gap; the strip used to be reserved on both sides of the
-  row, leaving 26 px of empty band under every box's first row (subgraph
-  786 -> 734 px tall, advanced 1 267 -> 1 214, dense-td 1 823 -> 1 663).
-  Titles are still never struck.
+  row, leaving 26 px of empty band under every box's first row. Titles
+  are still never struck. Where an edge runs sideways across a gap into
+  (or out of) a box, the gap keeps the box's border clear of the run's
+  middle, so the curve crosses the border instead of riding it (the
+  strip used to give that room by chance: advanced's `Gate ==> Job
+  Queue` would otherwise run along Async Workers' top); a straight drop
+  into a box keeps the plain gap (subgraph 786 -> 758 px tall, advanced
+  1 267 -> 1 236, dense-td 1 823 -> 1 746). In the static scene, two
+  unrelated edges left side by side closer than the edge spacing get one
+  moved clear (a free curve slid along the flow, a router leg across its
+  channel) where that costs nothing else, and an end's straight run into
+  its arrowhead is left out where it would swing the curve into a box it
+  passes beside (it is squared at paint time instead).
 - **Long node labels wrap** (report M7, §2.12). A flowchart or state
   label that breaks none of its own lines now wraps at 200 px (mermaid's
   `flowchart.wrappingWidth` default) instead of stretching its node into

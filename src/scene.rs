@@ -15416,6 +15416,53 @@ mod tests {
         }
     }
 
+    /// B7 review r1 (#2): an edge crossing into a box from the row above
+    /// with a sideways run keeps the box's border off the run's middle by
+    /// [`crate::clearance::FRAME_SEP`] (the strip no longer doubled, M8,
+    /// had put it 3 px off: advanced's `Gate ==> Job Queue` rode Async
+    /// Workers' top for 122 px and was rerouted into an L inside it); a
+    /// straight drop into a box keeps the plain gap. In advanced, no edge
+    /// cuts a foreign frame (Auth -> Users' stub into the comb on Users'
+    /// lid swung it round Async Workers' corner) nor rides Async Workers'
+    /// border, and `Gate ==> Job Queue` stays a curve, in either mode.
+    #[test]
+    fn a_run_into_a_box_crosses_its_border_clear_of_the_run() {
+        let src = "flowchart TD\n  G[Gateway] --> Q\n  G --> X[Elsewhere]\n  \
+                   subgraph W [Workers]\n    Q[Queue] --> A[Worker]\n  end\n";
+        let sc = scene(&parse(src).unwrap());
+        let n = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+        let frame = |id: &str| sc.clusters.iter().find(|c| c.id == id).unwrap();
+        let (g, q) = (n("G"), n("Q"));
+        assert!((g.x - q.x).abs() > 24.0, "the run into W must be sideways");
+        let mid = ((g.y + g.h / 2.0) + (q.y - q.h / 2.0)) / 2.0;
+        let top = frame("W").y;
+        assert!(
+            top - mid >= crate::clearance::FRAME_SEP - 1e-6,
+            "border {top} vs run middle {mid}"
+        );
+        // A straight drop keeps the plain gap and the strip over it.
+        let src =
+            "flowchart TD\n  C[Client] --> S\n  subgraph P [Platform]\n    S[Straight]\n  end\n";
+        let sc = scene(&parse(src).unwrap());
+        let n = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+        let (c, st) = (n("C"), n("S"));
+        assert!((c.x - st.x).abs() <= 24.0);
+        let gap = (st.y - st.h / 2.0) - (c.y + c.h / 2.0);
+        assert!(gap <= crate::layout::GAP_L + SUB_HEADER + 1e-6, "{gap}");
+
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/advanced.mmd"
+        ))
+        .unwrap();
+        let rep = crate::quality::measure_source(&src, false).unwrap();
+        for m in [&rep.statik, &rep.routed] {
+            assert_eq!(m.edge_frame_x, 0, "{:?}", m.details);
+            let bad = |d: &&String| d.contains("border Workers") || d.starts_with("Gate->Q ortho");
+            assert!(!m.details.iter().any(|d| bad(&d)), "{:?}", m.details);
+        }
+    }
+
     /// Report M3 (§2.6): a decision's labelled branches between adjacent
     /// layers get a gap that holds the label, the head and a stub either
     /// side; each label sits in the middle of its curve, where the S is

@@ -58,12 +58,20 @@ const GAP_FLOORS: &[(&str, f64, f64)] = &[
     // longer leaves a strip of dead room under its first row (dense-td
     // 1 823 -> 1 663 px tall). Its static drawing's closest pair is
     // now two router legs 10.5 px apart in one shared channel under the
-    // g5 / g6 frames, which closed by 160 px (12.16 -> 10.50, floor
-    // 10.4); its
+    // g5 / g6 frames, which closed by 160 px (12.16 -> 10.50); its
     // routed pairs opened 6.6 -> 12.0 and dense-lr's 9.5 / 9.7 ->
     // 11.7 / 12.1, ratcheted here.
-    ("dense-lr", 11.7, 12.0),
-    ("dense-td", 10.4, 12.0),
+    //
+    // B7 review r1 (#3): the floor dense-td had lost is back at 12.1.
+    // The router's dependency on the dead strip was channel room: two
+    // unrelated edges the nudge leaves side by side under the spacing
+    // now get one moved clear where that costs nothing else
+    // (`router::spread_close`, static scene), and a gap a box opens in
+    // keeps its border off the lateral runs crossing it (`layout`'s
+    // `cross_need`): dense-td static 10.50 -> 13.04, dense-lr 11.74 ->
+    // 14.50, ratcheted to 12.0.
+    ("dense-lr", 12.0, 12.0),
+    ("dense-td", 12.1, 12.0),
     ("fanout-frames", 40.0, 40.0),
     ("wide-labels", 40.0, 40.0),
 ];
@@ -197,7 +205,12 @@ fn quality_gate() {
 /// (316 + 192 -> 453 + 277 px under g5's and g6's bottoms) and
 /// `n22 -> n40` (126 px down g6's left) ride borders the closer
 /// channel leaves no lane beside; bench-75 routed 360 -> 402.
-const BORDER_LEN_MAX: (f64, f64) = (1_475.0, 2_105.0);
+/// B7 review r1 (#2, #3): 1 475 -> 1 395 static, 2 105 -> 1 895 routed —
+/// a gap a box opens in keeps the box's top off the middle of the runs
+/// crossing it into the box (dense-td 1 098 -> 1 020 static, 1 180 ->
+/// 971 routed: its `n45 -> g8` no longer rides g1's top) and the static
+/// scene moves one of two edges side by side under the spacing clear.
+const BORDER_LEN_MAX: (f64, f64) = (1_395.0, 1_895.0);
 
 /// Edges keep off frame borders where their channel has room (G4).
 #[test]
@@ -394,11 +407,17 @@ fn crossing_gaps_do_not_read_as_dashes() {
 /// closer; dense-lr 960 -> 2 562: the fan out of hub `n12` whose far
 /// ends now meet their targets in the middle runs as a cable); hug
 /// ratcheted down to 2 820 | 3 430 (dense-td static 2 208 -> 2 008).
+/// B7 review r1 (#2, #3, see `BORDER_LEN_MAX`): overlap 3 200 | 7 770 ->
+/// 2 950 | 7 160 (dense-td 2 290 -> 2 008 static, 5 638 -> 5 024 routed),
+/// tight 12 860 | 21 900 -> 12 630 | 20 700, routed hug 3 430 -> 3 290
+/// (dense-td 1 811 -> 1 674); static hug 2 820 -> 2 830, as dense-td's
+/// re-laid gaps cost it (2 008 -> 2 020: its `n25 -> n38` runs 12 px
+/// longer beside node `n13`), still under the 2 969 before B7.
 const CHANNEL_MAX: [(&str, f64, f64); 4] = [
-    ("overlap_len", 3_200.0, 7_770.0),
+    ("overlap_len", 2_950.0, 7_160.0),
     ("overlap_max", 470.0, 1_400.0),
-    ("tight_len", 12_860.0, 21_900.0),
-    ("hug_len", 2_820.0, 3_430.0),
+    ("tight_len", 12_630.0, 20_700.0),
+    ("hug_len", 2_830.0, 3_290.0),
 ];
 
 /// Most edges (over all fixtures, per mode) that pass a title chip
@@ -554,6 +573,17 @@ fn channels_keep_edges_apart_and_off_chips() {
 /// depth nearer each other, 19 804 -> 23 042 static, 22 150 -> 27 434
 /// routed; dense-lr's `n12` fan 4 670 -> 6 570 static), lat_backtrack
 /// static 1 813 -> 1 814.2 (dense-td 123.2 -> 124.5).
+///
+/// B7 review r1 (#2, #3): a gap a box opens in keeps the box's border off
+/// the lateral runs crossing it, and the static scene moves one of two
+/// edges side by side under the spacing clear. Lowered: band_pairs
+/// 96 | 106 -> 95 | 104, band_len 46 184 | 52 184 -> 46 030 | 51 310,
+/// end_kink static 54 -> 53, idiom_spline static 22 -> 21, x_drawn
+/// routed 503 -> 500. Raised, as dense-td's re-laid gaps (82 px deeper
+/// over the drawing) cost it, both still at or under the values before
+/// B7: x_drawn static 494 -> 498 (dense-td 88 -> 92) and idiom_spline
+/// routed 21 -> 22 (dense-td 0 -> 1, a `route()` channel spline the
+/// router no longer redraws orthogonally).
 const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
     ("end_tilt", 7.0, 11.0),
     ("end_tilt_max", 76.8, 128.4),
@@ -563,13 +593,13 @@ const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
     ("lat_backtrack", 1_814.2, 667.0),
     ("own_frame_x", 0.0, 0.0),
     ("own_frame_len", 0.0, 0.0),
-    ("band_pairs", 96.0, 106.0),
-    ("band_len", 46_184.0, 52_184.0),
+    ("band_pairs", 95.0, 104.0),
+    ("band_len", 46_030.0, 51_310.0),
     ("idiom_scubic", 61.0, 80.0),
-    ("idiom_spline", 22.0, 21.0),
+    ("idiom_spline", 21.0, 22.0),
     ("idiom_bow", 2.0, 1.0),
-    ("x_drawn", 494.0, 503.0),
-    ("end_kink", 54.0, 69.0),
+    ("x_drawn", 498.0, 500.0),
+    ("end_kink", 53.0, 69.0),
     ("ink_out", 0.0, 0.0),
 ];
 

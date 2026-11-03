@@ -4013,6 +4013,389 @@ pub(crate) fn nudge(g: &Graph, sc: &mut Scene, cx: &Ctx, mode: Mode, moved: &mut
     mark_crossed_labels(&w, sc, &was, moved);
 }
 
+/// Steps (px) [`spread_close`] tries to slide a free curve's middle
+/// (along the flow) or a router leg (across it) by, nearest first.
+const CLOSE_SHIFTS: [f64; 8] = [4.0, -4.0, 8.0, -8.0, 12.0, -12.0, 16.0, -16.0];
+
+/// The least share of its run along the flow either control of a curve
+/// [`spread_close`] slides keeps from its end, so the curve still
+/// leaves and enters along the flow.
+const CURVE_SHIFT_KEEP: f64 = 0.3;
+
+/// G4 (B7 review r1 #3): two unrelated edges side by side closer than
+/// [`EDGE_SEP`] and never crossing have one of them moved clear — a
+/// free curve slid along the flow (both its controls moved alike, so it
+/// still leaves and enters along the flow, its middle a few px nearer
+/// one end), a router path's leg nearest the other (not a port leg)
+/// slid across its channel — when that clears the pair without the
+/// moved edge coming nearer than it was to anything else: no new
+/// crossing, no other edge brought under [`EDGE_SEP`] (or nearer, if it
+/// already was), no turn folded back, and no worse a score against the
+/// nodes, frames, chips and labels. The channel nudge spaces the legs
+/// sharing a channel within what the curves and other legs beside it
+/// leave, at down to [`EDGE_SEP_MIN`]; a free curve is planned alone by
+/// the builder, at mid-gap. Two legs under dense-td's bottom row sat
+/// 10.5 px apart that way, and its gap rows shift with the layout (the
+/// title strips' room, report M8, and the labelled gaps', M3). An
+/// unlabelled edge is tried first; a fixed edge ([`Ctx::fixed`]), a
+/// back-edge's lane, a user-shaped (`curve:`) edge and a state note
+/// link never move. Marks the moved edges in `moved`, so the label
+/// stage re-places their labels.
+///
+/// The static scene only: in `route()` a drag frame has no budget for
+/// it (bench-75's frames took 12.6 -> 24 ms, G13), so a drag draws the
+/// pairs the nudge left as they are — what it keeps of the static scene
+/// in `route_partial` keeps the moved edges, and picking measures the
+/// drawn stroke either way.
+pub(crate) fn spread_close(g: &Graph, sc: &mut Scene, cx: &Ctx, mode: Mode, moved: &mut [bool]) {
+    let ne = sc.edges.len();
+    if mode != Mode::Static || !(2..=ROUTE_MAX_EDGES).contains(&ne) || g.edge_paint_width.is_some()
+    {
+        return;
+    }
+    let w = World::new(g, sc);
+    if !w.sane() {
+        return;
+    }
+    let infos: Vec<Option<Info>> = (0..ne).map(|i| info_of(g, &w, cx, i)).collect();
+    let mut polys: Vec<Vec<Pt>> = sc.edges.iter().map(edge_polyline).collect();
+    let mut grid = SegGrid::new(&polys, |k| infos[k].is_some());
+    let movable = |sc: &Scene, i: usize| {
+        let e = &sc.edges[i];
+        infos[i].as_ref().is_some_and(|f| !f.back)
+            && e.meta.curve.is_none()
+            && !cx.fixed.get(i).copied().unwrap_or(false)
+            && !crate::ports::note_link(sc, cx, i)
+            && (e.waypoints.is_empty() || ortho_corners(e).is_some_and(|c| c.len() >= 4))
+    };
+    // The drawn ends of edges `m` and `k` on the ends they share, where
+    // related edges converge (their spacing there is the ports').
+    let shared = |sc: &Scene, m: usize, k: usize| -> Vec<Pt> {
+        let (Some(a), Some(b)) = (&infos[m], &infos[k]) else {
+            return Vec::new();
+        };
+        let (am, bm) = drawn_ends(&sc.edges[m]);
+        let (ak, bk) = drawn_ends(&sc.edges[k]);
+        let mut out = Vec::new();
+        for (end, p) in [(a.ends.0, am), (a.ends.1, bm)] {
+            if end == b.ends.0 {
+                out.extend([p, ak]);
+            }
+            if end == b.ends.1 {
+                out.extend([p, bk]);
+            }
+        }
+        out
+    };
+    // The unrelated pairs to clear, closest first.
+    let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+    for i in 0..ne {
+        if infos[i].is_none() {
+            continue;
+        }
+        for (j, d) in grid.near(&polys, &polys[i], i, |k| shared(sc, i, k)) {
+            let unrelated = shared(sc, i, j).is_empty();
+            if j > i && unrelated && (movable(sc, i) || movable(sc, j)) {
+                if let Some(d) = d.filter(|&d| d < EDGE_SEP) {
+                    pairs.push((d, i, j));
+                }
+            }
+        }
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    for (_, i, j) in pairs {
+        // Still close (an earlier move may have cleared it)?
+        let now = grid.near(&polys, &polys[i], i, |_| Vec::new());
+        if !now
+            .iter()
+            .any(|&(k, d)| k == j && d.is_some_and(|d| d < EDGE_SEP))
+        {
+            continue;
+        }
+        let mut order = [(i, j), (j, i)];
+        if sc.edges[i].label.is_some() && sc.edges[j].label.is_none() {
+            order.swap(0, 1);
+        }
+        'mover: for (m, other) in order {
+            if !movable(sc, m) {
+                continue;
+            }
+            let info = infos[m].as_ref().expect("movable");
+            let tries = close_moves(&sc.edges[m], &polys[other]);
+            if tries.is_empty() {
+                continue;
+            }
+            let base = w.score(info, m, &polys[m], None);
+            // What the edge is near now: its gap to each edge (or a
+            // crossing), away from the ends they share.
+            let was = grid.near(&polys, &polys[m], m, |k| shared(sc, m, k));
+            for (bez, wps) in tries {
+                let mut probe = sc.edges[m].clone();
+                probe.bezier = bez;
+                probe.waypoints = wps;
+                let np = edge_polyline(&probe);
+                let after = grid.near(&polys, &np, m, |k| shared(sc, m, k));
+                let clear = after.iter().all(|&(k, d1)| {
+                    let d0 = was
+                        .iter()
+                        .find(|x| x.0 == k)
+                        .map_or(Some(f64::INFINITY), |x| x.1);
+                    match (d0, d1) {
+                        // A crossing may stay; a new one may not.
+                        (None, _) => true,
+                        (Some(_), None) => false,
+                        (Some(d0), Some(d1)) if k == other => d1 >= EDGE_SEP && d1 > d0,
+                        (Some(d0), Some(d1)) => d1 >= EDGE_SEP.min(d0) - EPS,
+                    }
+                });
+                if !clear || w.score(info, m, &np, None) > base {
+                    continue;
+                }
+                grid.replace(m, &polys[m], &np);
+                sc.edges[m] = probe;
+                polys[m] = np;
+                if let Some(f) = moved.get_mut(m) {
+                    *f = true;
+                }
+                break 'mover;
+            }
+        }
+    }
+}
+
+/// The drawn segments of a scene's edges in a uniform grid, each in
+/// every cell (of [`SEG_CELL`] px) its box grown by [`EDGE_SEP`] meets, so [`spread_close`]
+/// finds what lies within the spacing of a path without measuring it
+/// against every edge.
+struct SegGrid {
+    x0: f64,
+    y0: f64,
+    nx: usize,
+    ny: usize,
+    /// Per cell: (edge, segment index).
+    cells: Vec<Vec<(u32, u32)>>,
+}
+
+impl SegGrid {
+    /// The grid over `polys`, holding the edges `keep` accepts.
+    fn new(polys: &[Vec<Pt>], keep: impl Fn(usize) -> bool) -> Self {
+        let mut bb = (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for p in polys.iter().flatten() {
+            bb = (bb.0.min(p.0), bb.1.min(p.1), bb.2.max(p.0), bb.3.max(p.1));
+        }
+        if !bb.0.is_finite() {
+            bb = (0.0, 0.0, 0.0, 0.0);
+        }
+        let (x0, y0) = (bb.0 - 2.0 * SEG_CELL, bb.1 - 2.0 * SEG_CELL);
+        let nx = (((bb.2 - x0) / SEG_CELL) as usize + 3).min(4096);
+        let ny = (((bb.3 - y0) / SEG_CELL) as usize + 3).min(4096);
+        let mut grid = SegGrid {
+            x0,
+            y0,
+            nx,
+            ny,
+            cells: vec![Vec::new(); nx * ny],
+        };
+        for (k, pts) in polys.iter().enumerate() {
+            if keep(k) {
+                grid.add(k, pts);
+            }
+        }
+        grid
+    }
+
+    /// The cells (indices) the box `r` meets, clamped to the grid.
+    fn cells_of(&self, r: R) -> impl Iterator<Item = usize> + '_ {
+        let ix = |x: f64| (((x - self.x0) / SEG_CELL).max(0.0) as usize).min(self.nx - 1);
+        let iy = |y: f64| (((y - self.y0) / SEG_CELL).max(0.0) as usize).min(self.ny - 1);
+        let (a, b, c, d) = (ix(r.0), iy(r.1), ix(r.2), iy(r.3));
+        (b..=d).flat_map(move |y| (a..=c).map(move |x| y * self.nx + x))
+    }
+
+    fn add(&mut self, k: usize, pts: &[Pt]) {
+        for (s, q) in pts.windows(2).enumerate() {
+            let r = grow(bounds(q), EDGE_SEP);
+            let cells: Vec<usize> = self.cells_of(r).collect();
+            for c in cells {
+                self.cells[c].push((k as u32, s as u32));
+            }
+        }
+    }
+
+    /// Edge `k` drawn along `new` instead of `old`.
+    fn replace(&mut self, k: usize, old: &[Pt], new: &[Pt]) {
+        for q in old.windows(2) {
+            let cells: Vec<usize> = self.cells_of(grow(bounds(q), EDGE_SEP)).collect();
+            for c in cells {
+                self.cells[c].retain(|&(e, _)| e as usize != k);
+            }
+        }
+        self.add(k, new);
+    }
+
+    /// Per edge within [`EDGE_SEP`] of `pts` (other than `me`): its
+    /// closest approach farther than [`PORT_ZONE`] from the points
+    /// `away(k)` gives (the ends they share), or `None` where it
+    /// crosses `pts` there.
+    fn near(
+        &self,
+        polys: &[Vec<Pt>],
+        pts: &[Pt],
+        me: usize,
+        away: impl Fn(usize) -> Vec<Pt>,
+    ) -> Vec<(usize, Option<f64>)> {
+        let mut out: Vec<(usize, Option<f64>, Vec<Pt>)> = Vec::new();
+        // (A segment met in two cells is measured twice: harmless.)
+        for q in pts.windows(2) {
+            let (a, b) = (q[0], q[1]);
+            for c in self.cells_of(bounds(q)) {
+                for &(k, s) in &self.cells[c] {
+                    if k as usize == me {
+                        continue;
+                    }
+                    let (k, s) = (k as usize, s as usize);
+                    let (Some(&p0), Some(&p1)) = (polys[k].get(s), polys[k].get(s + 1)) else {
+                        continue;
+                    };
+                    let slot = match out.iter().position(|x| x.0 == k) {
+                        Some(i) => i,
+                        None => {
+                            out.push((k, Some(f64::INFINITY), away(k)));
+                            out.len() - 1
+                        }
+                    };
+                    let (_, d, far_from) = &mut out[slot];
+                    let far = |p: Pt| far_from.iter().all(|&o| dist(p, o) >= PORT_ZONE);
+                    if seg_cross(a, b, p0, p1).is_some_and(far) {
+                        *d = None;
+                    }
+                    if let Some(d) = d {
+                        for (p, (u, v)) in
+                            [(a, (p0, p1)), (b, (p0, p1)), (p0, (a, b)), (p1, (a, b))]
+                        {
+                            if far(p) {
+                                *d = d.min(seg_dist(p, u, v));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.into_iter()
+            .filter(|x| x.1.map_or(true, |d| d < f64::INFINITY))
+            .map(|x| (x.0, x.1))
+            .collect()
+    }
+}
+
+/// What [`spread_close`] tries for edge `e` to clear `other` (its
+/// drawn polyline), nearest first, as (curve, waypoints): a free curve
+/// slid along its flow axis ([`flow_controls`]), keeping
+/// [`CURVE_SHIFT_KEEP`] of its run to each control; a router path's
+/// inner leg nearest `other` slid across, its neighbours kept turning
+/// the way they turned and as long as two corners need, the corners
+/// rounded as they were.
+fn close_moves(e: &crate::scene::SceneEdge, other: &[Pt]) -> Vec<([Pt; 4], Vec<Pt>)> {
+    let mut out = Vec::new();
+    if e.waypoints.is_empty() {
+        let b = e.bezier;
+        let Some((u, a0, b0, run)) = flow_controls(&b) else {
+            return out;
+        };
+        let keep = CURVE_SHIFT_KEEP * run;
+        for s in CLOSE_SHIFTS {
+            if a0 + s < keep || b0 - s < keep {
+                continue;
+            }
+            let mut nb = b;
+            for c in [1, 2] {
+                nb[c] = (nb[c].0 + u.0 * s, nb[c].1 + u.1 * s);
+            }
+            out.push((nb, Vec::new()));
+        }
+        return out;
+    }
+    let Some(c) = ortho_corners(e) else {
+        return out;
+    };
+    let n = c.len();
+    // Corners rounded as the nudge left them.
+    let r = if e.waypoints == smooth(&c, CORNER_MAX) {
+        CORNER_MAX
+    } else {
+        CORNER_R
+    };
+    // The inner leg (both its corners off the ends) nearest `other`.
+    let Some(k) = (1..n.saturating_sub(2))
+        .map(|k| {
+            let d = other
+                .iter()
+                .map(|&p| seg_dist(p, c[k], c[k + 1]))
+                .fold(f64::INFINITY, f64::min);
+            (d, k)
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+        .map(|(_, k)| k)
+    else {
+        return out;
+    };
+    let level = (c[k].1 - c[k + 1].1).abs() < EPS;
+    for s in CLOSE_SHIFTS {
+        let mut nc = c.clone();
+        for q in [k, k + 1] {
+            if level {
+                nc[q].1 += s;
+            } else {
+                nc[q].0 += s;
+            }
+        }
+        // The legs either side keep their direction and the room for
+        // their corners.
+        let keeps = |a: Pt, b0: Pt, b1: Pt| {
+            let (d0, d1) = (dist(a, b0), dist(a, b1));
+            let same = (b0.0 - a.0) * (b1.0 - a.0) + (b0.1 - a.1) * (b1.1 - a.1) > 0.0;
+            same && d1 >= JOG_MIN.min(d0)
+        };
+        if !keeps(c[k - 1], c[k], nc[k]) || !keeps(c[k + 2], c[k + 1], nc[k + 1]) {
+            continue;
+        }
+        let wps = smooth(&nc, r);
+        let (p0, p3) = (wps[0], wps[wps.len() - 1]);
+        out.push(([p0, p0, p3, p3], wps));
+    }
+    out
+}
+
+/// A free curve's flow axis for [`spread_close`]: when both controls
+/// leave their ends along one axis, toward each other (a curve drawn
+/// across a gap), the unit along it from start to end, each control's
+/// reach from its end, and the run between the ends along it.
+fn flow_controls(b: &[Pt; 4]) -> Option<(Pt, f64, f64, f64)> {
+    let (d1, d2) = (
+        (b[1].0 - b[0].0, b[1].1 - b[0].1),
+        (b[3].0 - b[2].0, b[3].1 - b[2].1),
+    );
+    let axis = if d1.0.abs() < EPS && d2.0.abs() < EPS {
+        (0.0, (b[3].1 - b[0].1).signum())
+    } else if d1.1.abs() < EPS && d2.1.abs() < EPS {
+        ((b[3].0 - b[0].0).signum(), 0.0)
+    } else {
+        return None;
+    };
+    let along = |v: Pt| v.0 * axis.0 + v.1 * axis.1;
+    let (a, c, run) = (
+        along(d1),
+        along(d2),
+        along((b[3].0 - b[0].0, b[3].1 - b[0].1)),
+    );
+    (run > 0.0 && a > 0.0 && c > 0.0).then_some((axis, a, c, run))
+}
+
 /// Flag in `moved` every labelled edge whose label a path redrawn since
 /// `was` (each edge's waypoints and curve then) now runs through, so the
 /// label stage re-places it off the stroke and off the moved arrowhead
@@ -5497,6 +5880,51 @@ mod tests {
         for _ in 0..NUDGE_ROUNDS {
             let mut unlimited = usize::MAX;
             spread(&f, routes, &mut unlimited);
+        }
+    }
+
+    /// B7 review r1 (#3): two unrelated free curves crossing one gap
+    /// side by side under [`EDGE_SEP`] get one slid along the flow until
+    /// they clear it (static scene only); the slid curve still leaves
+    /// and enters along the flow.
+    #[test]
+    fn spread_close_slides_a_curve_off_its_neighbour() {
+        let g = parse("flowchart TD\nA-->B\nC-->D").unwrap();
+        let mut sc = scene(&g);
+        // Two long S-curves across one 100 px gap, 60 px apart sideways:
+        // their flat middles run a few px apart.
+        sc.edges[0].waypoints.clear();
+        sc.edges[0].bezier = [(0.0, 0.0), (0.0, 50.0), (600.0, 50.0), (600.0, 100.0)];
+        sc.edges[1].waypoints.clear();
+        sc.edges[1].bezier = [(60.0, 0.0), (60.0, 50.0), (660.0, 50.0), (660.0, 100.0)];
+        for e in sc.edges.iter_mut() {
+            e.label = None;
+        }
+        let (a, b) = (sc.edges[0].bezier, sc.edges[1].bezier);
+        let cx = crate::edgepass::ctx(&g, &sc);
+        let gap = |sc: &Scene| {
+            let (p, q) = (edge_polyline(&sc.edges[0]), edge_polyline(&sc.edges[1]));
+            p.iter()
+                .map(|&x| {
+                    q.windows(2)
+                        .map(|w| seg_dist(x, w[0], w[1]))
+                        .fold(f64::INFINITY, f64::min)
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        assert!(gap(&sc) < EDGE_SEP);
+        // A drag frame leaves them be (G13).
+        let mut routed = sc.clone();
+        let mut moved = vec![false; 2];
+        spread_close(&g, &mut routed, &cx, Mode::Routed, &mut moved);
+        assert_eq!((routed.edges[0].bezier, routed.edges[1].bezier), (a, b));
+        spread_close(&g, &mut sc, &cx, Mode::Static, &mut moved);
+        assert!(gap(&sc) >= EDGE_SEP, "{}", gap(&sc));
+        assert_eq!(moved.iter().filter(|&&m| m).count(), 1);
+        for e in &sc.edges {
+            let bz = e.bezier;
+            assert!(bz[1].0 == bz[0].0 && bz[2].0 == bz[3].0, "{bz:?}");
+            assert!(bz[1].1 > bz[0].1 && bz[2].1 < bz[3].1, "{bz:?}");
         }
     }
 
