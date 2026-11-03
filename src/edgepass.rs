@@ -322,7 +322,7 @@ pub(crate) fn finish_fixed(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool]
     // side's ends in the order their paths now head (G9).
     crate::router::nudge(g, sc, &cx, mode, &mut moved);
     glyph_stubs(sc, &cx, &mut moved);
-    cap_ends(sc, &cx, &mut moved);
+    cap_ends(sc, &cx);
     let budget = match mode {
         Mode::Static => crate::labels::LABEL_STATIC_WORK,
         Mode::Routed => crate::labels::LABEL_ROUTE_WORK,
@@ -445,7 +445,7 @@ fn glyph_stubs(sc: &mut Scene, cx: &Ctx, moved: &mut [bool]) {
 /// scene, picking and the SVG agree, in `scene()`, `route()` and every
 /// drag frame alike. Idempotent: an end on the arc is off the box side
 /// (or, at the arc's middle, on both).
-fn cap_ends(sc: &mut Scene, cx: &Ctx, moved: &mut [bool]) {
+fn cap_ends(sc: &mut Scene, cx: &Ctx) {
     for i in 0..sc.edges.len() {
         let (Some((from, to)), true) = (cx.ends[i], cx.drawn[i]) else {
             continue;
@@ -482,7 +482,9 @@ fn cap_ends(sc: &mut Scene, cx: &Ctx, moved: &mut [bool]) {
                 let a = if at_start { 0 } else { 3 };
                 e.bezier[a] = e.waypoints[k];
             }
-            moved[i] = true;
+            // Not `moved`: the end slides a few px along its own line,
+            // which leaves the label stage nothing to re-place (and a
+            // drag frame no label search per drum end).
         }
     }
 }
