@@ -91,6 +91,17 @@ pub fn to_mermaid(g: &Graph) -> String {
     check_preconditions(g);
 
     let mut out = String::new();
+    // A wrapping width of its own (report M7) rides an init directive,
+    // so the source re-parses into the same drawing. The labels go out
+    // as written: their automatic breaks are the layout's, not text.
+    if let Some(w) = g
+        .wrapping_width()
+        .filter(|&w| w != crate::layout::WRAP_WIDTH)
+    {
+        out.push_str(&format!(
+            "%%{{init: {{\"flowchart\": {{\"wrappingWidth\": {w}}}}}}}%%\n"
+        ));
+    }
     out.push_str("flowchart ");
     out.push_str(dir_token(g.direction));
     out.push('\n');
@@ -460,6 +471,13 @@ fn node_ref(g: &Graph, i: usize) -> String {
         return n.id.clone();
     }
     let (open, close) = shape_delims(n.shape);
+    // A markdown label goes back as the markdown it was written in, not
+    // as its lowered lines (whose breaks the width put there); a body
+    // the string lexer could not hold (a metadata label's backtick or
+    // quote) falls back to the lowered text.
+    if let Some(body) = g.md_label(i).filter(|b| !b.contains(['`', '"'])) {
+        return format!("{}{}\"`{}`\"{}", n.id, open, body, close);
+    }
     format!("{}{}{}{}", n.id, open, label_text(&n.label), close)
 }
 

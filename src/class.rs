@@ -2958,6 +2958,9 @@ struct Built {
 fn build(d: &ClassDiagram) -> Built {
     let mut g = Graph::default();
     g.direction = d.direction;
+    // Boxes are sized and their text laid out by this module's own
+    // painter: node labels never wrap.
+    g.set_wrapping_width(None);
     g.flat_leaves = true;
     g.tight_sources = true;
     // The class painter strokes the edges and draws their ends itself

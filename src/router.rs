@@ -419,7 +419,12 @@ fn clip(a: Pt, b: Pt, r: R) -> Option<(Pt, Pt)> {
     ))
 }
 
-/// Distance from `p` to a node's drawn outline (0 inside).
+/// Distance from `p` to a node's drawn outline (0 inside). Diamonds and
+/// circles exactly; any other shape as its box, which for a hexagon, a
+/// parallelogram or a cylinder (whose outline lies inside it) errs on
+/// the side of clearance: a path never threads a slant's empty corner,
+/// and the ends themselves go onto the true outline afterwards
+/// (`edgepass::snap_ends`, report M6).
 fn outline_gap(r: R, shape: Shape, p: Pt) -> f64 {
     let (hw, hh) = ((r.2 - r.0) / 2.0, (r.3 - r.1) / 2.0);
     let (cx, cy) = ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0);
@@ -786,6 +791,17 @@ impl World {
         match e {
             EndRef::Node(v) => self.nodes[v].0,
             EndRef::Frame(f) => self.frames[f],
+        }
+    }
+
+    /// The side of `e` another edge's end `p` belongs to: a drag's kept
+    /// edge may end on its node's outline, inside the box
+    /// (`edgepass::snap_ends`), where the outline decides
+    /// ([`crate::ports::outline_side`]).
+    fn end_side(&self, e: EndRef, p: Pt) -> Side {
+        match e {
+            EndRef::Node(v) => crate::ports::outline_side(self.nodes[v].1, self.nodes[v].0, p),
+            EndRef::Frame(f) => side_of(self.frames[f], p),
         }
     }
 
@@ -2727,7 +2743,7 @@ fn free_slot(
     };
     let others: Vec<f64> = taken
         .iter()
-        .filter(|t| t.0 == end && t.2 != me && side_of(rect, t.1) == side)
+        .filter(|t| t.0 == end && t.2 != me && w.end_side(end, t.1) == side)
         .map(|t| cross_along(usize::from(matches!(side, Side::Left | Side::Right)), t.1).1)
         .collect();
     let at = |t: f64| match side {
@@ -3072,17 +3088,32 @@ fn flat_shape(s: Shape) -> bool {
 /// and the side is straight; `None` otherwise.
 fn slide_range(w: &World, end: EndRef, p: Pt, axis: usize) -> Option<(Side, f64, f64)> {
     let r = w.end_rect(end);
-    if let EndRef::Node(v) = end {
-        if !flat_shape(w.nodes[v].1) {
-            return None;
-        }
-    }
     let side = side_of(r, p);
-    let (moves, t0, t1) = match side {
-        Side::Top | Side::Bottom => (1, r.0, r.2),
-        Side::Left | Side::Right => (0, r.1, r.3),
+    let moves = match side {
+        Side::Top | Side::Bottom => 1,
+        Side::Left | Side::Right => 0,
     };
-    let (lo, hi) = (t0 + PORT_INSET, t1 - PORT_INSET);
+    let (lo, hi) = match end {
+        EndRef::Node(v) => {
+            let shape = w.nodes[v].1;
+            if !flat_shape(shape) {
+                return None;
+            }
+            // The part of the side the ports stage spreads ends over:
+            // a hexagon's or a parallelogram's top off its slants, a
+            // cylinder's flank off its shoulders; none on a hexagon's
+            // point. The final stage puts the slid end on the outline
+            // along its leg (`edgepass::snap_ends`).
+            crate::ports::slide_span(shape, r, side)?
+        }
+        EndRef::Frame(_) => {
+            let (t0, t1) = match side {
+                Side::Top | Side::Bottom => (r.0, r.2),
+                Side::Left | Side::Right => (r.1, r.3),
+            };
+            (t0 + PORT_INSET, t1 - PORT_INSET)
+        }
+    };
     (moves == axis && lo <= hi).then_some((side, lo, hi))
 }
 
@@ -3201,7 +3232,6 @@ impl Fences<'_> {
         old: Pt,
         p: Pt,
     ) -> bool {
-        let r = self.w.end_rect(end);
         let tangent = |q: Pt| match side {
             Side::Top | Side::Bottom => q.0,
             Side::Left | Side::Right => q.1,
@@ -3214,7 +3244,7 @@ impl Fences<'_> {
             [(info.ends.0, a), (info.ends.1, b)].iter().all(|&(e, q)| {
                 let (now, was) = (tangent(q) - tangent(p), tangent(q) - tangent(old));
                 e != end
-                    || side_of(r, q) != side
+                    || self.w.end_side(e, q) != side
                     || (now * was > 0.0 && now.abs() >= PORT_SPACING.min(was.abs()) - EPS)
             })
         })

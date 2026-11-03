@@ -12,8 +12,8 @@
 //! 4. `to_svg(&scene)` exports any arrangement to SVG.
 
 use crate::layout::{
-    intrinsic_size, layout_clustered_ranked, layout_sized, text_width, title_extra, LayoutResult,
-    Placed, RankGroup, BAR_SIZE, FRAME_GAP, GAP_B, LABEL_BOX_H, TITLE_LINE_H, TITLE_SCALE,
+    layout_clustered_ranked, layout_sized, text_width, title_extra, LayoutResult, Placed,
+    RankGroup, BAR_SIZE, FRAME_GAP, GAP_B, LABEL_BOX_H, TITLE_LINE_H, TITLE_SCALE,
 };
 use crate::model::{
     Direction, Edge, EdgeAnimation, EdgeCurve, EdgeEnds, EdgeKind, EdgeMeta, End, Graph, Marker,
@@ -108,6 +108,17 @@ pub struct SceneNode {
     pub w: f64,
     pub h: f64,
     pub shape: Shape,
+    /// The label as drawn: `\n` line breaks — the source's own and, in
+    /// a label without any, the automatic wrap at the graph's
+    /// [`Graph::wrapping_width`] ([`crate::layout::wrap_label`]) — and
+    /// `<b>` / `<i>` markup. [`scene`], [`route`] and [`route_partial`]
+    /// size the node for exactly these lines; [`scene_sized`] /
+    /// [`route_sized`] wrap with the same built-in text estimate whatever
+    /// sizes they are given, and [`scene_sized_with`] /
+    /// [`route_sized_with`] with the embedder's own measure, so the lines
+    /// are the ones a box sized by
+    /// [`crate::layout::intrinsic_size_wrapped`] with that measure holds.
+    /// The model's `Node::label` keeps a plain label as written.
     pub label: String,
     /// Custom colors from `style`/`classDef`; empty = shape theme.
     pub style: NodeStyle,
@@ -242,9 +253,12 @@ impl Scene {
 
     /// Index of the topmost node whose shape contains `(x, y)`. Nodes
     /// are tested back-to-front (later-drawn wins, as painted), and the
-    /// test is shape-precise for diamonds and (double) circles — their
-    /// bounding box would over-select the empty corners — and the
-    /// bounding rectangle for every other shape.
+    /// test is shape-precise for every shape whose outline leaves its
+    /// box's corners empty — diamonds, (double) circles, hexagons,
+    /// parallelograms, cylinders, stadiums and rounded boxes, as the
+    /// flowchart painter draws them, on whose outline every edge end
+    /// sits — and the bounding rectangle for plain boxes (`Rect`,
+    /// `Subroutine`, a fork bar).
     pub fn node_at(&self, x: f64, y: f64) -> Option<usize> {
         self.nodes.iter().rposition(|n| node_contains(n, x, y))
     }
@@ -366,13 +380,37 @@ impl Scene {
     }
 }
 
-/// Whether a node's SHAPE (not just its bounding box) contains a point.
+/// Whether a node's SHAPE (not just its bounding box) contains a point:
+/// the region inside the outline `to_svg` paints ([`node_outline`],
+/// exactly rather than flattened), which is also where
+/// [`crate::edgepass`] puts every edge end ([`outline_along`]). Plain
+/// boxes (`Rect`, `Subroutine`, a fork bar) are their bounding
+/// rectangle: other diagrams' painters draw their `Rect` nodes with
+/// corners of their own (a git commit's square, a class card), and a
+/// 3 px corner is nothing to pick round.
 fn node_contains(n: &SceneNode, x: f64, y: f64) -> bool {
     let (hw, hh) = (n.w / 2.0, n.h / 2.0);
     if hw <= 0.0 || hh <= 0.0 {
         return false;
     }
     let (dx, dy) = ((x - n.x).abs(), (y - n.y).abs());
+    let circle = matches!(
+        n.shape,
+        Shape::Circle | Shape::DoubleCircle | Shape::StateStart | Shape::StateEnd
+    );
+    // A circle is a disc of radius w/2 whatever its height; every other
+    // outline lies within its box.
+    if !circle && (dx > hw || dy > hh) {
+        return false;
+    }
+    // Inside a box whose corners are elliptic arcs of radii (rx, ry),
+    // each clamped to its half extent as an SVG `<rect rx>` draws it.
+    let rounded = |rx: f64| {
+        let (rx, ry) = (rx.min(hw), rx.min(hh));
+        let (ox, oy) = (dx - (hw - rx), dy - (hh - ry));
+        ox <= 0.0 || oy <= 0.0 || (ox / rx).powi(2) + (oy / ry).powi(2) <= 1.0
+    };
+    let k = SLANT_MAX.min(n.w / 4.0);
     match n.shape {
         // Rhombus: |dx|/hw + |dy|/hh <= 1.
         Shape::Diamond => dx / hw + dy / hh <= 1.0,
@@ -382,8 +420,34 @@ fn node_contains(n: &SceneNode, x: f64, y: f64) -> bool {
         Shape::Circle | Shape::DoubleCircle | Shape::StateStart | Shape::StateEnd => {
             dx * dx + dy * dy <= hw * hw
         }
-        // Everything else: bounding rectangle.
-        _ => dx <= hw && dy <= hh,
+        Shape::Rounded => rounded(ROUNDED_RX),
+        Shape::Stadium => rounded(hh),
+        // The side points sit `k` in from the box at the top and bottom
+        // and on it at mid height.
+        Shape::Hexagon => dx <= hw - k * dy / hh,
+        // Each flank runs `k` across over the full height: `/ /` has
+        // its top edge `k` in from the left and its bottom edge `k` in
+        // from the right, `\ \` the mirror image.
+        Shape::Parallelogram | Shape::ParallelogramAlt => {
+            let (sx, sy) = (x - n.x, y - n.y);
+            // How far in from the left (and from the right) the outline
+            // is at this height: `k` at one edge, 0 at the other.
+            let down = (sy + hh) / (2.0 * hh);
+            let (left, right) = if n.shape == Shape::Parallelogram {
+                (k * (1.0 - down), k * down)
+            } else {
+                (k * down, k * (1.0 - down))
+            };
+            sx >= -hw + left && sx <= hw - right
+        }
+        // The lid's back arc above, the bottom arc below, both of the
+        // cap ellipse (`rx` = the half width) round the cap centres.
+        Shape::Cylinder => {
+            let ry = cylinder_ry(n.w, n.h);
+            let over = dy - (hh - ry);
+            over <= 0.0 || ry <= 0.0 || (dx / hw).powi(2) + (over / ry).powi(2) <= 1.0
+        }
+        Shape::Rect | Shape::Subroutine | Shape::ForkBar => true,
     }
 }
 
@@ -2827,8 +2891,8 @@ fn point_seg_dist(px: f64, py: f64, a: (f64, f64), b: (f64, f64)) -> f64 {
 /// to final coordinates. This is the source of truth that
 /// `render::render` uses as well.
 pub fn scene(g: &Graph) -> Scene {
-    let sizes: Vec<(f64, f64)> = g.nodes.iter().map(intrinsic_size).collect();
-    scene_sized(g, &sizes)
+    let (labels, sizes) = crate::layout::node_texts(g);
+    scene_labelled(g, &sizes, &labels)
 }
 
 /// Same as [`scene`] but with caller-provided node sizes — for
@@ -2837,7 +2901,30 @@ pub fn scene(g: &Graph) -> Scene {
 /// (laid across the flow and spanning them, see `fit_bars`); every
 /// other valid size is used as given, and a negative or non-finite
 /// width or height counts as 0, as in [`route_sized`].
+///
+/// Each node's label (`SceneNode::label`) is wrapped at the graph's
+/// width with the built-in text estimate, as [`scene`] wraps it; sizes
+/// measured with a real font go with [`scene_sized_with`].
 pub fn scene_sized(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
+    scene_labelled(g, sizes, &crate::layout::node_texts(g).0)
+}
+
+/// [`scene_sized`] for an embedder that measures text with its own
+/// font: each node's label is wrapped at the graph's width
+/// ([`Graph::wrapping_width`]) by `measure` — a label line's width at
+/// [`crate::layout::TEXT_CALIBRATION`], as
+/// [`crate::layout::intrinsic_size_wrapped`] takes it — so
+/// `SceneNode::label` holds exactly the lines a box sized by
+/// `intrinsic_size_wrapped(&g.nodes[i], g.wrapping_width(), measure)`
+/// was fitted to. [`scene_sized`] wraps with the built-in estimate,
+/// whose lines a real font's boxes may not hold.
+pub fn scene_sized_with(g: &Graph, sizes: &[(f64, f64)], measure: impl Fn(&str) -> f64) -> Scene {
+    scene_labelled(g, sizes, &crate::layout::node_labels(g, &measure))
+}
+
+/// [`scene_sized`] with each node's drawn label given (index-parallel
+/// with `g.nodes`).
+fn scene_labelled(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene {
     assert_eq!(
         sizes.len(),
         g.nodes.len(),
@@ -2846,19 +2933,19 @@ pub fn scene_sized(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
     let sizes = sane_sizes(sizes);
     let sizes = &fit_bars(g, &sizes)[..];
     let mut sc = if g.subgraphs.is_empty() {
-        scene_flat(g, sizes)
+        scene_flat(g, sizes, labels)
     } else {
-        scene_clustered(g, sizes)
+        scene_clustered(g, sizes, labels)
     };
     crate::edgepass::finish(g, &mut sc, crate::edgepass::Mode::Static);
     sc
 }
 
 /// The classic single-level pipeline (no subgraphs).
-fn scene_flat(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
+fn scene_flat(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene {
     let lo = layout_sized(g, sizes);
     let lanes = static_lanes(g, &lo, None, g.edges.len());
-    let mut sc = scene_from_layout(g, sizes, lo, &lanes, g.edges.len());
+    let mut sc = scene_from_layout(g, sizes, labels, lo, &lanes, g.edges.len());
     let moved = avoid_label_overlaps(&sc.nodes, &[], &mut sc.edges, LABEL_STATIC_WORK);
     fit_moved_labels(&mut sc, &moved);
     sc
@@ -2934,6 +3021,7 @@ fn static_lanes(
 fn scene_from_layout(
     g: &Graph,
     sizes: &[(f64, f64)],
+    labels: &[String],
     lo: LayoutResult,
     lanes: &[Option<crate::lanes::Lane>],
     real: usize,
@@ -3160,7 +3248,7 @@ fn scene_from_layout(
                 w,
                 h,
                 shape: n.shape,
-                label: n.label.clone(),
+                label: labels[i].clone(),
                 style: n.style.clone(),
                 link: g.links.get(&i).and_then(NodeLink::sanitized),
             }
@@ -3215,7 +3303,7 @@ const GRID_MIN_EDGELESS: usize = 4;
 /// contiguous, then wrap each subgraph around its final members. This
 /// keeps cross-cluster edges ordered globally so they route through the
 /// gaps between boxes instead of tangling straight through them.
-fn scene_clustered(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
+fn scene_clustered(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene {
     let node_cluster = node_cluster_paths(g);
     let grid = grid_pairs(g, &node_cluster);
     let proxies = sub_edge_proxies(g, &node_cluster, &grid);
@@ -3276,7 +3364,7 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
     };
     let (lo, groups) = layout_clustered_ranked(&ga, sizes, &node_cluster, &rank_only);
     let lanes = static_lanes(&ga, &lo, Some(&node_cluster), ne);
-    let mut sc = scene_from_layout(&ga, sizes, lo, &lanes, ne);
+    let mut sc = scene_from_layout(&ga, sizes, labels, lo, &lanes, ne);
     let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
 
     // Wrap boxes around the laid-out members, then widen each box to
@@ -4101,8 +4189,8 @@ pub(crate) fn shift_scene(sc: &mut Scene, dx: f64, dy: f64) {
 /// diagram doesn't "swim" while dragging; `to_svg` handles
 /// translation at export time.
 pub fn route(g: &Graph, centers: &[(f64, f64)]) -> Scene {
-    let sizes: Vec<(f64, f64)> = g.nodes.iter().map(intrinsic_size).collect();
-    route_sized(g, centers, &sizes)
+    let (labels, sizes) = crate::layout::node_texts(g);
+    route_labelled(g, centers, &sizes, &labels)
 }
 
 /// Same as [`route`] but with caller-provided node sizes (a fork/join
@@ -4115,7 +4203,34 @@ pub fn route(g: &Graph, centers: &[(f64, f64)]) -> Scene {
 /// where it lies). Nodes may also share a centre. For finite centres
 /// the returned geometry (every bezier point, waypoint and label spot)
 /// is finite whatever the sizes; valid sizes are used exactly as given.
+///
+/// Labels are wrapped with the built-in text estimate, as in
+/// [`scene_sized`]; sizes measured with a real font go with
+/// [`route_sized_with`].
 pub fn route_sized(g: &Graph, centers: &[(f64, f64)], sizes: &[(f64, f64)]) -> Scene {
+    route_labelled(g, centers, sizes, &crate::layout::node_texts(g).0)
+}
+
+/// [`route_sized`] with each node's label wrapped by `measure`, as
+/// [`scene_sized_with`] wraps it: the drag counterpart for an embedder
+/// that sizes its nodes with its own font.
+pub fn route_sized_with(
+    g: &Graph,
+    centers: &[(f64, f64)],
+    sizes: &[(f64, f64)],
+    measure: impl Fn(&str) -> f64,
+) -> Scene {
+    route_labelled(g, centers, sizes, &crate::layout::node_labels(g, &measure))
+}
+
+/// [`route_sized`] with each node's drawn label given (index-parallel
+/// with `g.nodes`).
+fn route_labelled(
+    g: &Graph,
+    centers: &[(f64, f64)],
+    sizes: &[(f64, f64)],
+    labels: &[String],
+) -> Scene {
     assert_eq!(
         centers.len(),
         g.nodes.len(),
@@ -4128,7 +4243,7 @@ pub fn route_sized(g: &Graph, centers: &[(f64, f64)], sizes: &[(f64, f64)]) -> S
     );
     let sizes = sane_sizes(sizes);
     let sizes = &fit_bars(g, &sizes)[..];
-    let mut sc = route_built(g, centers, sizes, true);
+    let mut sc = route_built(g, centers, sizes, labels, true);
     crate::edgepass::finish(g, &mut sc, crate::edgepass::Mode::Routed);
     sc
 }
@@ -4142,6 +4257,7 @@ fn route_built(
     g: &Graph,
     centers: &[(f64, f64)],
     sizes: &[(f64, f64)],
+    labels: &[String],
     place_labels: bool,
 ) -> Scene {
     let placed: Vec<Placed> = (0..g.nodes.len())
@@ -4165,7 +4281,7 @@ fn route_built(
             w: sizes[i].0,
             h: sizes[i].1,
             shape: n.shape,
-            label: n.label.clone(),
+            label: labels[i].clone(),
             style: n.style.clone(),
             link: g.links.get(&i).and_then(NodeLink::sanitized),
         })
@@ -4589,14 +4705,15 @@ pub fn route_partial(
     if !moved.iter().any(|&m| m) {
         return base.clone();
     }
-    let sizes: Vec<(f64, f64)> = g.nodes.iter().map(intrinsic_size).collect();
-    let sizes = fit_bars(g, &sizes);
+    // Each label wrapped once for the frame (the fallbacks below reuse it).
+    let (labels, raw_sizes) = crate::layout::node_texts(g);
+    let sizes = fit_bars(g, &raw_sizes);
     // No builder label pass: a redrawn edge's label starts at its spot
     // on the new line and the label stage moves it only if it covers
     // something. route() slides every label first so the router can
     // price paths round them; that second pass costs 3-4 ms of a dense
     // drag frame and is left out here (G13).
-    let mut sc = route_built(g, centers, &sizes, false);
+    let mut sc = route_built(g, centers, &sizes, &labels, false);
     // A kept edge is copied from `base` whole (style, end glyphs,
     // label text), and a node's box follows its text: an edit to any of
     // them must not keep stale geometry.
@@ -4617,7 +4734,7 @@ pub fn route_partial(
             .all(|(a, b)| a.id == b.id && a.label == b.label && a.shape == b.shape)
         && clusters_line_up(g, base);
     if !lines_up {
-        return route(g, centers);
+        return route_labelled(g, centers, &raw_sizes, &labels);
     }
     type R = (f64, f64, f64, f64);
     let node_rect = |nd: &SceneNode| -> R {
@@ -4725,7 +4842,7 @@ pub fn route_partial(
     // Most of the drawing redrawn afresh (not merely near the drag): a
     // full route() costs about the same and draws it better.
     if redrawn as f64 > PARTIAL_ROUTE_SHARE * fixed.len() as f64 {
-        return route(g, centers);
+        return route_labelled(g, centers, &raw_sizes, &labels);
     }
     sc.clusters = clusters;
     // The base canvas already covers the kept geometry; the pipeline's
@@ -5183,8 +5300,9 @@ pub(crate) const GLYPH_STUB: f64 = ARROW_MARKER_PX;
 /// Corner radius (px) `to_svg` paints a plain box with: `Rect`,
 /// `Subroutine` and a fork/join bar.
 const BOX_RX: f64 = 3.0;
-/// Corner radius (px) of a `Rounded` node.
-const ROUNDED_RX: f64 = 9.0;
+/// Corner radius (px) of a `Rounded` node, as every painter draws it
+/// (an architecture service card too) and [`Scene::hit_test`] picks it.
+pub(crate) const ROUNDED_RX: f64 = 9.0;
 /// Most inset (px) of a hexagon's side points and of a parallelogram's
 /// slant; a quarter of the width on a narrower node.
 pub(crate) const SLANT_MAX: f64 = 14.0;
@@ -5194,6 +5312,43 @@ pub(crate) const SLANT_MAX: f64 = 14.0;
 pub(crate) fn cylinder_ry(w: f64, h: f64) -> f64 {
     crate::layout::cylinder_cap_ry(w).min(h / 4.0)
 }
+/// The point of cylinder `n`'s shoulder nearest `p`, for an end on its
+/// flank past the straight run (within a cap's height of its top or
+/// bottom): on the cap ellipse's quarter there, which curves in so flatly
+/// that a run along the flank's normal meets it side-on, far in (a hub's
+/// crowded flank: 19 px along a horizontal run, landing among the lid's
+/// own ends). `None` for an end on the straight run or off the flank.
+/// Golden-section search on the quarter's angle, exact to far below a
+/// pixel (the distance to an outside point is unimodal along it).
+pub(crate) fn cylinder_shoulder_point(n: &SceneNode, p: (f64, f64)) -> Option<(f64, f64)> {
+    let (rx, ry) = (n.w / 2.0, cylinder_ry(n.w, n.h));
+    let (dx, dy) = (p.0 - n.x, p.1 - n.y);
+    let run = n.h / 2.0 - ry;
+    if !(rx > 0.0 && ry > 0.0) || dy.abs() <= run || dx.abs() < rx - 0.5 {
+        return None;
+    }
+    // The quarter facing `p`: centre (x, cap centre), angle 0 at the
+    // flank, PI/2 at the lid's (or bottom's) middle.
+    let (sx, sy) = (dx.signum(), dy.signum());
+    let (ox, oy) = (n.x, n.y + sy * run);
+    let at = |a: f64| (ox + sx * rx * a.cos(), oy + sy * ry * a.sin());
+    let d2 = |a: f64| {
+        let q = at(a);
+        (q.0 - p.0).powi(2) + (q.1 - p.1).powi(2)
+    };
+    let g = (5f64.sqrt() - 1.0) / 2.0;
+    let (mut a, mut b) = (0.0, std::f64::consts::FRAC_PI_2);
+    while b - a > 1e-12 {
+        let (c, d) = (b - g * (b - a), a + g * (b - a));
+        if d2(c) <= d2(d) {
+            b = d;
+        } else {
+            a = c;
+        }
+    }
+    Some(at((a + b) / 2.0))
+}
+
 /// How far (in cap radii) below the box centre a cylinder's label sits:
 /// in the middle of the body under the lid, where mermaid sets it, not
 /// up against the lid's front rim (the box centre is a cap radius above
@@ -5275,6 +5430,92 @@ pub(crate) fn node_outline(n: &SceneNode) -> Vec<(f64, f64)> {
         }
     }
 }
+
+/// Step (px) [`outline_along`] marches along its line to find a point
+/// on the other side of the outline: finer than any sliver of a shape a
+/// line could cross between two steps unseen.
+const OUTLINE_MARCH: f64 = 0.5;
+/// How close (px) [`outline_along`] brackets the outline: far below what
+/// any writer prints, so the end it returns is the outline's point.
+const OUTLINE_EXACT: f64 = 1e-9;
+
+/// Where the line through `p` along `out` (a unit vector pointing out of
+/// node `n`, back along the stroke from its end at `p`) crosses the
+/// outline `to_svg` paints, on the side the stroke comes in from: the
+/// end point that keeps the stroke's final run on its line while it
+/// touches the outline (report §2.5: the stages meet a slanted or round
+/// shape as its box, so an end floated beside a parallelogram's flank,
+/// a hexagon's point or a cylinder's lid). The outline is
+/// [`node_contains`]'s, so the end is on the border picking sees.
+/// From outside the line is followed in to where it meets the shape;
+/// from inside (an end sunk into it) out by at most [`OUTLINE_SINK`],
+/// so a run that heads back across the shape — a spilled end's leg
+/// leaving a lid over the drum's shoulder — never carries its end
+/// through the node to the far side. `None` when `p` already lies on
+/// the outline, for a plain box (its outline is its box, where the
+/// stages put the ends), or when the line misses the shape. Exact to
+/// [`OUTLINE_EXACT`].
+pub(crate) fn outline_along(n: &SceneNode, p: (f64, f64), out: (f64, f64)) -> Option<(f64, f64)> {
+    if matches!(n.shape, Shape::Rect | Shape::Subroutine | Shape::ForkBar) {
+        return None;
+    }
+    let contains = |q: (f64, f64)| node_contains(n, q.0, q.1);
+    // `s` px into the node from `p` along the line.
+    let at = |s: f64| (p.0 - s * out.0, p.1 - s * out.1);
+    let inside = |s: f64| contains(at(s));
+    // A bracket (outside, inside) of the crossing, marching from `p`:
+    // outwards from a point inside, inwards from one outside.
+    let (mut lo, mut hi) = if inside(0.0) {
+        let e = OUTLINE_EXACT;
+        let near = [(e, 0.0), (-e, 0.0), (0.0, e), (0.0, -e)];
+        if near.iter().any(|d| !contains((p.0 + d.0, p.1 + d.1))) {
+            return None;
+        }
+        let mut s = 0.0;
+        loop {
+            let next = (s - OUTLINE_MARCH).max(-OUTLINE_SINK);
+            if !inside(next) {
+                break (next, s);
+            }
+            if next <= -OUTLINE_SINK {
+                return None;
+            }
+            s = next;
+        }
+    } else {
+        let reach = n.w.max(0.0) + n.h.max(0.0) + OUTLINE_MARCH;
+        let mut s = 0.0;
+        loop {
+            let next = s + OUTLINE_MARCH;
+            if inside(next) {
+                break (s, next);
+            }
+            if next > reach {
+                return None;
+            }
+            s = next;
+        }
+    };
+    while hi - lo > OUTLINE_EXACT {
+        let mid = (lo + hi) / 2.0;
+        if inside(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let q = at(hi);
+    ((q.0 - p.0).hypot(q.1 - p.1) > OUTLINE_SNAP_EPS).then_some(q)
+}
+
+/// Most (px) [`outline_along`] carries an end sunk into its node back out
+/// to the outline: the stages leave an end on its box, so one inside the
+/// shape by more is not a sunk end but a run heading back in.
+const OUTLINE_SINK: f64 = 1.0;
+
+/// An end [`outline_along`] would move less than this (px) is on the
+/// outline already and keeps its exact bytes.
+const OUTLINE_SNAP_EPS: f64 = 1e-6;
 
 /// A marker variant a `linkStyle`d edge end needs: the glyph in the
 /// edge's stroke colour, and an arrowhead set further ahead of a stroke
@@ -6991,10 +7232,23 @@ fn toward(me: (&Placed, Shape, bool), far: (&Placed, Shape, bool)) -> f64 {
 pub(crate) fn port_lean(shape: Shape, size: (f64, f64), toward: f64, off: f64) -> f64 {
     let flat = match shape {
         Shape::Stadium => size.0 / 2.0 - size.1 / 2.0 - 4.0,
+        Shape::Hexagon | Shape::Parallelogram | Shape::ParallelogramAlt => slant_flat_half(size.0),
         _ => size.0 / 2.0 - 12.0,
     }
     .max(0.0);
     (toward * 0.35 + off).clamp(-flat, flat)
+}
+
+/// How far either way from its middle an end may lean along the side of
+/// a hexagon or a parallelogram `bsize` px across that faces along the
+/// flow: the straight run between the slants (a slant at most
+/// [`SLANT_MAX`] in from each corner), a port inset short of them. An
+/// end leaned further lands on the slant, its head half over the
+/// outline's corner (advanced's `fail` lane: its tip past Developer's
+/// bottom-right vertex). Shared by [`port_lean`] and
+/// [`crate::lanes::port_span`]; may be negative on a narrow node.
+pub(crate) fn slant_flat_half(bsize: f64) -> f64 {
+    bsize / 2.0 - 12.0f64.max(SLANT_MAX.min(bsize / 4.0) + crate::ports::PORT_INSET)
 }
 
 /// Edge exit/entry point on a node's border.
@@ -8771,7 +9025,7 @@ pub(crate) fn assert_drawn_inside_canvas(svg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::LINE_H;
+    use crate::layout::{intrinsic_size, LINE_H};
     use crate::parser::parse;
 
     fn svg_src(src: &str) -> String {
@@ -9294,6 +9548,106 @@ mod tests {
         let mut big = sc.nodes[3].clone();
         (big.w, big.h) = (1e6, 1e6);
         assert!(node_outline(&big).len() <= OUTLINE_MAX_STEPS as usize + 1);
+    }
+
+    #[test]
+    fn picking_takes_the_painted_outline_of_every_shape() {
+        // Report M6: what `node_at` picks is the outline the painter draws
+        // and the edge ends sit on — a box corner a hexagon, a
+        // parallelogram, a drum, a pill or a rounded box leaves empty is
+        // not the node; plain boxes stay their box.
+        let sc = scene(
+            &parse(
+                "flowchart TD\nA[rect]-->B(rounded)-->C([stadium])-->F[(cylinder)]\n\
+                 F-->H{{hexagon}}-->I[/lean right/]-->J[\\lean left\\]-->G[[sub]]",
+            )
+            .unwrap(),
+        );
+        for n in &sc.nodes {
+            assert!(node_contains(n, n.x, n.y), "{} centre", n.id);
+            let o = node_outline(n);
+            // Each painted vertex is inside up to rounding; a point a px
+            // beyond it, away from the centre, is outside.
+            for &(px, py) in &o {
+                let (dx, dy) = (px - n.x, py - n.y);
+                let l = dx.hypot(dy);
+                let at = |s: f64| (n.x + dx * (1.0 + s / l), n.y + dy * (1.0 + s / l));
+                let inner = at(-0.01);
+                assert!(node_contains(n, inner.0, inner.1), "{} at {px},{py}", n.id);
+                let outer = at(1.0);
+                let boxy = matches!(n.shape, Shape::Rect | Shape::Subroutine);
+                assert!(
+                    boxy || !node_contains(n, outer.0, outer.1),
+                    "{} past {px},{py}",
+                    n.id
+                );
+            }
+            // Box corners: all four a plain box's, the two a
+            // parallelogram's slants keep, none of the others'.
+            let (hw, hh) = (n.w / 2.0 - 0.5, n.h / 2.0 - 0.5);
+            let inside = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+                .iter()
+                .filter(|c| node_contains(n, n.x + c.0, n.y + c.1))
+                .count();
+            let want = match n.shape {
+                Shape::Rect | Shape::Subroutine => 4,
+                Shape::Parallelogram | Shape::ParallelogramAlt => 2,
+                _ => 0,
+            };
+            assert_eq!(inside, want, "{} box corners", n.id);
+        }
+    }
+
+    #[test]
+    fn outline_along_puts_an_end_on_the_painted_outline() {
+        let sc = scene(&parse("flowchart LR\nA[/lean/] --> B[(db)] --> C{{hex}}").unwrap());
+        let node = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap().clone();
+        let a = node("A");
+        let (l, r, t) = (a.x - a.w / 2.0, a.x + a.w / 2.0, a.y - a.h / 2.0);
+        let k = SLANT_MAX.min(a.w / 4.0);
+        // `/ /`'s right flank runs from (r, t) to (r - k, b): an end on
+        // the box side at mid height, run leaving to the right, goes in
+        // k/2 along its run.
+        let q = outline_along(&a, (r, a.y), (1.0, 0.0)).expect("moves in");
+        assert!(
+            (q.0 - (r - k / 2.0)).abs() < 1e-6 && (q.1 - a.y).abs() < 1e-9,
+            "{q:?}"
+        );
+        // On the outline already, it stays.
+        assert_eq!(outline_along(&a, q, (1.0, 0.0)), None);
+        assert_eq!(outline_along(&a, (l + k, t), (0.0, -1.0)), None);
+        // An end sunk half a px comes back out; a run heading back across
+        // the shape (leaving a point deep inside) never carries the end
+        // through the node to its far side.
+        let sunk = outline_along(&a, (q.0 - 0.5, q.1), (1.0, 0.0)).expect("comes out");
+        assert!((sunk.0 - q.0).abs() < 1e-6, "{sunk:?}");
+        assert_eq!(outline_along(&a, (a.x, a.y), (1.0, 0.0)), None);
+        // A run that misses the shape leaves the end where it is.
+        assert_eq!(outline_along(&a, (r + 0.2, t - 0.2), (0.0, -1.0)), None);
+        // The drum's lid: an end on the box top, a quarter of the way in,
+        // goes down onto the back arc.
+        let b = node("B");
+        let (rx, ry) = (b.w / 2.0, cylinder_ry(b.w, b.h));
+        let x = b.x + rx / 2.0;
+        let q = outline_along(&b, (x, b.y - b.h / 2.0), (0.0, -1.0)).expect("onto the lid");
+        let want = b.y - b.h / 2.0 + ry * (1.0 - (1.0f64 - 0.25).sqrt());
+        assert!(
+            (q.0 - x).abs() < 1e-9 && (q.1 - want).abs() < 1e-6,
+            "{q:?} vs {want}"
+        );
+        // A plain box is its outline.
+        let mut boxed = a.clone();
+        boxed.shape = Shape::Rect;
+        assert_eq!(outline_along(&boxed, (r, a.y), (1.0, 0.0)), None);
+        // The shoulder's nearest point lies on the cap ellipse, nearer
+        // than the box corner beside it.
+        let p = (b.x + rx, b.y - b.h / 2.0 + ry / 3.0);
+        let s = cylinder_shoulder_point(&b, p).expect("on the shoulder");
+        let cap = (b.y - b.h / 2.0) + ry;
+        let on = ((s.0 - b.x) / rx).powi(2) + ((s.1 - cap) / ry).powi(2);
+        assert!((on - 1.0).abs() < 1e-6, "{s:?} off the ellipse ({on})");
+        assert!((s.0 - p.0).hypot(s.1 - p.1) < ry, "{s:?}");
+        assert_eq!(cylinder_shoulder_point(&b, (b.x + rx, b.y)), None);
     }
 
     #[test]
@@ -10834,8 +11188,11 @@ mod tests {
         moved[ci].1 = draft.y;
         let r = route(&g, &moved);
         let (_, e, draft, _) = link(&r);
+        // On the flank — near its corner, on the rounded corner's arc
+        // (`edgepass::snap_ends`), within 1.5 px of the box side.
         assert!(
-            (e.bezier[0].0 - (draft.x + draft.w / 2.0)).abs() < 0.5,
+            (e.bezier[0].0 - (draft.x + draft.w / 2.0)).abs() < 1.5
+                && (e.bezier[0].1 - draft.y).abs() < draft.h / 2.0,
             "flow side: {e:?}"
         );
         // `note right of S` lands past S's own fan, a transition from S
@@ -11486,8 +11843,11 @@ mod tests {
     fn a_title_overflowing_its_frame_onto_the_canvas_stays_whole() {
         let long = "a long subgraph title, wider than its box";
         let s = scene(
+            // The node label kept on one line (it would wrap at the
+            // default width), so it reaches past the title.
             &parse(&format!(
-                "flowchart TB\nsubgraph R [\"{long}\"]\n  r\nend\n\
+                "%%{{init: {{\"flowchart\": {{\"wrappingWidth\": 2000}}}}}}%%\n\
+                 flowchart TB\nsubgraph R [\"{long}\"]\n  r\nend\n\
                  r --> w[\"a node label that is far wider than the subgraph title above it, so \
                  the canvas reaches well past the title\"]"
             ))
@@ -12949,8 +13309,8 @@ mod tests {
         // straight labelled edge is no taller than its nodes and a chip
         // beside them (the label's 300 px width made it 350 px tall).
         let g = parse("flowchart LR\nA -->|a very very long label for one short edge| B").unwrap();
-        let sizes = g.nodes.iter().map(intrinsic_size).collect::<Vec<_>>();
-        let sc = scene_flat(&g, &sizes);
+        let (labels, sizes) = crate::layout::node_texts(&g);
+        let sc = scene_flat(&g, &sizes, &labels);
         let tallest = sc.nodes.iter().map(|n| n.h).fold(0.0, f64::max);
         assert!(
             sc.height <= tallest + LABEL_BOX_H + 2.0 * MARGIN,
@@ -15381,6 +15741,64 @@ mod tests {
         svg.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
             .find(|t| t.parse::<f64>().is_ok_and(|v| !v.is_finite()))
             .map(|t| format!("svg writes {t:?}"))
+    }
+
+    /// Report M7, the host contract: an embedder that measures text with
+    /// its own font sizes its nodes with `intrinsic_size_wrapped` and
+    /// hands the same measure to `scene_sized_with` / `route_sized_with`,
+    /// and every label line it gets back is one its box was sized for —
+    /// with the built-in estimate's lines, a 15 % wider font's boxes
+    /// (two lines tall) got one 218 px line into 124 px of room.
+    #[test]
+    fn an_embedders_measure_gives_the_lines_its_boxes_hold() {
+        use crate::layout::{intrinsic_size_wrapped, wrap_label, BASE_H, PAD_X};
+        let labels = [
+            "Escalate the ticket to level two",
+            "Notify the account manager",
+            "Send the invoice to customer",
+            "Check stock in the warehouse",
+        ];
+        let mut src = String::from("flowchart TD\n");
+        for (i, l) in labels.iter().enumerate() {
+            src += &format!("N{i}[{l}]\n");
+        }
+        src += "N0 --> Q{Is the payment valid for this order?} --> N1\nN2 --> N3\n";
+        let g = parse(&src).unwrap();
+        let ww = g.wrapping_width().unwrap();
+        let real = |s: &str| text_width(s) * 1.15;
+        let sizes: Vec<(f64, f64)> = g
+            .nodes
+            .iter()
+            .map(|n| intrinsic_size_wrapped(n, Some(ww), real))
+            .collect();
+        let sc = scene_sized_with(&g, &sizes, real);
+        let centers: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let rt = route_sized_with(&g, &centers, &sizes, real);
+        for s in [&sc, &rt] {
+            for (n, m) in s.nodes.iter().zip(&g.nodes) {
+                assert_eq!(n.label, wrap_label(m, ww, real), "{}", n.id);
+                let widest = n.label.lines().map(real).fold(0.0, f64::max);
+                let lines = n.label.lines().count() as f64;
+                match n.shape {
+                    Shape::Rect => {
+                        assert!(widest + 2.0 * PAD_X <= n.w + 1e-9, "{}", n.id);
+                        assert_eq!(n.h, BASE_H + (lines - 1.0) * LINE_H, "{}", n.id);
+                    }
+                    Shape::Diamond => {
+                        assert!(lines > 1.0);
+                        assert!(((widest + 24.0) * 1.6 - n.w).abs() < 1e-9, "{}", n.id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // The built-in estimate breaks a 15 % wider font's labels in
+        // other places: its lines do not fit these boxes.
+        let est = scene_sized(&g, &sizes);
+        assert!(est
+            .nodes
+            .iter()
+            .any(|n| n.label.lines().map(real).fold(0.0, f64::max) + 2.0 * PAD_X > n.w + 1.0));
     }
 
     #[test]
