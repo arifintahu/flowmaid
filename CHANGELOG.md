@@ -199,7 +199,9 @@ Minor, not patch: several class structs gain public fields (see
   innermost frame holding both its ends (a last tie-break, never a reason
   to reroute).
 - **Self-loops keep their room** (report P0 #13): the layout keeps a
-  looped node's loop (and 12 px) clear of its high-side neighbour, so a
+  looped node's loop (and 12 px) clear of its high-side neighbour —
+  widening the gap only by what the loop reaches past it (stress is 269
+  px wide, 221 before, 293 while the whole reach was added) — so a
   long edge's channel beside it no longer runs through the loop's apex
   (stress: `A ==> D`), and a back-edge's lane clears the loop too. The
   router treats every self-loop as an obstacle, so `route()` keeps other

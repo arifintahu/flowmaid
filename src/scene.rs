@@ -12349,15 +12349,17 @@ mod tests {
         // a back-edge's ends, not round its ends' own boxes (demo 383 ->
         // 321 wide in the report), and a wide LR label no longer spreads
         // its back-edge across the flow (wide-labels 413 -> 201 tall at
-        // most). Stress grows instead: its loop keeps its room from the
-        // thick edge's channel, and the dashed back-edge takes the side
-        // that crosses nothing (report P0 #13).
+        // most). Stress grows instead (221 -> 270): its loop keeps its
+        // room from the thick edge's channel — what the loop reaches past
+        // the node's half of the gap, not the whole reach on top of it
+        // (293 wide) — and the dashed back-edge takes the side that
+        // crosses nothing (report P0 #13).
         assert!(
             sizes["back-edge"].0 < 300.0,
             "back-edge {:?}",
             sizes["back-edge"]
         );
-        assert!(sizes["stress"].0 < 300.0, "stress {:?}", sizes["stress"]);
+        assert!(sizes["stress"].0 < 275.0, "stress {:?}", sizes["stress"]);
         assert!(sizes["demo"].0 <= 321.5, "demo {:?}", sizes["demo"]);
         assert!(
             sizes["wide-labels"].1 <= 201.0,

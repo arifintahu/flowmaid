@@ -158,7 +158,16 @@ fn quality_gate() {
 /// frame's right border for 99 px, is searched on past a first
 /// candidate that does not beat it (`router::repair`) and leaves the
 /// border (`dense-td`'s `n21 -> n16`, a 63 px ride, is a reversed S now).
-const BORDER_LEN_MAX: (f64, f64) = (1_020.0, 2_070.0);
+/// Routed, the fixtures measured 1975 before B3 and 2061 after: in
+/// bench-75's `route()` the lanes now take the sides `scene()` takes,
+/// and the forward edges the router redraws round them ride borders a
+/// drag frame does not search off (`router::repair` searches only a
+/// cramped node in `route()`, G13): `svc3 -> db` 140 px on the data
+/// frame's left, `svc1 -> objects` 62 px on the app frame's right and
+/// `queue -> job2` 57 px on the jobs frame's left, where `svc1 -> db`
+/// (87 px) and `svc6 -> db` (85 px) rode before (bench-75 274 -> 360 px,
+/// border_runs 4 -> 5). Ratcheted to just above that: 2070 -> 2065.
+const BORDER_LEN_MAX: (f64, f64) = (1_020.0, 2_065.0);
 
 /// Edges keep off frame borders where their channel has room (G4).
 #[test]

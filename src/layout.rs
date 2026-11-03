@@ -2262,7 +2262,11 @@ fn place(
     // high-side neighbour, where the scene draws the loop (report P0
     // #13: a channel beside it ran through the loop's apex). A
     // separation size counts on both sides; a node with no high-side
-    // neighbour needs none.
+    // neighbour needs none. The node's own half of the gap between
+    // neighbours (`pair_sep`: GAP_B / 2) already lies past its side, so
+    // only what the loop reaches beyond it widens the node (stress's
+    // `A ==> D` channel ran 54 px past the loop's apex, the canvas 72 px
+    // wider than it needed).
     let loops = crate::scene::loop_reach(g);
     let spaced = if loops.iter().any(|&r| r > 0.0) {
         let mut sep = spaced.unwrap_or_else(|| absize.clone());
@@ -2270,7 +2274,8 @@ fn place(
             for w in lay.windows(2) {
                 let v = w[0];
                 if v < n && loops[v] > 0.0 {
-                    sep[v] = sep[v].max(absize[v] + 2.0 * (loops[v] + NODE_SEP));
+                    let past = (loops[v] + NODE_SEP - GAP_B / 2.0).max(0.0);
+                    sep[v] = sep[v].max(absize[v] + 2.0 * past);
                 }
             }
         }
