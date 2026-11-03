@@ -435,18 +435,29 @@ fn outline_gap(r: R, shape: Shape, p: Pt) -> f64 {
 /// How bad one drawn edge is, compared lexicographically: unrelated
 /// nodes it crosses (G6: the worst, a line through a box reads as a
 /// connection); then foreign frames it enters and title chips it
-/// touches; then a flow-axis backtrack (so of two equal routes the
-/// monotone one wins); then px on top of accepted edges, crossings at
-/// an arrowhead, cramped nodes,
+/// touches; then px outside its own frame; then a flow-axis backtrack
+/// (so of two equal routes the monotone one wins); then px on top of
+/// accepted edges, crossings at an arrowhead, cramped nodes,
 /// crossings with accepted edges, px cramped beside accepted edges,
-/// other edges' labels it runs under, px along frame borders and node
-/// sides, and px outside its own frame.
+/// other edges' labels it runs under, and px along frame borders and
+/// node sides.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Score {
     node: usize,
     frame: usize,
     /// Frame title chips the path touches (G6).
     chip: usize,
+    /// px of path outside the innermost frame holding both its ends
+    /// (report §2.2): an edge between two members of a box belongs
+    /// inside it, as much as an edge keeps out of a box it has no end
+    /// in — so it ranks with the frames, ahead of a backtrack or a
+    /// crossing. Never a reason to reroute on its own (the repair asks
+    /// for node, frame and chip hits), but of the candidates a reroute
+    /// weighs the one that stays home wins: in `route()`, a member's
+    /// edge to its own box's entry member left the box through its
+    /// bottom and came back in, 798 px out, rather than backtrack along
+    /// the flow inside it (q21).
+    out: usize,
     wiggle: usize,
     /// px of parallel run on top of accepted edges (within
     /// [`EDGE_SPACING`]), over the pairs whose run passes
@@ -471,11 +482,6 @@ struct Score {
     /// [`TIGHT_RUN_MIN`] (G4): of two otherwise equal routes, the one in
     /// the middle of its channel wins.
     hug: usize,
-    /// px of path outside the innermost frame holding both its ends
-    /// (report §2.2): an edge between two members of a box belongs
-    /// inside it. The softest price: never a reason to reroute, but of
-    /// two otherwise equal candidates the one that stays home wins.
-    out: usize,
 }
 
 impl Score {

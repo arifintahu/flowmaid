@@ -209,8 +209,12 @@ Minor, not patch: several class structs gain public fields (see
   edge bulged out of CI/CD) — in `route()` and `route_partial()` too, so
   a labelled loop inside nested boxes no longer jumps out of both frames
   on the first drag — and the router prices any path that leaves the
-  innermost frame holding both its ends (a last tie-break, never a reason
-  to reroute).
+  innermost frame holding both its ends right after a foreign frame or
+  title chip it enters, ahead of a backtrack or a crossing (never a
+  reason to reroute on its own, but of the paths a reroute weighs the one
+  that stays home wins: a member's edge to its own box's entry member no
+  longer leaves the box through its bottom and comes back in, 798 px out,
+  in `route()`).
 - **Self-loops keep their room** (report P0 #13): the layout keeps a
   looped node's loop (and 12 px) clear of its high-side neighbour —
   widening the gap only by what the loop reaches past it (stress is 269

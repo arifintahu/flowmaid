@@ -13408,6 +13408,39 @@ mod tests {
     }
 
     #[test]
+    fn a_rerouted_edge_between_members_stays_in_their_frame_in_route() {
+        // B3 review r5 #3 (q21): in route() a member's edge to its own
+        // box (drawn to the box's entry member, `n5 <--> F0` to Node 6)
+        // was rerouted out through the frame's bottom and back in, 798
+        // px outside it, because the router priced leaving home below a
+        // backtrack along the flow. It now ranks with the frames: of the
+        // candidates the one that stays inside wins, in route() as in
+        // scene().
+        let src = "flowchart LR\n  subgraph F0 [Frame 0]\n    n6[/Node 6/]\n    \
+                   n5(Node 5 with a longer label)\n  end\n  n4 -->|lbl| n2\n  n10 --o F0\n  \
+                   n9 ==> n7\n  n3 o--o n5\n  n7 o--o F0\n  n8 <-.-> n13\n  n1 --x n0\n  \
+                   n13 --o n13\n  n13 -->|lbl| n2\n  n7 x--x F0\n  n1 -->|lbl| n8\n  \
+                   n5 <--> F0\n  n6 --x F0\n  n0 ==> n3\n  n12 --- n11\n  n9 -.->|dot| n8\n  \
+                   n2 <==> n8\n  n8 -->|lbl| n1\n  n0 <-.-> n7\n  n5 -.-> n8\n  \
+                   n1 -.->|dot| F0\n  n7 <==> n8\n  n6 --o n7\n  n5 --- n9\n  n10 ==> F0\n  \
+                   n8 -.-> n0\n  n9 --o n12\n  n4 <-.-> n5\n";
+        for sc in static_and_routed(src) {
+            let f = sc.clusters.iter().find(|c| c.id == "F0").unwrap();
+            for e in sc.edges.iter().filter(|e| e.from == "n5" && e.to == "F0") {
+                for (x, y) in edge_polyline(e) {
+                    assert!(
+                        x >= f.x - 0.5
+                            && x <= f.x + f.w + 0.5
+                            && y >= f.y - 0.5
+                            && y <= f.y + f.h + 0.5,
+                        "({x:.1}, {y:.1}) outside {f:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_parallel_label_and_a_loop_keep_off_the_other_lines() {
         // stress (report P0 #13): the `parallel` label clears the
         // unlabelled twin, and the thick A ==> D keeps clear of B's loop.
