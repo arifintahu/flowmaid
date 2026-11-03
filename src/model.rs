@@ -428,6 +428,13 @@ pub struct Graph {
     /// painter will not draw: no straight glyph stubs, no arrow trims.
     /// `None` = a flowchart (or state) graph.
     pub(crate) edge_paint_width: Option<f64>,
+    /// The width node labels wrap at when not [`crate::layout::WRAP_WIDTH`]
+    /// (`flowchart.wrappingWidth` from an init directive or the
+    /// frontmatter); see [`Graph::wrapping_width`].
+    wrap_width: Option<f64>,
+    /// Labels never wrap: set by [`Graph::set_wrapping_width`]`(None)`
+    /// (class and ER graphs, whose painters lay their own text out).
+    no_wrap: bool,
     index: HashMap<String, usize>,
 }
 
@@ -650,6 +657,41 @@ fn decode_href_entities(s: &str) -> String {
 }
 
 impl Graph {
+    /// The width (px, at [`crate::layout::TEXT_CALIBRATION`]) a node label
+    /// without a line break of its own wraps at
+    /// ([`crate::layout::wrap_label`], report M7):
+    /// [`crate::layout::WRAP_WIDTH`] unless the diagram sets
+    /// `%%{init: {"flowchart": {"wrappingWidth": N}}}%%` or
+    /// `wrappingWidth: N` under `config.flowchart` in its frontmatter;
+    /// `None` when labels keep the lines they were written with
+    /// ([`Graph::set_wrapping_width`]). The node labels themselves never
+    /// change: the scene shows the wrapped lines (`SceneNode::label`)
+    /// and sizes the nodes for them.
+    pub fn wrapping_width(&self) -> Option<f64> {
+        if self.no_wrap {
+            None
+        } else {
+            Some(self.wrap_width.unwrap_or(crate::layout::WRAP_WIDTH))
+        }
+    }
+
+    /// Set the width node labels wrap at ([`Graph::wrapping_width`]);
+    /// `None` (or a width that is not a positive finite number) keeps
+    /// every label on the lines it was written with, as flowmaid did
+    /// before labels wrapped.
+    pub fn set_wrapping_width(&mut self, width: Option<f64>) {
+        match width.filter(|w| w.is_finite() && *w > 0.0) {
+            Some(w) => {
+                self.wrap_width = Some(w);
+                self.no_wrap = false;
+            }
+            None => {
+                self.wrap_width = None;
+                self.no_wrap = true;
+            }
+        }
+    }
+
     /// Look up a node by id; create it if missing.
     /// The latest label/shape overrides earlier ones (Mermaid behaviour).
     pub fn ensure_node(&mut self, id: &str, label: Option<String>, shape: Option<Shape>) -> usize {

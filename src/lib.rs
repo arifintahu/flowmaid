@@ -66,6 +66,7 @@ pub mod seq;
 pub(crate) mod shapedata;
 pub mod style;
 pub mod timeline;
+mod wrap;
 
 pub use emit::to_mermaid;
 pub use model::Document;

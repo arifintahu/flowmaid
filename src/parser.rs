@@ -206,18 +206,23 @@ fn clean_label_1line(s: &str) -> String {
     clean_label(s).replace('\n', " ")
 }
 
-/// Lower a markdown string body (see [`crate::markdown`]): node labels
-/// (`node`) keep their lines and wrap; edge labels and subgraph titles
-/// are one line.
-fn md_label(raw: &str, lineno: usize, node: bool) -> Result<String, ParseError> {
-    markdown::lower(raw, node, !node).map_err(|m| err(lineno, m))
+/// Lower a markdown string body (see [`crate::markdown`]) for an edge
+/// label or a subgraph title: one line.
+fn md_label(raw: &str, lineno: usize) -> Result<String, ParseError> {
+    markdown::lower(raw, None, true).map_err(|m| err(lineno, m))
+}
+
+/// [`md_label`] for a node label: it keeps its lines and wraps at
+/// `wrap` (the graph's [`Graph::wrapping_width`]).
+fn md_node_label(raw: &str, lineno: usize, wrap: Option<f64>) -> Result<String, ParseError> {
+    markdown::lower(raw, wrap, false).map_err(|m| err(lineno, m))
 }
 
 /// An edge label or subgraph title: a whole-label markdown string is
 /// lowered to one line, anything else cleaned like before.
 fn label_1line(s: &str, lineno: usize) -> Result<String, ParseError> {
     match markdown::md_quoted(s) {
-        Some(inner) => md_label(inner, lineno, false),
+        Some(inner) => md_label(inner, lineno),
         None => Ok(clean_label_1line(s)),
     }
 }
@@ -1223,7 +1228,7 @@ fn apply_node_meta(
                     g.nodes[n].label = if plain {
                         clean_label(&text)
                     } else {
-                        markdown::lower_text(&text, true, false)
+                        markdown::lower_text(&text, g.wrapping_width(), false)
                     };
                 }
             }
@@ -1596,7 +1601,12 @@ pub fn parse_document(source: &str) -> Result<Document, ParseError> {
             }),
             Some("pie") => parse_pie(source, i + 1).map(Document::Pie),
             Some("stateDiagram-v2") | Some("stateDiagram") => {
-                parse_state(source, i + 1).map(Document::State)
+                parse_state(source, i + 1).map(|mut g| {
+                    if let Some(w) = wrapping_width_directive(raw_source) {
+                        g.set_wrapping_width(Some(w));
+                    }
+                    Document::State(g)
+                })
             }
             Some("mindmap") => parse_mindmap(source, i + 1).map(Document::Mindmap),
             Some("journey") => parse_journey(source, i + 1).map(Document::Journey),
@@ -1620,7 +1630,8 @@ pub fn parse_document(source: &str) -> Result<Document, ParseError> {
             )),
             // `source` here is already BOM+frontmatter-stripped —
             // go straight to the body so it isn't re-stripped.
-            None => parse_flowchart(source).map(Document::Flowchart),
+            None => parse_flowchart(source, wrapping_width_directive(raw_source))
+                .map(Document::Flowchart),
         };
     }
     Ok(Document::Flowchart(Graph::default()))
@@ -1632,7 +1643,10 @@ pub fn parse(source: &str) -> Result<Graph, ParseError> {
     // juga, jadi dapat perlakuan yang sama (BOM + frontmatter).
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let stripped = strip_frontmatter(source)?;
-    parse_flowchart(&strip_directives(&stripped))
+    parse_flowchart(
+        &strip_directives(&stripped),
+        wrapping_width_directive(source),
+    )
 }
 
 /// The flowchart parse body, on a source that has ALREADY had its BOM
@@ -1640,8 +1654,12 @@ pub fn parse(source: &str) -> Result<Graph, ParseError> {
 /// flowchart arm both funnel through here so the strip happens exactly
 /// once — otherwise a diagram BODY whose first line is itself `---`
 /// would be mistaken for a second frontmatter block on the re-strip.
-fn parse_flowchart(source: &str) -> Result<Graph, ParseError> {
+fn parse_flowchart(source: &str, wrap: Option<f64>) -> Result<Graph, ParseError> {
     let mut g = Graph::default();
+    // Before any label: a markdown node label wraps as it is lowered.
+    if let Some(w) = wrap {
+        g.set_wrapping_width(Some(w));
+    }
     // Accessibility statements are line-level in mermaid (an
     // `accTitle:` value runs to the end of the line, `;` included), so
     // they come out BEFORE the `;` statement split. Only lines after
@@ -2237,7 +2255,7 @@ fn parse_subgraph_header(rest: &str, lineno: usize) -> Result<(String, String), 
     // markdown text; flowmaid keeps it even with spaces, as it does for
     // a bare multi-word title.
     if let Some(inner) = markdown::md_quoted(rest) {
-        return Ok((inner.trim().to_string(), md_label(inner, lineno, false)?));
+        return Ok((inner.trim().to_string(), md_label(inner, lineno)?));
     }
     if let Some(bi) = rest.find('[') {
         let id = rest[..bi].trim();
@@ -2253,7 +2271,7 @@ fn parse_subgraph_header(rest: &str, lineno: usize) -> Result<(String, String), 
         // A markdown string is lowered to one line; a plain title keeps
         // its `<br/>` breaks as `\n` so the frame draws one row each.
         let title = match markdown::md_quoted(inner) {
-            Some(md) => md_label(md, lineno, false)?,
+            Some(md) => md_label(md, lineno)?,
             None => clean_label(inner),
         };
         return Ok((id.to_string(), title));
@@ -2345,7 +2363,7 @@ fn parse_statement(
                         "edge label opened with '|' but never closed".to_string(),
                     ));
                 }
-                label = Some(md_label(&inner, lineno, false)?);
+                label = Some(md_label(&inner, lineno)?);
             } else {
                 cur.pos = save;
                 let l = cur.take_until("|").ok_or_else(|| {
@@ -2662,7 +2680,10 @@ fn parse_node(
     };
 
     let (shape, label) = match parsed {
-        Some((s, (l, true))) => (Some(s), Some(md_label(&l, lineno, true)?)),
+        Some((s, (l, true))) => (
+            Some(s),
+            Some(md_node_label(&l, lineno, g.wrapping_width())?),
+        ),
         Some((s, (l, false))) => (Some(s), Some(clean_label(&l))),
         None => (None, None),
     };
@@ -6163,6 +6184,37 @@ pub(crate) fn theme_directive(source: &str) -> (Option<Theme>, ThemeVars) {
         }
     }
     (theme, vars)
+}
+
+/// The node label wrapping width a diagram's source asks for (report
+/// M7): `wrappingWidth` under `config.flowchart:` in its YAML
+/// frontmatter, then `"flowchart": {"wrappingWidth": N}` in every
+/// `%%{init: …}%%` directive in source order, a later one winning — the
+/// option mermaid reads for flowchart and state node labels alike.
+/// `None` when nothing sets one, or for a value that is not a positive
+/// finite number (mermaid's own then stands too).
+pub(crate) fn wrapping_width_directive(source: &str) -> Option<f64> {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let num = |v: &str| {
+        v.trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|w| w.is_finite() && *w > 0.0)
+    };
+    let mut width = None;
+    for (k, v) in frontmatter_config(source, "flowchart") {
+        if k == "wrappingWidth" {
+            width = num(&unquote_yaml(v)).or(width);
+        }
+    }
+    for body in init_directives(source) {
+        if let Some(Json::Obj(entries)) = json_get(&body, "flowchart") {
+            if let Some(Json::Str(v)) = json_get(entries, "wrappingWidth") {
+                width = num(v).or(width);
+            }
+        }
+    }
+    width
 }
 
 /// The value of a scalar `config.<key>: value` line in YAML frontmatter

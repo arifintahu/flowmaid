@@ -91,6 +91,17 @@ pub fn to_mermaid(g: &Graph) -> String {
     check_preconditions(g);
 
     let mut out = String::new();
+    // A wrapping width of its own (report M7) rides an init directive,
+    // so the source re-parses into the same drawing. The labels go out
+    // as written: their automatic breaks are the layout's, not text.
+    if let Some(w) = g
+        .wrapping_width()
+        .filter(|&w| w != crate::layout::WRAP_WIDTH)
+    {
+        out.push_str(&format!(
+            "%%{{init: {{\"flowchart\": {{\"wrappingWidth\": {w}}}}}}}%%\n"
+        ));
+    }
     out.push_str("flowchart ");
     out.push_str(dir_token(g.direction));
     out.push('\n');

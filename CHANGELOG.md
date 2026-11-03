@@ -165,6 +165,40 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Changed
 
+- **Long node labels wrap** (report M7, §2.12). A plain flowchart or
+  state label that breaks none of its own lines now wraps at 200 px
+  (mermaid's `flowchart.wrappingWidth` default) instead of stretching its
+  node into a banner: long-labels was 672 px wide with a 616 × 65 sliver
+  of a diamond, and is 406 px now (mermaid: 358). Words are never split
+  (an over-long word keeps a line to itself) and the lines are evened
+  out, so no word is stranded on the last ("Return documents / to the
+  applicant"). A label with a `<br/>` keeps exactly its own lines, so the
+  dense diagrams mermaid turns into 4–8-line towers stay as written (one
+  node of the dense fixtures wraps, into two lines). The width is set
+  with `%%{init: {"flowchart": {"wrappingWidth": N}}}%%` or `wrappingWidth:
+  N` under `config.flowchart` in the frontmatter (mermaid 12.2 draws its
+  node labels at 120; at 120 or 150 a dense drawing's three- and
+  four-word labels wrap too and reshuffle its layering), and survives
+  `to_mermaid`. Markdown node labels wrap the same way at the same width
+  (a fixed 175 px before). The wrap is layout only: the model's
+  `Node::label` and `to_mermaid` keep the text as written, the scene's
+  node label (`SceneNode::label`, what hosts paint) carries the drawn
+  lines, and the node is sized for them — by `layout::intrinsic_size` /
+  `intrinsic_size_with` (an embedder's real font wraps by its own
+  measure) at the default width, `layout::intrinsic_size_wrapped` at a
+  graph's own. New: `layout::WRAP_WIDTH`, `layout::wrap_label`,
+  `layout::intrinsic_size_wrapped`, `Graph::wrapping_width`,
+  `Graph::set_wrapping_width` (`None` keeps every label on its written
+  lines, as class and ER boxes do). Edge labels and subgraph titles stay
+  on one line.
+- **Decision diamonds are never flatter than 1.6 : 1** (report §2.12,
+  `layout::DIAMOND_ASPECT_MAX`). A diamond's height is at least its width
+  over 1.6, so a wide one-line label grows the rhombus taller instead of
+  into a sliver, and a wrapping question takes a line more while that
+  keeps the rhombus within the cap at its text's own height (long-labels'
+  question: four even lines in a 220 × 151 rhombus). Short labels keep
+  their compact diamonds (`A{ok?}` is still 80 × 65), and a label-less
+  branch point its small square.
 - **Back-edges run in orthogonal lanes, as in mermaid** (report §2.2,
   Q4 + M4). A flowchart or state edge running against the flow used to be
   one wide cubic "bow" round every node on the layers it spans, its own

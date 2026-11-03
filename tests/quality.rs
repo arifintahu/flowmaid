@@ -45,8 +45,12 @@ const GAP_FLOORS: &[(&str, f64, f64)] = &[
     ("back-edge", 40.0, 40.0),
     // Static 3.4 before the channel nudge spread parallel legs apart.
     ("bench-75", 5.9, 2.1),
-    // The generated dense fixtures, as first measured.
-    ("dense-lr", 9.6, 5.5),
+    // The generated dense fixtures, as first measured. dense-lr static
+    // 9.6 -> 9.5 (report M7): its one label past the 200 px wrapping
+    // width (`n32`, 204 px) now wraps to two lines, the drawing grows
+    // 17 px taller, and a pair of parallel legs closes 9.63 -> 9.53 px
+    // while the routed drawing crosses 4 fewer edges.
+    ("dense-lr", 9.5, 5.5),
     ("dense-td", 12.1, 3.2),
     ("fanout-frames", 40.0, 40.0),
     ("wide-labels", 40.0, 40.0),
@@ -656,5 +660,42 @@ fn every_shape_end_sits_on_its_outline() {
             check(&format!("carried drag of node {v}"), &sc);
             (prev, base) = (centres, sc);
         }
+    }
+}
+
+/// Report M7 / §2.14 #2: the default wrapping width turns long-labels
+/// from a 672 px strip (a 616 px sliver of a diamond) into a 406 px
+/// drawing, while the dense fixtures — whose labels break their own
+/// lines, mermaid stacking each of those into 4-8-line towers — stay as
+/// written: a node only ever gains lines when it has no break of its
+/// own, and then at most one.
+#[test]
+fn long_labels_wrap_and_dense_labels_do_not_tower() {
+    use flowmaid::model::Document;
+    use flowmaid::scene::scene;
+    let graph = |path: &str| {
+        let src = std::fs::read_to_string(path).expect("source");
+        match flowmaid::parser::parse_document(&src).expect("parses") {
+            Document::Flowchart(g) | Document::State(g) => g,
+            _ => panic!("{path}: not a flowchart"),
+        }
+    };
+    let root = env!("CARGO_MANIFEST_DIR");
+    let sc = scene(&graph(&format!("{root}/examples/long-labels.mmd")));
+    assert!(sc.width <= 420.0, "long-labels {} px wide", sc.width);
+    for name in ["dense-td", "dense-lr", "fanout-frames", "bench-75"] {
+        let g = graph(&format!("{root}/tests/fixtures/quality/{name}.mmd"));
+        let sc = scene(&g);
+        let mut wrapped = 0;
+        for (n, s) in g.nodes.iter().zip(&sc.nodes) {
+            let (was, now) = (n.label.lines().count(), s.label.lines().count());
+            if n.label.contains('\n') {
+                assert_eq!(now, was, "{name} {}: a broken label is left alone", n.id);
+            } else {
+                assert!(now <= 2, "{name} {}: {:?}", n.id, s.label);
+                wrapped += usize::from(now > was);
+            }
+        }
+        assert!(wrapped <= 1, "{name}: {wrapped} labels wrapped");
     }
 }

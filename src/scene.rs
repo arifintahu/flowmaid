@@ -12,8 +12,8 @@
 //! 4. `to_svg(&scene)` exports any arrangement to SVG.
 
 use crate::layout::{
-    intrinsic_size, layout_clustered_ranked, layout_sized, text_width, title_extra, LayoutResult,
-    Placed, RankGroup, BAR_SIZE, FRAME_GAP, GAP_B, LABEL_BOX_H, TITLE_LINE_H, TITLE_SCALE,
+    layout_clustered_ranked, layout_sized, text_width, title_extra, LayoutResult, Placed,
+    RankGroup, BAR_SIZE, FRAME_GAP, GAP_B, LABEL_BOX_H, TITLE_LINE_H, TITLE_SCALE,
 };
 use crate::model::{
     Direction, Edge, EdgeAnimation, EdgeCurve, EdgeEnds, EdgeKind, EdgeMeta, End, Graph, Marker,
@@ -108,6 +108,11 @@ pub struct SceneNode {
     pub w: f64,
     pub h: f64,
     pub shape: Shape,
+    /// The label as drawn: `\n` line breaks — the source's own and, in
+    /// a label without any, the automatic wrap at the graph's
+    /// [`Graph::wrapping_width`] (`layout::wrap_label`), which the node's
+    /// size is fitted to — and `<b>` / `<i>` markup. The model's
+    /// `Node::label` keeps the text as written.
     pub label: String,
     /// Custom colors from `style`/`classDef`; empty = shape theme.
     pub style: NodeStyle,
@@ -2880,8 +2885,7 @@ fn point_seg_dist(px: f64, py: f64, a: (f64, f64), b: (f64, f64)) -> f64 {
 /// to final coordinates. This is the source of truth that
 /// `render::render` uses as well.
 pub fn scene(g: &Graph) -> Scene {
-    let sizes: Vec<(f64, f64)> = g.nodes.iter().map(intrinsic_size).collect();
-    scene_sized(g, &sizes)
+    scene_sized(g, &crate::layout::node_sizes(g))
 }
 
 /// Same as [`scene`] but with caller-provided node sizes — for
@@ -3213,7 +3217,7 @@ fn scene_from_layout(
                 w,
                 h,
                 shape: n.shape,
-                label: n.label.clone(),
+                label: crate::layout::display_label(g, n),
                 style: n.style.clone(),
                 link: g.links.get(&i).and_then(NodeLink::sanitized),
             }
@@ -4154,7 +4158,7 @@ pub(crate) fn shift_scene(sc: &mut Scene, dx: f64, dy: f64) {
 /// diagram doesn't "swim" while dragging; `to_svg` handles
 /// translation at export time.
 pub fn route(g: &Graph, centers: &[(f64, f64)]) -> Scene {
-    let sizes: Vec<(f64, f64)> = g.nodes.iter().map(intrinsic_size).collect();
+    let sizes: Vec<(f64, f64)> = crate::layout::node_sizes(g);
     route_sized(g, centers, &sizes)
 }
 
@@ -4218,7 +4222,7 @@ fn route_built(
             w: sizes[i].0,
             h: sizes[i].1,
             shape: n.shape,
-            label: n.label.clone(),
+            label: crate::layout::display_label(g, n),
             style: n.style.clone(),
             link: g.links.get(&i).and_then(NodeLink::sanitized),
         })
@@ -4642,7 +4646,7 @@ pub fn route_partial(
     if !moved.iter().any(|&m| m) {
         return base.clone();
     }
-    let sizes: Vec<(f64, f64)> = g.nodes.iter().map(intrinsic_size).collect();
+    let sizes: Vec<(f64, f64)> = crate::layout::node_sizes(g);
     let sizes = fit_bars(g, &sizes);
     // No builder label pass: a redrawn edge's label starts at its spot
     // on the new line and the label stage moves it only if it covers
@@ -8960,7 +8964,7 @@ pub(crate) fn assert_drawn_inside_canvas(svg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::LINE_H;
+    use crate::layout::{intrinsic_size, LINE_H};
     use crate::parser::parse;
 
     fn svg_src(src: &str) -> String {
@@ -11778,8 +11782,11 @@ mod tests {
     fn a_title_overflowing_its_frame_onto_the_canvas_stays_whole() {
         let long = "a long subgraph title, wider than its box";
         let s = scene(
+            // The node label kept on one line (it would wrap at the
+            // default width), so it reaches past the title.
             &parse(&format!(
-                "flowchart TB\nsubgraph R [\"{long}\"]\n  r\nend\n\
+                "%%{{init: {{\"flowchart\": {{\"wrappingWidth\": 2000}}}}}}%%\n\
+                 flowchart TB\nsubgraph R [\"{long}\"]\n  r\nend\n\
                  r --> w[\"a node label that is far wider than the subgraph title above it, so \
                  the canvas reaches well past the title\"]"
             ))

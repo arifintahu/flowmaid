@@ -20,7 +20,7 @@
 //!   drags use `scene::route_partial` with the compact scene as base
 //!   (bare `route()` would free-route the fold turns away).
 
-use crate::layout::{intrinsic_size, GAP_L};
+use crate::layout::GAP_L;
 use crate::model::{Direction, Edge, EdgeKind, Graph};
 use crate::scene::{
     flip_scene, grow_canvas, parallel_offsets, scene_sized, shift_scene, Bbox, Scene, SceneEdge,
@@ -124,7 +124,7 @@ pub struct CompactScene {
 /// Compact layout with intrinsic node sizes (the [`crate::scene::scene`]
 /// counterpart).
 pub fn scene_compact(g: &Graph, opts: &CompactOptions) -> CompactScene {
-    let sizes: Vec<(f64, f64)> = g.nodes.iter().map(intrinsic_size).collect();
+    let sizes: Vec<(f64, f64)> = crate::layout::node_sizes(g);
     scene_compact_sized(g, &sizes, opts)
 }
 
