@@ -79,6 +79,11 @@ const STRAIGHT_WEIGHT: f64 = 8.0;
 /// ends stay put (verifier: the links' elbow ends sat 7-18 px apart in
 /// the two, a router path spread past them in one and not the other).
 const NOTE_WEIGHT: f64 = 1.0e6;
+/// How far (px) spacing a side afresh may slide the end of an edge a
+/// drag keeps ([`Ctx::fixed`]) before the side's redrawn ends are
+/// placed round the kept ones instead ([`around_kept`]): half a port
+/// spacing, a nudge the eye does not follow.
+const KEPT_NUDGE: f64 = PORT_SPACING / 2.0;
 /// What a back-edge's end weighs: its lane or curve is planned round
 /// the nodes it passes, not to the side's spacing, so it gives way
 /// first.
@@ -888,23 +893,38 @@ fn place_ports(
         // the wrong order is re-placed in order (G9): before routing,
         // and after the nudge.
         let crossed = |a: &PortEnd, b: &PortEnd| uncross && legs_cross(sc, a, b);
+        let kept = |p: &PortEnd| cx.fixed.get(p.edge).copied().unwrap_or(false);
         let x = if lone {
             // The middle of the side's straight run (a slanted shape's
             // top or bottom is offset from its box's middle).
             vec![(lo + hi) / 2.0]
-        } else if shaped
+        } else if let Some(x) = (shaped
             && k >= 3
             && !ports
                 .iter()
                 .enumerate()
-                .any(|(j, a)| ports[j + 1..].iter().any(|b| sibling(a, b)))
-        {
+                .any(|(j, a)| ports[j + 1..].iter().any(|b| sibling(a, b))))
+        .then(|| even_comb(&ports, kept, s, room, lo, hi))
+        .filter(|x| {
+            ports
+                .iter()
+                .zip(x)
+                .all(|(p, &t)| !kept(p) || (t - split(side, p.at).0).abs() < PORT_EPS)
+        }) {
             // (Parallel edges — a 2-cycle's twins too, even with a note
             // link's end between them — keep the spacing their run's
             // slant needs and the order they are drawn in: a comb would
             // pull one of a pair across under the other's label, or skew
             // a twin's bow into its head.)
-            even_comb(&ports, s, room, lo, hi)
+            //
+            // In `route_partial` the ends a drag keeps ([`Ctx::fixed`])
+            // pin the comb, and a comb that would move one is not used:
+            // the plain rule below then leaves the side as drawn while
+            // it stays spaced. The base scene's ports came out of the
+            // router, the respacing and the nudge after this comb, and
+            // combing them afresh made a hub's fan jump 20-50 px under
+            // a 1 px drag of a node none of its edges touch.
+            x
         } else {
             if !shaded
                 && ports.iter().all(|p| p.spilled.is_none())
@@ -914,7 +934,20 @@ fn place_ports(
             }
             let d: Vec<f64> = ports.iter().map(|p| p.want).collect();
             let w: Vec<f64> = ports.iter().map(|p| p.weight).collect();
-            place_weighted(&d, &w, s, lo, hi)
+            let x = place_weighted(&d, &w, s, lo, hi);
+            // A drag's kept end the spacing would throw by more than a
+            // nudge: the redrawn ends are placed round the kept ones
+            // instead (see `around_kept`). A nudge stands, so the edges
+            // on a dragged node match `route()`'s.
+            let thrown = ports
+                .iter()
+                .zip(&x)
+                .any(|(p, &t)| kept(p) && (t - split(side, p.at).0).abs() > KEPT_NUDGE);
+            if thrown && !shaded && ports.iter().all(|p| p.spilled.is_none()) {
+                around_kept(&ports, kept, side, s, lo, hi).unwrap_or(x)
+            } else {
+                x
+            }
         };
         // The moved edges as they were, for the judge and the leg check
         // below.
@@ -1132,6 +1165,68 @@ fn looped_sides(sc: &Scene, cx: &Ctx) -> Vec<(EndRef, Side)> {
     out
 }
 
+/// The ends of a side holding both ends a drag keeps (`kept`, see
+/// [`Ctx::fixed`]) and redrawn ones, placed with the kept ends where
+/// they are: each redrawn end (in [`port_order`]) at the spot nearest
+/// where it wants to be that stays `s` from every end placed so far and
+/// on the span `[lo, hi]` (or as far out as a kept end lies: a crowded
+/// side's span reaches nearer its corners, and the base scene may have
+/// spaced more ends here). `None` when no end or every end is kept,
+/// when the kept ends are not spaced `s` apart themselves, or when a
+/// redrawn end finds no such spot: the side is then spaced afresh.
+/// Used where spacing it afresh would throw a kept end more than
+/// [`KEPT_NUDGE`]: in heading order it re-sorted the kept ends (a
+/// router path heads elsewhere than the builder's curve it replaced)
+/// and shifted a whole fan a port spacing under a 1 px drag.
+fn around_kept(
+    ports: &[PortEnd],
+    kept: impl Fn(&PortEnd) -> bool,
+    side: Side,
+    s: f64,
+    lo: f64,
+    hi: f64,
+) -> Option<Vec<f64>> {
+    let n_kept = ports.iter().filter(|p| kept(p)).count();
+    if n_kept == 0 || n_kept == ports.len() {
+        return None;
+    }
+    let at = |p: &PortEnd| split(side, p.at).0;
+    let mut taken: Vec<f64> = ports.iter().filter(|p| kept(p)).map(at).collect();
+    taken.sort_by(f64::total_cmp);
+    if taken.windows(2).any(|w| w[1] - w[0] < s - SETTLE_EPS) {
+        return None;
+    }
+    let (lo, hi) = (lo.min(taken[0]), hi.max(taken[taken.len() - 1]));
+    let on_span = |t: f64| t >= lo - SETTLE_EPS && t <= hi + SETTLE_EPS;
+    let mut x = vec![0.0; ports.len()];
+    for (j, p) in ports.iter().enumerate() {
+        if kept(p) {
+            x[j] = at(p);
+            continue;
+        }
+        let want = p.want.max(lo).min(hi);
+        // The nearest free spot is the want itself or the edge of a
+        // taken spot's reach (or of the span).
+        let mut tries = vec![want, lo, hi];
+        for &t in &taken {
+            tries.push(t - s);
+            tries.push(t + s);
+        }
+        let best = tries
+            .into_iter()
+            .filter(|&c| on_span(c) && taken.iter().all(|&t| (c - t).abs() >= s - SETTLE_EPS))
+            .min_by(|a, b| {
+                (a - want)
+                    .abs()
+                    .total_cmp(&(b - want).abs())
+                    .then(a.total_cmp(b))
+            })?;
+        x[j] = best;
+        taken.push(best);
+    }
+    Some(x)
+}
+
 /// Report M3 (§2.4): a box side's three or more ends (in order) at one
 /// even pitch, a share of the side's usable span `[lo, hi]` (never
 /// under the spacing `s` nor over the even room `room`, at most
@@ -1140,17 +1235,32 @@ fn looped_sides(sc: &Scene, cx: &Ctx) -> Vec<(EndRef, Side)> {
 /// and kept on the span. The plain spacing packed equal wants a port
 /// spacing apart and left wide gaps to the middle end: a fan's heads
 /// landed in near-touching pairs (fanout's 14 / 29 / 29 / 14 px).
-fn even_comb(ports: &[PortEnd], s: f64, room: f64, lo: f64, hi: f64) -> Vec<f64> {
+fn even_comb(
+    ports: &[PortEnd],
+    kept: impl Fn(&PortEnd) -> bool,
+    s: f64,
+    room: f64,
+    lo: f64,
+    hi: f64,
+) -> Vec<f64> {
     let k = ports.len();
     let pitch = ((hi - lo) / (k + 1) as f64)
         .min(PORT_EVEN_MAX)
         .max(s)
         .min(room.max(s));
     let slot = |j: usize| (j as f64 - (k - 1) as f64 / 2.0) * pitch;
+    // The ends `kept` (a drag's kept edges'), if any, alone set the
+    // centre.
+    let pinned = ports.iter().any(&kept);
     let (mut num, mut den) = (0.0, 0.0);
     for (j, p) in ports.iter().enumerate() {
-        num += p.weight * (p.want - slot(j));
-        den += p.weight;
+        let w = match (pinned, kept(p)) {
+            (false, _) => p.weight,
+            (true, true) => 1.0,
+            (true, false) => 0.0,
+        };
+        num += w * (p.want - slot(j));
+        den += w;
     }
     let c = num / den.max(SETTLE_EPS);
     let (cmin, cmax) = (lo - slot(0), hi - slot(k - 1));
@@ -2116,6 +2226,56 @@ mod tests {
         assert!(settled(&ports, Side::Right, 10.0, -20.0, 20.0, |_, _| {
             false
         }));
+    }
+
+    #[test]
+    fn a_drag_s_kept_ends_stay_and_pin_the_comb() {
+        // B7 review r1 (#1): in `route_partial` the ends a drag keeps
+        // hold their spots; the redrawn end takes the nearest free spot
+        // (here below the kept fan, where the base scene had it, not
+        // between two kept ends a port spacing apart), and a comb takes
+        // its centre from the kept ends alone.
+        let end = |edge: usize, want: f64, key: f64| PortEnd {
+            edge,
+            src: false,
+            key,
+            glyph: false,
+            at: (0.0, want),
+            steer: (0.0, want),
+            want,
+            spilled: None,
+            back: false,
+            weight: 1.0,
+        };
+        // Heading order puts the redrawn edge 3 between the kept ones.
+        let ports = [
+            end(0, 116.0, 0.0),
+            end(3, 110.0, 0.1),
+            end(1, 103.0, 0.2),
+            end(2, 129.0, 0.3),
+        ];
+        let kept = |p: &PortEnd| p.edge != 3;
+        let x = around_kept(&ports, kept, Side::Left, 13.0, 80.0, 140.0).unwrap();
+        assert_eq!(x, vec![116.0, 90.0, 103.0, 129.0]);
+        // Kept ends closer than the spacing: the side is spaced afresh.
+        let tight = [end(0, 100.0, 0.0), end(1, 105.0, 0.1), end(3, 130.0, 0.2)];
+        assert!(around_kept(&tight, kept, Side::Left, 13.0, 80.0, 140.0).is_none());
+        // Every end kept, or none: nothing to place round.
+        assert!(around_kept(&ports, |_| true, Side::Left, 13.0, 80.0, 140.0).is_none());
+        assert!(around_kept(&ports, |_| false, Side::Left, 13.0, 80.0, 140.0).is_none());
+        // A comb whose kept ends sit on its slots keeps them there,
+        // wherever the redrawn end wants to be.
+        let comb = [end(0, 100.0, 0.0), end(1, 114.0, 0.1), end(3, 140.0, 0.2)];
+        let x = even_comb(&comb, kept, 14.0, 14.0, 60.0, 160.0);
+        assert!(
+            (x[0] - 100.0).abs() < 1e-9 && (x[1] - 114.0).abs() < 1e-9,
+            "{x:?}"
+        );
+        assert!((x[2] - 128.0).abs() < 1e-9, "{x:?}");
+        // Off its 25 px slots they would move (`place_ports` then spaces
+        // the side by the plain rule): the centre is theirs all the same.
+        let x = even_comb(&comb, kept, 14.0, 30.0, 60.0, 160.0);
+        assert!((x[1] - 119.5).abs() < 1e-9, "{x:?}");
     }
 
     #[test]

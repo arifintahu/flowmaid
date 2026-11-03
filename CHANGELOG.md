@@ -181,7 +181,12 @@ Minor, not patch: several class structs gain public fields (see
   their edges head (fanout's Aggregator took 14 / 29 / 29 / 14 px); when
   ends must make room, the ends of straight edges keep their place and a
   back-edge's give way; and a 1:1 pair on facing sides a few px apart
-  along them is drawn straight. Parallel edges keep their own spacing. A
+  along them is drawn straight. Parallel edges keep their own spacing.
+  In a drag (`route_partial`) the ends of the edges the drag keeps hold
+  their places: a side is combed only round them, and a redrawn end that
+  would throw a kept one more than half a port spacing takes the nearest
+  free spot beside the kept fan instead, so a 1 px drag never re-spaces
+  the fan of a node it does not touch. A
   state note card's link holds its end whatever else shares its node's
   side, and keeps the router's corners, so `scene()` and `route()` draw
   it alike and a drag that leaves its ends put never moves it (its elbow

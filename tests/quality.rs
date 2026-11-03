@@ -744,3 +744,73 @@ fn long_labels_wrap_and_dense_labels_do_not_tower() {
         assert!(wrapped <= 1, "{name}: {wrapped} labels wrapped");
     }
 }
+
+/// Most edges per fixture (over a 1 px drag of each of its nodes in
+/// turn, `route_partial` from the static scene) that move an end more
+/// than [`DRAG_JUMP`] px though neither end is the dragged node. What
+/// is left is edges the drag redraws because they pass near it (a
+/// redrawn edge takes `route()`'s course, which may differ from
+/// `scene()`'s) and labels on a node or head, redrawn on every frame.
+/// B7 review r1 (#1): the M3 comb re-spaced hub sides whose ends were
+/// all kept edges, and dense-lr's hub `n12` threw its fan 23-49 px on a
+/// drag of `n50`: 150 / 225 / 78 jumps here, against 2 / 94 / 26 before
+/// B7. A comb now takes its centre from the ends a drag keeps and is
+/// not used when it would move one, and a side holding kept and redrawn
+/// ends places the redrawn ones round the kept ones.
+const DRAG_JUMPS_MAX: &[(&str, usize)] = &[("dense-lr", 1), ("dense-td", 93), ("bench-75", 28)];
+
+/// How far (px) an unrelated edge's end may move under a 1 px drag
+/// before [`DRAG_JUMPS_MAX`] counts it.
+const DRAG_JUMP: f64 = 20.0;
+
+/// A 1 px drag never throws the fans of nodes it does not touch
+/// (report invariant: the interactive drag stays stable, B7 review r1).
+#[test]
+fn a_one_px_drag_leaves_unrelated_edges_put() {
+    use flowmaid::model::Document;
+    use flowmaid::scene::{route_partial, scene, SceneEdge};
+    type P = (f64, f64);
+    let ends = |e: &SceneEdge| -> (P, P) {
+        match (e.waypoints.first(), e.waypoints.last()) {
+            (Some(&a), Some(&b)) if e.waypoints.len() >= 2 => (a, b),
+            _ => (e.bezier[0], e.bezier[3]),
+        }
+    };
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/quality");
+    let mut bad = Vec::new();
+    for &(name, max) in DRAG_JUMPS_MAX {
+        let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");
+        let g = match flowmaid::parser::parse_document(&src).expect("parses") {
+            Document::Flowchart(g) | Document::State(g) => g,
+            _ => panic!("{name}: not a flowchart"),
+        };
+        let base = scene(&g);
+        let at: Vec<P> = base.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let mut jumps = Vec::new();
+        for (v, node) in g.nodes.iter().enumerate() {
+            let mut c = at.clone();
+            c[v].0 += 1.0;
+            let p = route_partial(&g, &c, &base, &at);
+            for (a, b) in base.edges.iter().zip(&p.edges).take(g.edges.len()) {
+                if a.from == node.id || a.to == node.id {
+                    continue;
+                }
+                let ((a0, a1), (b0, b1)) = (ends(a), ends(b));
+                let d = |x: P, y: P| (x.0 - y.0).hypot(x.1 - y.1);
+                let m = d(a0, b0).max(d(a1, b1));
+                if m > DRAG_JUMP {
+                    jumps.push(format!("drag {}: {} -> {} {m:.1}", node.id, a.from, a.to));
+                }
+            }
+        }
+        println!("{name}: {} drag jumps", jumps.len());
+        if jumps.len() > max {
+            bad.push(format!(
+                "{name}: {} > {max} drag jumps\n  {}",
+                jumps.len(),
+                jumps.join("\n  ")
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
