@@ -72,6 +72,10 @@ pub(crate) const LANE_STAGGER: f64 = 12.0;
 pub(crate) const LANE_CROSS_COST: f64 = 400.0;
 /// Breadth positions closer than this (px) are one.
 const LANE_EPS: f64 = 1e-6;
+/// How near (px) across the flow a stretch of another edge running
+/// along the flow lies on a lane's run ([`crossings`]): half the room a
+/// node keeps, so the two would be drawn on top of each other.
+const LANE_ON: f64 = NODE_SEP / 2.0;
 
 /// The breadth a back-edge's label takes across its lane (the label is
 /// centred on the lane): its box's height in LR / RL, where a label
@@ -410,6 +414,27 @@ pub(crate) fn crossings(
         }
         if s.bbox.0 > bb.2 || s.bbox.2 < bb.0 || s.bbox.1 > bb.3 || s.bbox.3 < bb.1 {
             continue;
+        }
+        // A straight edge (a bare chord, as `route()` judges a free curve)
+        // running along the flow within LANE_ON of the lane's run lies on
+        // the lane, ends shared or not: drawn on top of each other (or a
+        // band once nudged apart), worse than a crossing, so it counts as
+        // one (r046 in `route()`: `Emit load ==> Parse` ran its lane 1 px
+        // off the chord of `Parse -> Check report` with no crossing,
+        // instead of round the top as in `scene()`). A channel's points
+        // (the layout's skeletons) lie where the layering put the edge's
+        // dummies, which a lane beside them passes as a parallel run.
+        if let (2, Some(&r0), Some(&r1)) = (k, path.get(2), path.get(3)) {
+            let (l0, l1) = (r0.1.min(r1.1), r0.1.max(r1.1));
+            let (v0, v1) = (s.pts[0], s.pts[1]);
+            if (v0.0 - x).abs() < LANE_ON
+                && (v1.0 - x).abs() < LANE_ON
+                && v0.1.min(v1.1) < l1
+                && v0.1.max(v1.1) > l0
+            {
+                n += 1;
+                continue;
+            }
         }
         let from = if at_a { 2 } else { 0 };
         let to = if at_b { segs.saturating_sub(2) } else { segs };

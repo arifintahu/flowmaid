@@ -136,7 +136,11 @@ Minor, not patch: several class structs gain public fields (see
   the one the lanes sharing an end with it took, so `scene()` and
   `route()` pick the same sides (x2-nested-backs: `fail` and `rollback`
   swapped sides on the first drag, and the static `rollback` crossed
-  `retry`'s lane).
+  `retry`'s lane). `route()` judges a forward edge that runs through a box
+  as drawn round it — as the layout's channel and the router draw it — and
+  a straight one lying along the lane as on it, not crossed (a lane jumped
+  sides on the first drag where a forward edge's chord ran through a box
+  between its ends, or ran on top of such a chord).
   Where it meets an end another edge also uses, the lane is judged by
   where that edge heads, so it never turns across an edge arriving beside
   it: the state `retry` loop runs straight up out of `Rejected` round the
@@ -460,6 +464,12 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Fixed
 
+- **Spacing an edge's end never slides its path into a node.** When the
+  ports stage moved the end of an orthogonal path along its side, the
+  straight leg out of that end slid with it — a long leg the router ran a
+  dozen px past a box landed in it (a forward edge in `route()` drew up
+  through the box beside two lanes' legs). A side whose re-spacing would do
+  that keeps its ends where the router put them.
 - **A nested subgraph keeps its nodes when the outer block mentions them
   again.** In `subgraph Platform … subgraph Workers … end … W1 --> Users
   … end`, the mention of `W1` after `Workers` closed moved it back into

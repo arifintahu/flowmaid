@@ -558,8 +558,11 @@ fn place_ports(
         }
         let d: Vec<f64> = ports.iter().map(|p| p.want).collect();
         let x = place(&d, s, lo, hi);
-        // The moved edges as they were, for the judge.
+        // The moved edges as they were, for the judge and the leg check
+        // below.
         let mut was: Vec<(usize, SceneEdge)> = Vec::new();
+        // The moved waypoint edges and the nodes they ran through then.
+        let mut legs_was: Vec<(usize, usize)> = Vec::new();
         let mut moves: Vec<(usize, usize, Pt)> = Vec::new();
         for (j, p) in ports.iter().enumerate() {
             let old = p.at;
@@ -568,8 +571,13 @@ fn place_ports(
             if p.spilled.is_none() && delta.0.abs() < PORT_EPS && delta.1.abs() < PORT_EPS {
                 continue;
             }
-            if judge.is_some() && was.iter().all(|w| w.0 != p.edge) {
+            // (Only after the router: `assign`'s moves are the router's
+            // input, and an edge they push through a node is rerouted.)
+            if (judge.is_some() || !spill_over) && was.iter().all(|w| w.0 != p.edge) {
                 was.push((p.edge, sc.edges[p.edge].clone()));
+                if !spill_over && !sc.edges[p.edge].waypoints.is_empty() {
+                    legs_was.push((p.edge, legs_through_nodes(sc, cx, p.edge)));
+                }
             }
             moves.push((p.edge, usize::from(!p.src), delta));
             let e = &mut sc.edges[p.edge];
@@ -578,6 +586,22 @@ fn place_ports(
             } else {
                 move_end(e, p.src, old, delta, side, p.back);
             }
+        }
+        // A move never drags an orthogonal path's leg through a node:
+        // `move_end` slides the straight leg out of a moved end along
+        // with it, and a long leg the router ran a dozen px past a box
+        // slid 20 px lands in it (r280 in `route()`: `N0 --> N3` up
+        // through `Queue validate`, its end re-spaced beside two lane
+        // legs). Such a side keeps its ends where they were: the router
+        // placed them clear of the taken ports.
+        if legs_was
+            .iter()
+            .any(|&(i, hits)| legs_through_nodes(sc, cx, i) > hits)
+        {
+            for (i, e) in was {
+                sc.edges[i] = e;
+            }
+            continue;
         }
         if let Some(judge) = judge.as_mut() {
             if !moves.is_empty() && !judge(sc, &was) {
@@ -732,6 +756,80 @@ fn label_hits(sc: &Scene, own: usize, m: Pt, w: f64) -> usize {
         })
         .count();
     nodes + borders + labels
+}
+
+/// How many nodes other than its own ends the straight legs between the
+/// waypoints of edge `i` run through (each box less a pixel all round,
+/// so a leg along a border does not count): what a port move must not
+/// add ([`place_ports`]).
+fn legs_through_nodes(sc: &Scene, cx: &Ctx, i: usize) -> usize {
+    let w = &sc.edges[i].waypoints;
+    if w.len() < 2 {
+        return 0;
+    }
+    let own = |v: usize| {
+        cx.ends
+            .get(i)
+            .copied()
+            .flatten()
+            .is_some_and(|(a, b)| a == EndRef::Node(v) || b == EndRef::Node(v))
+    };
+    let (mut x0, mut y0, mut x1, mut y1) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(x, y) in w {
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    sc.nodes
+        .iter()
+        .enumerate()
+        .filter(|&(v, n)| {
+            let r = (
+                n.x - n.w / 2.0 + 1.0,
+                n.y - n.h / 2.0 + 1.0,
+                n.x + n.w / 2.0 - 1.0,
+                n.y + n.h / 2.0 - 1.0,
+            );
+            r.0 < r.2
+                && r.1 < r.3
+                && r.0 < x1
+                && x0 < r.2
+                && r.1 < y1
+                && y0 < r.3
+                && !own(v)
+                && w.windows(2).any(|q| seg_meets_rect(q[0], q[1], r))
+        })
+        .count()
+}
+
+/// Whether segment `a`-`b` meets the open rectangle `r` = `(x0, y0, x1,
+/// y1)` (Liang-Barsky clipping).
+fn seg_meets_rect(a: Pt, b: Pt, r: (f64, f64, f64, f64)) -> bool {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for (p, q) in [
+        (-dx, a.0 - r.0),
+        (dx, r.2 - a.0),
+        (-dy, a.1 - r.1),
+        (dy, r.3 - a.1),
+    ] {
+        if p == 0.0 {
+            if q <= 0.0 {
+                return false;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+        }
+    }
+    t0 < t1
 }
 
 /// Heading key of an end at `p` steering to `q`, seen from `side`.

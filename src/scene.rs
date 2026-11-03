@@ -7016,10 +7016,7 @@ fn route_backs(g: &Graph, flow: &[Placed]) -> Vec<Back> {
         .iter()
         .enumerate()
         .filter(|&(ei, e)| drawn(e) && backs.binary_search(&ei).is_err())
-        .map(|(_, e)| {
-            let (a, b) = (&flow[e.from], &flow[e.to]);
-            Skeleton::new((e.from, e.to), vec![(a.b, a.l), (b.b, b.l)])
-        })
+        .map(|(_, e)| Skeleton::new((e.from, e.to), forward_skeleton(flow, e.from, e.to)))
         .collect();
     let node_cluster = if g.subgraphs.is_empty() {
         Vec::new()
@@ -7113,6 +7110,61 @@ fn route_backs(g: &Graph, flow: &[Placed]) -> Vec<Back> {
         out[ei] = lane.map_or(Back::Direct, Back::Lane);
     }
     out
+}
+
+/// The skeleton [`route_backs`] judges a forward edge from node `from`
+/// to `to` by, in flow coordinates `flow`: its centre-to-centre chord,
+/// stepped round each node it runs through
+/// ([`crate::clearance::NODE_SEP`] past the side of that box the chord
+/// passes nearer), on along the flow from the last such step to the
+/// target's level, as the router's orthogonal detour runs on past the
+/// box it went round into its target. The static layout judges a
+/// forward edge by its channel points, which the layering threads past
+/// the boxes between its ends, and `route()` reroutes a free curve that
+/// runs through a box round it: judged by its bare chord through such a
+/// box, a lane took the side the edge is drawn on (r280: `again` on the
+/// right of `Done store -> Queue validate` in `route()`, across `Store
+/// check -> Done store` rerouted there, on the left in `scene()`).
+/// O(nodes) per edge.
+fn forward_skeleton(flow: &[Placed], from: usize, to: usize) -> Vec<(f64, f64)> {
+    let (a, b) = (&flow[from], &flow[to]);
+    let (p, q) = ((a.b, a.l), (b.b, b.l));
+    let (l0, l1) = (a.l.min(b.l), a.l.max(b.l));
+    // The boxes between the ends along the flow, nearest the source
+    // first, each judged against the line on from the last step.
+    let mut between: Vec<&Placed> = flow
+        .iter()
+        .enumerate()
+        .filter(|&(v, n)| v != from && v != to && n.l > l0 && n.l < l1)
+        .map(|(_, n)| n)
+        .collect();
+    if between.is_empty() {
+        return vec![p, q];
+    }
+    between.sort_by(|x, y| (x.l - p.1).abs().total_cmp(&(y.l - p.1).abs()));
+    let mut pts = vec![p];
+    let mut cur = p;
+    for n in between {
+        // Where the line on crosses the box's centre line along the flow.
+        let t = (n.l - cur.1) / (q.1 - cur.1);
+        let at = cur.0 + t * (q.0 - cur.0);
+        let (lo, hi) = (n.b - n.bsize / 2.0, n.b + n.bsize / 2.0);
+        if at <= lo || at >= hi {
+            continue;
+        }
+        let side = if at - lo < hi - at {
+            lo - crate::clearance::NODE_SEP
+        } else {
+            hi + crate::clearance::NODE_SEP
+        };
+        cur = (side, n.l);
+        pts.push(cur);
+    }
+    if pts.len() > 1 {
+        pts.push((cur.0, q.1));
+    }
+    pts.push(q);
+    pts
 }
 
 /// A back-edge with nothing between its ends, from `a` (downstream) to
@@ -13281,6 +13333,60 @@ mod tests {
                 }
             }
             assert!(lanes > 0, "no lane in\n{src}");
+        }
+    }
+
+    #[test]
+    fn route_lanes_take_the_static_side_and_no_leg_slides_into_a_node() {
+        // r280 (BT): `route()` judged `Store check -> Done store` by its
+        // bare chord, up through `Queue validate`; the router then drew
+        // it round the right, where the `again` lane went too (on the
+        // left in `scene()`), and the ports stage, spacing Done store's
+        // bottom, slid that edge's 400 px leg 20 px into Queue validate.
+        // r046 (RL): `Emit load ==> Parse` ran its lane in `route()` 1 px
+        // off the chord of `Parse -> Check report` (on top of it), not
+        // over the top as in `scene()`. Each lane now takes the static
+        // side, and no edge runs through a node in either drawing.
+        let r280 = "flowchart BT\nN0(Store check)\nN1[Notify]\nN2[Queue validate]\n\
+                    N3(Done store)\nN4(Queue)\nN5([Load notify])\nN6{Fetch}\nN0 --> N1\n\
+                    N0 -->|yes| N2\nN0 --> N3\nN2 --> N4\nN3 --> N5\nN4 --> N6\n\
+                    N6 -->|retry| N3\nN3 --> N2\nN3 -->|again| N2";
+        let r046 = "flowchart RL\nN0(Store)\nN1(Notify check)\nN2([Parse])\nN3((Retry emit))\n\
+                    N4([Check report])\nN5([Emit load])\nN6(Notify store)\nN7{Queue parse}\n\
+                    N0 --> N1\nN1 --> N2\nN2 --> N3\nN2 --> N4\nN4 -->|ok| N5\nN5 --> N6\n\
+                    N6 --> N7\nN3 --> N5\nN2 --> N7\nN4 --> N5\nN6 -->|rollback| N0\n\
+                    N5 ==> N2\nN5 ==>|rollback| N4";
+        // (source, edge index, the lane's side: its mean breadth less its
+        // target's, across the flow — x in BT, y in RL).
+        for (src, ei, across_x) in [(r280, 8, true), (r046, 11, false)] {
+            let g = parse(src).unwrap();
+            let sides: Vec<f64> = static_and_routed(src)
+                .iter()
+                .map(|sc| {
+                    assert_eq!(
+                        crate::quality::measure(&g, sc).edge_node_x,
+                        0,
+                        "an edge through a node in\n{src}"
+                    );
+                    let e = &sc.edges[ei];
+                    assert!(e.waypoints.len() > 2, "{e:?}");
+                    let t = &sc.nodes[g.edges[ei].to];
+                    let k = e.waypoints.len() as f64;
+                    let mean =
+                        |f: fn(&(f64, f64)) -> f64| e.waypoints.iter().map(f).sum::<f64>() / k;
+                    if across_x {
+                        mean(|p| p.0) - t.x
+                    } else {
+                        mean(|p| p.1) - t.y
+                    }
+                })
+                .collect();
+            assert!(
+                sides[0] * sides[1] > 0.0,
+                "edge {ei}: static side {:.0}, routed side {:.0} in\n{src}",
+                sides[0],
+                sides[1]
+            );
         }
     }
 
