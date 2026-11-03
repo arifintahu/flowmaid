@@ -45,6 +45,9 @@ const PARALLEL_GAP: f64 = 16.0;
 /// How far (px) the controls of a labelled 2-cycle's two curves across
 /// one gap bow apart across the flow in LR / RL ([`twin_bows`]).
 const TWIN_LABEL_BOW: f64 = LABEL_BOX_H + 2.0 * crate::labels::STROKE_PAD;
+/// Most (degrees) a twin's bow ([`bowed`]) tilts an end off square: the
+/// bow shrinks to what keeps both ends within it.
+const TWIN_BOW_TILT: f64 = 10.0;
 /// How far (px) a self-loop's controls reach past its node's side.
 const LOOP_EXT: f64 = 48.0;
 /// Room (px) a parallel edge's label keeps from the neighbouring line of
@@ -6326,6 +6329,12 @@ fn twin_bows(g: &Graph, offs: &[f64], curve: impl Fn(usize) -> bool) -> Vec<f64>
 /// and runs on level into the other end, never past it and back); what
 /// is left of the bow moves both controls.
 fn bowed(mut pts: [(f64, f64); 4], bow: f64) -> [(f64, f64); 4] {
+    // No more than each end leaves within TWIN_BOW_TILT of square: in a
+    // short gap the full bow swung the curve out of its source at 35 deg
+    // (state `lr_right`, a 74 px gap), wider than any label clearance is
+    // worth.
+    let reach = (pts[1].1 - pts[0].1).abs().min((pts[3].1 - pts[2].1).abs());
+    let bow = bow.signum() * bow.abs().min(reach * TWIN_BOW_TILT.to_radians().tan());
     if bow == 0.0 {
         return pts;
     }
@@ -13162,6 +13171,53 @@ mod tests {
                     });
                     assert!(!crosses, "lanes {a} and {b} cross");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_bowed_twin_leaves_and_enters_near_square() {
+        // State lr_right: the labelled return edge of a 2-cycle across a
+        // 74 px LR gap bowed its full TWIN_LABEL_BOW at its source (35 deg
+        // off square), and the ports stage, taking it for an obstacle
+        // bow, pulled its target control back when it spread the ends
+        // (the head entered Draft at 30 deg). The bow now keeps both ends
+        // within TWIN_BOW_TILT, and a control running straight out of
+        // the end being moved moves with it.
+        for src in [
+            "stateDiagram-v2\ndirection LR\n[*] --> Draft\nDraft --> Review\n\
+             Review --> Draft : changes\nReview --> Done\nnote right of Draft : author edits",
+            "stateDiagram-v2\ndirection LR\n[*] --> S\nS --> T1\nS --> T2\nS --> T3\n\
+             T1 --> S : back\nnote right of S : busy state\nnote left of T2 : t2 note",
+        ] {
+            let g = match crate::parser::parse_document(src).unwrap() {
+                crate::model::Document::State(g) => g,
+                _ => panic!("state"),
+            };
+            let s = scene(&g);
+            let c: Vec<(f64, f64)> = s.nodes.iter().map(|n| (n.x, n.y)).collect();
+            for sc in [s.clone(), route(&g, &c)] {
+                let back = sc
+                    .edges
+                    .iter()
+                    .find(|e| {
+                        e.label
+                            .as_ref()
+                            .is_some_and(|l| l.0 == "changes" || l.0 == "back")
+                    })
+                    .expect("return edge");
+                assert!(
+                    end_skew(back, false) <= 10.0,
+                    "head {:.1}",
+                    end_skew(back, false)
+                );
+            }
+            let back = s
+                .edges
+                .iter()
+                .find(|e| e.label.as_ref().is_some_and(|l| l.0 == "changes"));
+            if let Some(b) = back {
+                assert!(end_skew(b, true) <= 10.0, "tail {:.1}", end_skew(b, true));
             }
         }
     }

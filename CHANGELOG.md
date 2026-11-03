@@ -166,7 +166,10 @@ Minor, not patch: several class structs gain public fields (see
   order at both ends, and the pair counts as one link when the layout
   aligns the two nodes. In LR / RL a labelled 2-cycle's two curves bow
   apart by a label's height, so each label rides its own line (wide-labels'
-  return label covered its twin near Client). A back-edge whose ends lie
+  return label covered its twin near Client) — in a short gap less, so
+  each end still leaves and enters within 10° of square, and the ports
+  stage moves a control that runs straight out of an end along with it
+  (state `lr_right`'s return head entered `Draft` at 30°). A back-edge whose ends lie
   more than 450 px apart across the flow takes a lane instead: a reversed S
   would sweep along the gap through every edge there and meet its end at a
   slant (bench-75's `svc2 -> db` entered `db` at 71° in `route()`).
