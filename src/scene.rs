@@ -59,6 +59,17 @@ const TWIN_BOW_TILT: f64 = 9.5;
 const TWIN_SKEW_BEND: f64 = 35.0;
 /// How far (px) a self-loop's controls reach past its node's side.
 const LOOP_EXT: f64 = 48.0;
+/// Half the spread (px) of a self-loop's two ends along its node's side
+/// ([`loop_points`]): a node's loops stack [`PARALLEL_GAP`] apart, each
+/// starting where the one before ends.
+const LOOP_HALF: f64 = PARALLEL_GAP / 2.0;
+/// How much farther (px) along the side than its ends a self-loop's
+/// controls lie: the loop flares out round its ends.
+const LOOP_FLARE: f64 = 20.0;
+/// How far (px) a stack of self-loops squeezed onto its node's side
+/// keeps its outermost ends from the side's corners ([`loop_points`]);
+/// two 16 px loops on a 38 px box, 3 px from them, keep their place.
+const LOOP_CORNER: f64 = 3.0;
 /// Room (px) a parallel edge's label keeps from the neighbouring line of
 /// its pair ([`parallel_offsets`]): a stroke's pad and a clear gap.
 const PARALLEL_LABEL_AIR: f64 = crate::labels::STROKE_PAD + crate::clearance::EDGE_SEP;
@@ -2958,8 +2969,10 @@ fn scene_from_layout(
         lo.nodes[e.from].layer > lo.nodes[e.to].layer
     });
     let mut abs_edges: Vec<AbsEdge> = Vec::with_capacity(g.edges.len());
-    // How far each node's self-loop reaches past its side.
+    // How far each node's self-loop reaches past its side, and its
+    // stack of loops along it.
     let loops = loop_reach(g);
+    let spans = loop_spans(g, &offs);
     for (ei, (e, off)) in g.edges.iter().zip(offs).enumerate() {
         let a = &lo.nodes[e.from];
         let b = &lo.nodes[e.to];
@@ -3018,7 +3031,7 @@ fn scene_from_layout(
                 b,
                 g.nodes[e.from].shape,
                 g.nodes[e.to].shape,
-                e.from == e.to,
+                (e.from == e.to).then(|| spans[e.from]),
                 lo.total_b,
                 off,
                 lone,
@@ -3457,7 +3470,7 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)]) -> Scene {
                             else {
                                 continue;
                             };
-                            free_edge(&pa, &pb, sa, sb, false, 0.0, Some(g.direction), NO_LONE)
+                            free_edge(&pa, &pb, sa, sb, None, 0.0, Some(g.direction), NO_LONE)
                         }
                     };
                     (pts, Vec::new())
@@ -4214,8 +4227,10 @@ fn route_built(
     } else {
         flow_frame_spans(g, &flow_at, g.direction)
     };
-    // How far each node's self-loop reaches past its side.
+    // How far each node's self-loop reaches past its side, and its
+    // stack of loops along it.
     let loops_at = loop_reach(g);
+    let spans = loop_spans(g, &offs);
     // A labelled 2-cycle across one gap bows apart as in the static
     // layout ([`twin_bows`]).
     let curve = |ei: usize| {
@@ -4298,7 +4313,7 @@ fn route_built(
                     b,
                     sa,
                     sb,
-                    e.from == e.to,
+                    (e.from == e.to).then(|| spans[e.from]),
                     off,
                     Some(g.direction),
                     lone_ends(g, &bars, e),
@@ -4453,12 +4468,12 @@ fn route_built(
                 (Some((v, m)), _) => {
                     let (sv, sm) = (g.nodes[v].shape, g.nodes[m].shape);
                     let dir = Some(g.direction);
-                    let pts = free_edge(&placed[v], &placed[m], sv, sm, false, off, dir, NO_LONE);
+                    let pts = free_edge(&placed[v], &placed[m], sv, sm, None, off, dir, NO_LONE);
                     (pts, None)
                 }
                 (None, Some((pts, mid))) => (pts, Some(mid)),
                 (None, None) => (
-                    free_edge(&pa, &pb, sa, sb, false, off, Some(g.direction), NO_LONE),
+                    free_edge(&pa, &pb, sa, sb, None, off, Some(g.direction), NO_LONE),
                     None,
                 ),
             };
@@ -5044,7 +5059,10 @@ pub fn box_edge_bezier(
         &make(b_center, b_size),
         Shape::Rect,
         Shape::Rect,
-        self_loop,
+        // A host's loop keeps its offset as given: it alone knows the
+        // node's other loops, which `scene` squeezes onto a short side
+        // together ([`loop_points`]).
+        self_loop.then_some(0.0),
         offset,
         None,
         NO_LONE,
@@ -6266,7 +6284,8 @@ fn pair(a: usize, b: usize) -> (usize, usize) {
 }
 
 /// Per-edge offsets so parallel edges (same node pair) separate:
-/// [`PARALLEL_GAP`] apart, or, next to a labelled one in a TD / BT flow,
+/// [`PARALLEL_GAP`] apart (a node's self-loops always), or, next to a
+/// labelled one in a TD / BT flow,
 /// far enough that the label (on its own line, half its width either
 /// side) clears the neighbouring line by [`PARALLEL_LABEL_AIR`] (report
 /// P0 #13: a label between two lines 16 px apart covers the unlabelled
@@ -6281,7 +6300,13 @@ pub(crate) fn parallel_offsets(g: &Graph) -> Vec<f64> {
     let half = |e: &Edge| {
         // A compact branch point's twins get their label room from the
         // layout instead (`fan_twin_room`), their labels beside the lines.
-        if horizontal || branch(e.from) || branch(e.to) {
+        // A node's self-loops stack ALONG the flow ([`loop_points`] puts
+        // each `off` along its side), so a label's breadth across the
+        // flow says nothing about their pitch: widening it moved each
+        // loop off its node by about its label's width, ends and heads
+        // in empty space (B3 review r5 #1). Their labels sit past their
+        // loops' apexes and keep apart there (`avoid_label_overlaps`).
+        if e.from == e.to || horizontal || branch(e.from) || branch(e.to) {
             0.0
         } else {
             crate::lanes::label_breadth(e.label.as_deref(), false) / 2.0
@@ -6963,19 +6988,21 @@ fn on_flow_side(p: &Placed, shape: Shape, pt: (f64, f64), up: bool) -> (f64, f64
 /// that comes here has no lane ([`crate::lanes`]: nothing lies between
 /// its ends): it crosses the gap as a forward edge does, leaving its
 /// source's flow-in side and entering its target's flow-out side.
+/// `looped` holds a self-loop's stack span ([`loop_spans`]), `None` for
+/// any other edge.
 #[allow(clippy::too_many_arguments)]
 fn edge_points(
     a: &Placed,
     b: &Placed,
     sa: Shape,
     sb: Shape,
-    self_loop: bool,
+    looped: Option<f64>,
     total_b: f64,
     off: f64,
     lone: (bool, bool),
 ) -> [(f64, f64); 4] {
-    if self_loop {
-        return loop_points(a, off);
+    if let Some(span) = looped {
+        return loop_points(a, off, span);
     }
 
     if b.layer != a.layer {
@@ -7612,28 +7639,30 @@ fn flow_placed(dir: Direction, p: &Placed) -> Placed {
 /// Without one (`dir = None`, a host's free boxes), the side follows
 /// the dominant axis between the centres. Either way the tangents are
 /// capped at half the border gap, so curves never double back (G8).
+/// `looped` holds a self-loop's stack span ([`loop_spans`]), `None` for
+/// any other edge.
 #[allow(clippy::too_many_arguments)]
 fn free_edge(
     a: &Placed,
     b: &Placed,
     sa: Shape,
     sb: Shape,
-    self_loop: bool,
+    looped: Option<f64>,
     off: f64,
     dir: Option<Direction>,
     lone: (bool, bool),
 ) -> [(f64, f64); 4] {
     let Some(dir) = dir else {
-        if self_loop {
-            return loop_points(a, off);
+        if let Some(span) = looped {
+            return loop_points(a, off, span);
         }
         return axis_edge(a, b, sa, sb, off);
     };
-    if self_loop {
+    if let Some(span) = looped {
         // On the high breadth side, as the static layout draws it (and
         // keeps the room for it): on screen right only in TD / BT — in
         // LR / RL, below the node, not in the gap its edges leave by.
-        return loop_points(&flow_placed(dir, a), off).map(|p| from_flow(dir, p));
+        return loop_points(&flow_placed(dir, a), off, span).map(|p| from_flow(dir, p));
     }
     let (fa, fb) = (flow_placed(dir, a), flow_placed(dir, b));
     if let Some(pts) = nested_edge(&fa, &fb, sa, sb, off) {
@@ -7819,16 +7848,47 @@ fn loop_on_low_side(at: &[Placed], v: usize, reach: &[f64]) -> bool {
 }
 
 /// Small self-loop on the node's right side; parallel loops stack
-/// vertically.
-fn loop_points(a: &Placed, off: f64) -> [(f64, f64); 4] {
+/// vertically, each starting where the one before ends. `span` is how
+/// far the node's stack of loops reaches either side of its centre
+/// ([`loop_spans`]): a stack longer than the side (three loops on a
+/// 38 px box reach 24 px either way) is squeezed evenly onto it, short
+/// of the corners by [`LOOP_CORNER`], so every loop starts and ends on
+/// its node's border and the loops still nest in order (B3 review r5
+/// #1). A stack that fits keeps its 16 px loops exactly.
+fn loop_points(a: &Placed, off: f64, span: f64) -> [(f64, f64); 4] {
     let r = a.b + a.bsize / 2.0;
     let ext = loop_ext(off);
+    let room = (a.lsize / 2.0 - LOOP_CORNER).max(0.0);
+    let k = if span > room && span > 0.0 {
+        room / span
+    } else {
+        1.0
+    };
+    // The loop's place on the side and its ends' half spread, squeezed
+    // alike; its controls keep their flare past the ends.
+    let (c, h) = (off * k, LOOP_HALF * k);
+    let flare = h + LOOP_FLARE;
     [
-        (r, a.l - 8.0 + off),
-        (r + ext, a.l - 28.0 + off),
-        (r + ext, a.l + 28.0 + off),
-        (r, a.l + 8.0 + off),
+        (r, a.l - h + c),
+        (r + ext, a.l - flare + c),
+        (r + ext, a.l + flare + c),
+        (r, a.l + h + c),
     ]
+}
+
+/// Per node: how far (px) the ends of its stack of self-loops reach
+/// either side of its centre along its side, for parallel offsets
+/// `offs` (index-parallel with `g.edges`): the farthest loop's offset
+/// plus [`LOOP_HALF`]; 0 without a loop. [`loop_points`] squeezes a
+/// stack longer than its side onto it.
+fn loop_spans(g: &Graph, offs: &[f64]) -> Vec<f64> {
+    let mut span = vec![0.0f64; g.nodes.len()];
+    for (e, off) in g.edges.iter().zip(offs) {
+        if e.from == e.to {
+            span[e.from] = span[e.from].max(off.abs() + LOOP_HALF);
+        }
+    }
+    span
 }
 
 /// Intersection of the line (from the node centre towards `toward`)
@@ -13897,6 +13957,74 @@ mod tests {
             lb.2 <= c[b].0 - s.nodes[b].w / 2.0 + 1.0,
             "left of B: {lb:?}"
         );
+    }
+
+    #[test]
+    fn a_nodes_self_loops_start_and_end_on_its_border() {
+        // B3 review r5 #1: the label room a labelled parallel edge takes
+        // across the flow was given to self-loops too, whose offsets run
+        // ALONG their node's side — two labelled loops on Poll ended
+        // 22.5 px off its border, a state's 30 px, three on Worker 85 px
+        // (beside Start and Next step), heads in empty space, in scene(),
+        // route() and drags alike. And three plain loops on a 38 px box
+        // already overhung it by 5 px: a stack longer than the side is
+        // squeezed onto it, in order.
+        let off_border = |sc: &Scene, e: &SceneEdge| {
+            let n = sc.nodes.iter().find(|n| n.id == e.from).unwrap();
+            let p = edge_polyline(e);
+            [p[0], p[p.len() - 1]]
+                .iter()
+                .map(|q| {
+                    let dx = ((q.0 - n.x).abs() - n.w / 2.0).max(0.0);
+                    let dy = ((q.1 - n.y).abs() - n.h / 2.0).max(0.0);
+                    dx.hypot(dy)
+                })
+                .fold(0.0, f64::max)
+        };
+        for src in [
+            "flowchart TD\nA[Start] --> B[Poll]\nB -->|timeout| B\nB -->|busy| B\nB --> C[Done]",
+            "flowchart BT\nA[Start] --> B[Poll]\nB -->|timeout| B\nB -->|busy| B\nB --> C[Done]",
+            "flowchart LR\nA[Start] --> B[Poll]\nB -->|timeout| B\nB -->|busy| B\nB --> C[Done]",
+            "flowchart TD\nS[Start] --> A[Worker]\nA -->|retry once| A\nA -->|retry twice| A\n\
+             A -->|give up later| A\nA --> B[Next step]\nS --> C[Side]\nC --> B\nB --> B",
+            "flowchart TD\nA --> B\nB --> B\nB --> B\nB --> B\nB --> B\nB --> C",
+            "stateDiagram-v2\n[*] --> Idle\nIdle --> Active : go\nActive --> Active : tick\n\
+             Active --> Active : refresh cache\nActive --> Idle : stop\nActive --> [*]",
+        ] {
+            let g = match crate::parser::parse_document(src).unwrap() {
+                crate::Document::Flowchart(g) | crate::Document::State(g) => g,
+                _ => unreachable!(),
+            };
+            let s = scene(&g);
+            let c: Vec<(f64, f64)> = s.nodes.iter().map(|n| (n.x, n.y)).collect();
+            let mut dragged = c.clone();
+            dragged[0].0 += 37.0;
+            dragged[0].1 -= 23.0;
+            let r = route(&g, &c);
+            let d = route(&g, &dragged);
+            let p = route_partial(&g, &dragged, &s, &c);
+            for (mode, sc) in [
+                ("static", &s),
+                ("routed", &r),
+                ("dragged", &d),
+                ("partial", &p),
+            ] {
+                for (ei, e) in g.edges.iter().enumerate() {
+                    if e.from == e.to {
+                        let off = off_border(sc, &sc.edges[ei]);
+                        assert!(off < 0.5, "{src}\n{mode}: loop {ei} {off:.1} px off");
+                    }
+                }
+            }
+        }
+        // Two loops on a box still sit where they did, 16 px each.
+        let s = scene(&parse("flowchart TD\nA --> B\nB --> B\nB --> B\nB --> C").unwrap());
+        let ends: Vec<f64> = s.edges[1..3]
+            .iter()
+            .flat_map(|e| [e.bezier[0].1, e.bezier[3].1])
+            .collect();
+        let y = s.nodes[1].y;
+        assert_eq!(ends, [y - 16.0, y, y, y + 16.0]);
     }
 
     #[test]
