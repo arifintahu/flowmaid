@@ -48,6 +48,15 @@ const TWIN_LABEL_BOW: f64 = LABEL_BOX_H + 2.0 * crate::labels::STROKE_PAD;
 /// Most (degrees) a twin's bow ([`bowed`]) tilts an end off square: the
 /// bow shrinks to what keeps both ends within it.
 const TWIN_BOW_TILT: f64 = 9.5;
+/// Most (degrees) a [`skewed`] twin's far end may bend over its last
+/// arrowhead length (the chord there against the flow, on the curve as
+/// built): the painter squares a head in from up to about that bend
+/// (state r212's return head, 34 deg, enters within 10 deg), not from
+/// much more (bench-75's `cache -> svc4`, its ends 410 px apart across a
+/// 60 px gap, bent 55 deg and swung into `svc4` at 75 deg). A twin bent
+/// past it already keeps its course, and the router reroutes it off its
+/// twin as before.
+const TWIN_SKEW_BEND: f64 = 35.0;
 /// How far (px) a self-loop's controls reach past its node's side.
 const LOOP_EXT: f64 = 48.0;
 /// Room (px) a parallel edge's label keeps from the neighbouring line of
@@ -2936,12 +2945,17 @@ fn scene_from_layout(
     } else {
         flow_frame_spans(g, &lo.nodes, g.direction)
     };
-    let bows = twin_bows(g, &offs, |ei| {
+    let curve = |ei: usize| {
         let e = &g.edges[ei];
         ei < real
             && lo.edge_paths[ei].is_empty()
             && lanes[ei].is_none()
             && lo.nodes[e.from].layer != lo.nodes[e.to].layer
+    };
+    let bows = twin_bows(g, &offs, curve);
+    let sides = twin_sides(g, &offs, curve, |ei| {
+        let e = &g.edges[ei];
+        lo.nodes[e.from].layer > lo.nodes[e.to].layer
     });
     let mut abs_edges: Vec<AbsEdge> = Vec::with_capacity(g.edges.len());
     // How far each node's self-loop reaches past its side.
@@ -3009,7 +3023,7 @@ fn scene_from_layout(
                 off,
                 lone,
             );
-            bowed(pts, bows[ei])
+            twin_curve(pts, bows[ei], sides[ei], chip_extents(e, g.direction))
         });
         // A long edge threads through its virtual-node channel: its
         // node-boundary start, the per-layer channel points, then its
@@ -4204,14 +4218,16 @@ fn route_built(
     let loops_at = loop_reach(g);
     // A labelled 2-cycle across one gap bows apart as in the static
     // layout ([`twin_bows`]).
-    let bows = twin_bows(g, &offs, |ei| {
+    let curve = |ei: usize| {
         let e = &g.edges[ei];
         match backs[ei] {
             Back::Direct => true,
             Back::No => e.from != e.to && top_of(e.from) == top_of(e.to),
             Back::Lane(_) => false,
         }
-    });
+    };
+    let bows = twin_bows(g, &offs, curve);
+    let sides = twin_sides(g, &offs, curve, |ei| backs[ei] == Back::Direct);
     for (ei, (e, off)) in g.edges.iter().zip(offs).enumerate() {
         let a = &placed[e.from];
         let b = &placed[e.to];
@@ -4269,9 +4285,11 @@ fn route_built(
         }
         let pts = match (elbow, back) {
             (Some(pts), _) => pts,
-            (None, Back::Direct) => bowed(
+            (None, Back::Direct) => twin_curve(
                 direct_back(fa, fb, sa, sb, off, lone_ends(g, &bars, e)),
                 bows[ei],
+                sides[ei],
+                chip_extents(e, g.direction),
             )
             .map(|p| from_flow(g.direction, p)),
             _ => {
@@ -4293,11 +4311,16 @@ fn route_built(
                         let (b, l) = to_flow(g.direction, p);
                         from_flow(g.direction, (2.0 * c - b, l))
                     })
-                } else if bows[ei] == 0.0 {
+                } else if bows[ei] == 0.0 && sides[ei] == 0.0 {
                     pts
                 } else {
-                    bowed(pts.map(|p| to_flow(g.direction, p)), bows[ei])
-                        .map(|p| from_flow(g.direction, p))
+                    twin_curve(
+                        pts.map(|p| to_flow(g.direction, p)),
+                        bows[ei],
+                        sides[ei],
+                        chip_extents(e, g.direction),
+                    )
+                    .map(|p| from_flow(g.direction, p))
                 }
             }
         };
@@ -6359,6 +6382,174 @@ fn bowed(mut pts: [(f64, f64); 4], bow: f64) -> [(f64, f64); 4] {
     pts[1].0 += s * rest;
     pts[2].0 += s * rest;
     pts
+}
+
+/// Per edge of `g`: for the return edge (`back(ei)`) of a 2-cycle drawn
+/// as single curves across one gap (`curve(ei)`, as for [`twin_bows`]),
+/// the breadth side its parallel offset `offs` puts it on (-1 low, +1
+/// high), 0 for every other edge: the return edge [`skewed`] away from
+/// its twin along the flow where no [`twin_bows`] bow parts them. Only
+/// the return edge moves: the forward one keeps the course the layout
+/// cleared for it (state r215: skewed too, `S0 -> T0` clipped the
+/// corner of the frame beside it and the router sent it round, across
+/// its twin).
+fn twin_sides(
+    g: &Graph,
+    offs: &[f64],
+    curve: impl Fn(usize) -> bool,
+    back: impl Fn(usize) -> bool,
+) -> Vec<f64> {
+    let drawn = |e: &Edge| e.from != e.to && !matches!(e.kind, EdgeKind::Invisible);
+    g.edges
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let twin = drawn(e)
+                && back(i)
+                && curve(i)
+                && g.edges.iter().enumerate().any(|(j, f)| {
+                    j != i && f.from == e.to && f.to == e.from && drawn(f) && curve(j)
+                });
+            if twin {
+                offs.get(i).map_or(0.0, |o| o.signum())
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// `pts` (flow coordinates), a 2-cycle's return curve on breadth side
+/// `side` of its twin ([`twin_sides`]), skewed along the flow away from
+/// the twin; `None` where it needs no skew. Twins whose ends lie far
+/// apart across a short gap run their middles nearly across the flow,
+/// there only their ports' spacing times the slope apart (state r215:
+/// 60 px within 6 px of each other, one thick band, and r085's return
+/// edge was taken off its twin by the router and run beside a note
+/// link); the return curve's middle moves until the two lie
+/// [`PARALLEL_GAP`] apart square to their run — a labelled one as far
+/// as its chip (`chip`: its extents across and along the flow) reaches
+/// square to the run, plus [`crate::clearance::EDGE_SPACING`], so the
+/// label riding its middle keeps off the twin (r175: `back` over `S0 ->
+/// T0`) — and not at all where the run is steep enough already (within
+/// a px of it) or runs nearer along the flow than across it. Only the control of the
+/// end the middle moves away from moves, along the flow and out from
+/// its end — that tangent grows (by at most its own length, so the
+/// control never passes the other end), the middle moves 3/8 of it, and
+/// the other end keeps its tangent: neither end swings in any harder
+/// (shortening the other tangent instead tilted r036's return head 25
+/// deg). On the low side the middle moves downstream when it heads to
+/// higher breadths downstream (it lies below its twin there), upstream
+/// otherwise; on the high side the other way.
+fn skewed(mut pts: [(f64, f64); 4], side: f64, chip: (f64, f64)) -> Option<[(f64, f64); 4]> {
+    let dir = (
+        pts[3].0 + pts[2].0 - pts[1].0 - pts[0].0,
+        pts[3].1 + pts[2].1 - pts[1].1 - pts[0].1,
+    );
+    let len = dir.0.hypot(dir.1);
+    if side == 0.0 || len.is_nan() || len <= 0.0 || dir.0 == 0.0 {
+        return None;
+    }
+    let (sin, cos) = (dir.1.abs() / len, dir.0.abs() / len);
+    // A run nearer along the flow than across it gains little from a
+    // move along the flow: its twin lies across the flow from it already.
+    if cos < 0.5 {
+        return None;
+    }
+    // The separation wanted square to the run: a label riding the middle
+    // keeps its chip off the twin too.
+    let reach = if chip.0 > 0.0 {
+        chip.0 / 2.0 * sin + chip.1 / 2.0 * cos + crate::clearance::EDGE_SPACING
+    } else {
+        0.0
+    };
+    // The separation missing along the flow between the middles.
+    let missing = (PARALLEL_GAP.max(reach) - PARALLEL_GAP * sin) / cos;
+    if missing.is_nan() || missing < 1.0 {
+        return None;
+    }
+    let toward = -side * (dir.0 * dir.1).signum();
+    // The end the middle moves away from, and its control.
+    let (end, ctrl) = if (pts[3].1 - pts[0].1) * toward > 0.0 {
+        (0, 1)
+    } else {
+        (3, 2)
+    };
+    let mut grow = (missing / 0.375).min((pts[ctrl].1 - pts[end].1).abs());
+    // The other end's last arrowhead length bends harder the further
+    // the middle moves toward it: no further than TWIN_SKEW_BEND.
+    let far = 3 - end;
+    let tilt = |g: f64| {
+        let mut q = pts;
+        q[ctrl].1 += toward * g;
+        let tip = q[far];
+        let mut t = 0.0;
+        let mut at = tip;
+        while t < 1.0 && (at.0 - tip.0).hypot(at.1 - tip.1) < ARROW_MARKER_PX {
+            t += 1.0 / 128.0;
+            at = cubic_at(&q, if far == 0 { t } else { 1.0 - t });
+        }
+        (at.0 - tip.0)
+            .abs()
+            .atan2((at.1 - tip.1).abs())
+            .to_degrees()
+    };
+    let allowed = TWIN_SKEW_BEND;
+    if tilt(grow) > allowed {
+        let (mut lo, mut hi) = (0.0, grow);
+        for _ in 0..10 {
+            let mid = (lo + hi) / 2.0;
+            if tilt(mid) > allowed {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        grow = lo;
+    }
+    // Less than a px of the middle's move is none.
+    if grow * 0.375 < 1.0 {
+        return None;
+    }
+    pts[ctrl].1 += toward * grow;
+    Some(pts)
+}
+
+/// A twin curve's shape: [`bowed`] by `bow` ([`twin_bows`]), then, for
+/// the return edge on `side` ([`twin_sides`]), [`skewed`] — a bow kept
+/// within [`TWIN_BOW_TILT`] parts twins whose ends lie far apart across
+/// a short gap by a few px only (state r085). A return curve it skews
+/// takes the static layout's tangents first (half the gap, at least 20
+/// px, as [`edge_points`] draws a curve across one gap): [`route`]'s
+/// free curves take [`TANGENT_SHARE`] of it, and skewed from there the
+/// return head swung in at 12 deg against 10 in `scene()`.
+fn twin_curve(pts: [(f64, f64); 4], bow: f64, side: f64, chip: (f64, f64)) -> [(f64, f64); 4] {
+    let plain = bowed(pts, bow);
+    if side == 0.0 {
+        return plain;
+    }
+    let mut q = pts;
+    if q[1].0 == q[0].0 && q[2].0 == q[3].0 {
+        let s = (q[3].1 - q[0].1).signum();
+        let dl = ((q[3].1 - q[0].1).abs() * 0.5).max(20.0);
+        q[1].1 = q[0].1 + s * dl;
+        q[2].1 = q[3].1 - s * dl;
+    }
+    skewed(bowed(q, bow), side, chip).unwrap_or(plain)
+}
+
+/// The extents (px) of `e`'s label chip across and along the flow
+/// (flow coordinates; a chip is wide on screen, so across the flow in
+/// TD / BT), `(0, 0)` without a label.
+fn chip_extents(e: &Edge, dir: Direction) -> (f64, f64) {
+    let Some(l) = e.label.as_deref() else {
+        return (0.0, 0.0);
+    };
+    let w = text_width(l) + 14.0;
+    match dir {
+        Direction::LR | Direction::RL => (LABEL_BOX_H, w),
+        Direction::TD | Direction::BT => (w, LABEL_BOX_H),
+    }
 }
 
 /// [`parallel_offsets`] for `g.sub_edges`: several edges between one
@@ -13765,6 +13956,80 @@ mod tests {
                     }
                 }
                 assert!(lanes > 0, "{mode}: no lane at a looped end in {src}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_two_cycle_across_a_short_gap_keeps_its_twins_apart() {
+        // Twins whose ends lie far apart across a short gap ran their
+        // middles nearly across the flow a port spacing times the slope
+        // apart: state r215's `S0 -> T0` / `T0 -> S0 : back` lay within
+        // 6 px of each other for 60 px, one thick band; in r085 (LR) the
+        // router took the return edge off its twin and ran it beside a
+        // note link instead. The return curve now moves its middle away
+        // along the flow, its ends still square. (r215 in route(): the
+        // forward twin's free curve clips the frame beside it and the
+        // router sends it round, across its twin, as before.)
+        let srcs = [
+            (
+                "stateDiagram-v2\n[*] --> S0\nstate C0 {\n[*] --> C0i0\nC0i0 --> C0i1\n\
+                 note right of C0i0 : n69\n}\nstate C1 {\n[*] --> C1i0\nC1i0 --> C1i1\n\
+                 C1i0 --> C1i2\nnote right of C1i1 : n81\n}\nS0 --> C0\nC0 --> C1\n\
+                 S0 --> T0\nnote left of T0 : m86\nnote left of S0 : m28\nT0 --> S0 : back",
+                false,
+            ),
+            (
+                "stateDiagram-v2\ndirection LR\n[*] --> S0\nstate C0 {\n[*] --> C0i0\n\
+                 C0i0 --> C0i1\nC0i0 --> C0i2\nnote left of C0i2 : n28\n\
+                 note left of C0i2 : n68\n}\nS0 --> C0\nS0 --> T0\nnote left of T0 : m0\n\
+                 note right of S0 : m60\nnote left of S0 : m87\nT0 --> S0 : back",
+                true,
+            ),
+        ];
+        type Pt = (f64, f64);
+        let seg_dist = |p: Pt, a: Pt, b: Pt| {
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let l2 = dx * dx + dy * dy;
+            let t = if l2 > 0.0 {
+                (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / l2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
+        };
+        for (src, routed) in srcs {
+            let crate::model::Document::State(g) = crate::parser::parse_document(src).unwrap()
+            else {
+                panic!("state diagram");
+            };
+            let s = scene(&g);
+            let c: Vec<Pt> = s.nodes.iter().map(|n| (n.x, n.y)).collect();
+            let mut modes = vec![("static", s.clone())];
+            if routed {
+                modes.push(("routed", route(&g, &c)));
+            }
+            for (mode, sc) in modes {
+                let fwd = edge_polyline(the_edge(&sc, "S0", "T0"));
+                let back = the_edge(&sc, "T0", "S0");
+                assert!(back.waypoints.is_empty(), "{mode}: rerouted {back:?}");
+                let skew = end_skew(back, false);
+                assert!(skew <= 10.0, "{mode}: return head {skew:.1} deg");
+                // The middle half of the return curve, against its twin.
+                let back = edge_polyline(back);
+                let n = back.len();
+                let gap = back[n / 4..3 * n / 4]
+                    .iter()
+                    .map(|&p| {
+                        fwd.windows(2)
+                            .map(|w| seg_dist(p, w[0], w[1]))
+                            .fold(f64::INFINITY, f64::min)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                assert!(
+                    gap > crate::clearance::EDGE_SPACING + 2.0,
+                    "{mode}: twins {gap:.1} px apart"
+                );
             }
         }
     }

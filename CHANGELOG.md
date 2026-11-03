@@ -182,7 +182,17 @@ Minor, not patch: several class structs gain public fields (see
   return label covered its twin near Client) — in a short gap less, so
   each end still leaves and enters within 9.5° of square, and the ports
   stage moves a control that runs straight out of an end along with it
-  (state `lr_right`'s return head entered `Draft` at 30°). A back-edge whose ends lie
+  (state `lr_right`'s return head entered `Draft` at 30°). Where the
+  twins' ends lie far apart across a short gap, their middles ran nearly
+  across the flow only a port spacing times the slope apart — a single
+  thick band (state r215: 60 px within 6 px), or the router took the
+  return edge off its twin and ran it beside a note link — so the return
+  curve now moves its middle away along the flow, by lengthening the
+  tangent at the end it moves from: its twin and the forward edge's
+  course stay as they are, both ends still leave and enter square, and a
+  labelled return edge moves far enough for its label to keep off the
+  twin. Twins already bent hard into an end keep their course, and the
+  router reroutes them as before. A back-edge whose ends lie
   more than 450 px apart across the flow takes a lane instead: a reversed S
   would sweep along the gap through every edge there and meet its end at a
   slant (bench-75's `svc2 -> db` entered `db` at 71° in `route()`). On a
