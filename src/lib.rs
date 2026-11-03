@@ -46,6 +46,7 @@ pub mod gitgraph;
 pub mod journey;
 pub(crate) mod json;
 mod labels;
+mod lanes;
 pub mod layout;
 mod markdown;
 pub mod mindmap;

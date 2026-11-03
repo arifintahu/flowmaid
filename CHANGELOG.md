@@ -112,6 +112,157 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Changed
 
+- **Back-edges run in orthogonal lanes, as in mermaid** (report §2.2,
+  Q4 + M4). A flowchart or state edge running against the flow used to be
+  one wide cubic "bow" round every node on the layers it spans, its own
+  ends included, entering its target at 13–17° and often under the box.
+  It now leaves its source square out of the side facing upstream, runs
+  in a lane just past what lies *between* its ends (the layers strictly
+  between them, and anything on an end's layer that reaches into the
+  band), and enters its target square, with rounded corners delivered as
+  densely sampled `SceneEdge::waypoints` (router style, so a host's spline
+  through them draws the same path; `bezier` is a cubic through the lane's
+  corners). The lane keeps 24 px plus half its label from what it passes,
+  takes the spot that crosses fewest edges (then the shorter way round),
+  never threads a gap between nodes, and nests with other lanes without
+  crossing their legs: lanes from ends stacked on one layer into one node
+  run side by side straight out of their ends and turn in one after the
+  other, and lanes nested round each other are dealt out so the end
+  nearest their side takes the outermost lane and the shortest stub;
+  lanes of edges between the same two ends leave and enter in that order
+  too, the outermost nearest the lane (x6: two `Gamma -> Alpha` lanes
+  crossed twice in `route()`). A lane counts the lanes planned before it
+  among the edges it may cross, and of two sides that cost the same takes
+  the one the lanes sharing an end with it took, so `scene()` and
+  `route()` pick the same sides (x2-nested-backs: `fail` and `rollback`
+  swapped sides on the first drag, and the static `rollback` crossed
+  `retry`'s lane). `route()` judges a forward edge that runs through a box
+  as drawn round it — as the layout's channel and the router draw it — and
+  a straight one lying along the lane as on it, not crossed (a lane jumped
+  sides on the first drag where a forward edge's chord ran through a box
+  between its ends, or ran on top of such a chord).
+  Where it meets an end another edge also uses, the lane is judged by
+  where that edge heads, so it never turns across an edge arriving beside
+  it: the state `retry` loop runs straight up out of `Rejected` round the
+  outside, crossing nothing (it ran between the Validating frame and
+  `Rejected`, across `invalid`). A lane running straight into its
+  target's busy side counts the edges leaving beside it, and a leg out of
+  a member of a frame the lane leaves runs a stub past that frame's
+  border instead of along it. When another edge fans out of (or into) an
+  end toward the lane — a hub — the lane meets that end on its side
+  facing the lane, the lanes meeting one side one after the other, when
+  the lane passes outside the end itself by 24 px (a lane within the
+  end's breadth ran on along it through the box and turned to its flank
+  from inside, the arrowhead hidden under the node and pointing out:
+  `rollback` into `Check queue` in an RL chart, `Check -> c` in an LR
+  state choice). A lane meets a hexagon or parallelogram on the flat run
+  of its side, off the slant (advanced's `fail` lane put its head half
+  over Developer's corner), and its end stays on its side when the side
+  is over-full: the ports stage moves other ends round the corner, never
+  a lane's, whose last leg it would swing in at a slant. The
+  router takes the lanes first, so the forward edges route round them,
+  and in `scene()` an edge it searches for riding a frame border or
+  cramped searches on past a first candidate that does not beat it
+  (bench-75's `svc4 -> logs` rode the app frame's border for 99 px).
+  demo is 321 px wide (was 383), back-edge 290 (351), fanout's `no` loop
+  goes round the outside, and the flow corpus crosses fewer edges (524 ->
+  505 static, 519 -> 508 in `route()`). The same rule runs in `scene()`,
+  in the layout's own estimate of the drawing it centres (so it reserves
+  exactly the lane's room) and in `route()` / `route_partial()`
+  (O(nodes + edges) per back-edge, inside the drag budget).
+- **A back-edge with nothing between its ends crosses the gap** like a
+  forward edge, a reversed S out of its source's flow-in side — a 2-cycle
+  (`A --> B`, `B --> A`) draws its two edges side by side, uncrossed, in
+  every direction, both labels in the gap (the layout fits the gap to
+  the return edge's label too). lr is 226 px tall (was 299, the return
+  edge a V-shaped loop below the row); the twins' ports keep their drawn
+  order at both ends, and the pair counts as one link when the layout
+  aligns the two nodes. In LR / RL a labelled 2-cycle's two curves bow
+  apart by a label's height, so each label rides its own line (wide-labels'
+  return label covered its twin near Client) — in a short gap less, so
+  each end still leaves and enters within 9.5° of square, and the ports
+  stage moves a control that runs straight out of an end along with it
+  (state `lr_right`'s return head entered `Draft` at 30°). Where the
+  twins' ends lie far apart across a short gap, their middles ran nearly
+  across the flow only a port spacing times the slope apart — a single
+  thick band (state r215: 60 px within 6 px), or the router took the
+  return edge off its twin and ran it beside a note link — so the return
+  curve now moves its middle away along the flow, by lengthening the
+  tangent at the end it moves from: its twin and the forward edge's
+  course stay as they are, both ends still leave and enter square, and a
+  labelled return edge moves far enough for its label to keep off the
+  twin. Twins already bent hard into an end, and a return edge among
+  more parallel edges between the same two nodes, keep their course, and
+  the router reroutes them as before. A back-edge whose ends lie
+  more than 450 px apart across the flow takes a lane instead: a reversed S
+  would sweep along the gap through every edge there and meet its end at a
+  slant (bench-75's `svc2 -> db` entered `db` at 71° in `route()`). On a
+  diamond or circle such an end stays on the part of the border facing
+  along the flow, where the ports stage spaces it from its twin's (a
+  2-cycle into a diamond put its head on its twin's start, on the
+  diamond's flank).
+- **An LR / RL back-edge's label takes its height across the flow**, not
+  its width: wide-labels is 160 px tall (was 413, the loop under the row
+  sized by a 337 px label).
+- **An edge between two members of a subgraph stays inside it**: the
+  frame grows over a back-edge's lane and its label (advanced's `fail`
+  edge bulged out of CI/CD) — in `route()` and `route_partial()` too, so
+  a labelled loop inside nested boxes no longer jumps out of both frames
+  on the first drag — and the router prices any path that leaves the
+  innermost frame holding both its ends right after a foreign frame or
+  title chip it enters, ahead of a backtrack or a crossing (never a
+  reason to reroute on its own, but of the paths a reroute weighs the one
+  that stays home wins: a member's edge to its own box's entry member no
+  longer leaves the box through its bottom and comes back in, 798 px out,
+  in `route()`).
+- **Self-loops keep their room** (report P0 #13): the layout keeps a
+  looped node's loop (and 12 px) clear of its high-side neighbour —
+  widening the gap only by what the loop reaches past it (stress is 269
+  px wide, 221 before, 293 while the whole reach was added) — so a
+  long edge's channel beside it no longer runs through the loop's apex
+  (stress: `A ==> D`), and a back-edge's lane clears the loop too: it
+  never meets an end on the flank that end loops on, but crosses its flow
+  side there instead (a lane into a looped hub turned in through the loop,
+  its head on the loop's own). The
+  router treats every self-loop as an obstacle, so `route()` keeps other
+  edges off it as well (stress's `A ==> D` ran 5 px from `B`'s loop on a
+  drag). `route()` draws a loop on the side `scene()` does — in LR / RL
+  below its node, not on the screen's right, where its node's edges
+  leave (x6: a loop hidden under three parallel edges) — and a drag that
+  crowds that side moves it to the free one. A node's loops stack 16 px
+  apart along its side, labelled or not (their labels sit past their
+  apexes), each starting and ending on the border: a stack longer than
+  the side (three loops on a 38 px box overhung it by 5 px) is squeezed
+  evenly onto it, in order, short of its corners.
+- **A labelled parallel edge keeps its label off its twin** (report
+  P0 #13): in TD / BT, parallel edges next to a labelled one leave
+  half the label's width plus 15 px between their lines (self-loops
+  excepted: they stack along their node's side; a 16 px gap put
+  stress's `parallel` label on the unlabelled edge), and a label both
+  lines touch counts as the one whose line runs nearer its centre — an
+  unlabelled line only: a labelled one carries its own label, so a
+  `<<choice>>`'s middle twin label keeps its spot beside its line
+  instead of moving onto it between both neighbours (state `twins3`).
+  In LR / RL a gap holding a label on an edge of a node a lane leaves
+  or enters by a leg across that gap widens to keep the legs clear
+  (x6-rl-loops: `forward` and `parallel` lay over two lanes' legs).
+- **Class and ER diagrams follow the same back-edge, 2-cycle, parallel
+  label and loop rules**, as they ride the flowchart layout and scene:
+  a relation against the flow of a cyclic diagram comes as a lane the
+  class layout keeps orthogonal, a 2-cycle's two lines and labels stand
+  apart (ER `works in` / `employs` no longer read as one band), a TB / BT
+  class's labelled parallel relations leave room for their labels
+  between their lines, a class's self-relations keep their room beside
+  it (nine self-relations on one class ran into both its neighbours), and fewer
+  relations are left on their curves (399 -> 346 over the class test
+  inputs, 456 -> 385 in `route()`). A dense cyclic diagram can grow:
+  seven classes each related both ways to every other are 1473 px wide
+  (was 1027). There, a routed relation whose end moved used to slide a
+  leg along the square exit of another class's last end on that face,
+  which then had no way out and kept its curve — a sweep across the
+  drawing's orthogonal lines; such a slide is now refused and the relation
+  stays as routed.
+
 - **One arrowhead size for every flowchart edge, sharper and square onto
   the node** (report §2.3, Q1 + M1). Every end glyph — the arrowhead at
   either end, the cross and the circle — is now 11 px in user space
@@ -164,7 +315,11 @@ Minor, not patch: several class structs gain public fields (see
   last channel leg slanted into its node gets a straight stub along the
   side's normal in `SceneEdge::waypoints` (so hosts draw it too), unless
   the stub would bring it nearer a node or along another edge than the
-  routing left it. The squared ends and the cut are the SVG painter's:
+  routing left it, and a route the router draws into a head grown past
+  11 px takes a stub long enough to hold it where that costs about the
+  same way round (a 16 px `linkStyle` edge turned into its node 14 px
+  out under a 28 px head, which hooked past the side into it, in
+  `route()`). The squared ends and the cut are the SVG painter's:
   `SceneEdge::bezier` is unchanged and still ends on the border (hosts draw
   their own heads along its end tangent), the painted curve stays within a
   pixel of it outside the head beyond two head lengths of the tip, and
@@ -362,6 +517,12 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Fixed
 
+- **Spacing an edge's end never slides its path into a node.** When the
+  ports stage moved the end of an orthogonal path along its side, the
+  straight leg out of that end slid with it — a long leg the router ran a
+  dozen px past a box landed in it (a forward edge in `route()` drew up
+  through the box beside two lanes' legs). A side whose re-spacing would do
+  that keeps its ends where the router put them.
 - **A nested subgraph keeps its nodes when the outer block mentions them
   again.** In `subgraph Platform … subgraph Workers … end … W1 --> Users
   … end`, the mention of `W1` after `Workers` closed moved it back into

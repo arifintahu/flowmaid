@@ -15,6 +15,7 @@
 //! l = layer / depth); the renderer maps them to final x,y
 //! according to the diagram direction (TD/LR/BT/RL).
 
+use crate::clearance::NODE_SEP;
 use crate::labels::{FAN_FAR, FAN_SIBLING_GAP, LABEL_SIDE_AIR, LABEL_STRADDLE, STROKE_PAD};
 use crate::model::{Direction, EdgeKind, Graph, Node, Shape};
 use crate::ports::PORT_INSET;
@@ -144,9 +145,6 @@ const CENTRE_KEY_STEP: f64 = 0.01;
 /// slides into (D4): it moves only as far as that band, not to the
 /// exact middle.
 const CENTRE_SLIDE_BAND: f64 = 0.15;
-/// How far a back-edge bow clears the nodes it passes, before half its
-/// label (the scene's `edge_points` bow clearance).
-const BOW_CLEAR: f64 = 24.0;
 /// Area ratio by which a top-level node must outsize every other
 /// top-level node, and every other node of its layer, to count as the
 /// largest object that D3/D4 centre (G3). Equal or near-equal boxes have
@@ -1884,7 +1882,9 @@ fn place(
         };
         let (llo, lhi) = (alayer[lo], alayer[hi]);
         if lhi <= llo + 1 {
-            if llo < lhi {
+            // A 2-cycle's return edge runs beside its twin across the
+            // gap: one link between the pair, not a second pull.
+            if llo < lhi && !(back[ei] && succs[lo].contains(&hi)) {
                 succs[lo].push(hi);
                 preds[hi].push(lo);
             }
@@ -2258,6 +2258,31 @@ fn place(
     // The far ends of a compact branch point's fan whose labels need
     // to sit side by side get the room (see `fan_label_room`).
     let spaced = fan_label_room(g, back, &layers, &alayer, &absize, &alsize, n, horizontal);
+    // A self-looped node keeps its loop's reach (and NODE_SEP) from its
+    // high-side neighbour, where the scene draws the loop (report P0
+    // #13: a channel beside it ran through the loop's apex). A
+    // separation size counts on both sides; a node with no high-side
+    // neighbour needs none. The node's own half of the gap between
+    // neighbours (`pair_sep`: GAP_B / 2) already lies past its side, so
+    // only what the loop reaches beyond it widens the node (stress's
+    // `A ==> D` channel ran 54 px past the loop's apex, the canvas 72 px
+    // wider than it needed).
+    let loops = crate::scene::loop_reach(g);
+    let spaced = if loops.iter().any(|&r| r > 0.0) {
+        let mut sep = spaced.unwrap_or_else(|| absize.clone());
+        for lay in &layers {
+            for w in lay.windows(2) {
+                let v = w[0];
+                if v < n && loops[v] > 0.0 {
+                    let past = (loops[v] + NODE_SEP - GAP_B / 2.0).max(0.0);
+                    sep[v] = sep[v].max(absize[v] + 2.0 * past);
+                }
+            }
+        }
+        Some(sep)
+    } else {
+        spaced
+    };
     let bsep: &[f64] = spaced.as_deref().unwrap_or(&absize);
     let mut bpos = coordinates_bk(
         n,
@@ -2300,12 +2325,12 @@ fn place(
     let chains_b = |bpos: &[f64]| -> (f64, f64) {
         drawn_breadth(
             g,
-            back,
             node_cluster,
             &absize,
+            &alsize,
             &alayer,
             bpos,
-            edge_chain.iter().flatten().copied(),
+            &edge_chain,
         )
     };
     // A node already on a straight run with a neighbour stays: sliding it
@@ -2400,16 +2425,93 @@ fn place(
         Vec::new()
     };
     let par_reach = parallel_reach(g, &par);
+    // A back-edge's lane leaves its source and enters its target by a
+    // leg across the gap beside that end, `crate::lanes::LANE_STUB` out
+    // (one `LANE_STAGGER` more per lane nested round it there), from a
+    // port at the edge of the side's usable span (one `LANE_STAGGER`
+    // further in per twin lane) to the lane past the node. A label
+    // centred in that gap on an edge of the same node, reaching across
+    // that span edge, keeps that leg's depth clear at both ends of the
+    // gap, or it lies on the legs (x6-rl-loops: `forward` over both
+    // `Gamma -> Alpha` lanes). Per labelled short edge: the room the
+    // legs take, summed for both ends of the gap. Only in LR / RL, where
+    // the label lies along the flow and fills the gap's length; a TD /
+    // BT label is a row tall and slides along its line past the legs.
+    let lane_par = if horizontal && par.is_empty() && back.iter().any(|&b| b) {
+        crate::scene::parallel_offsets(g)
+    } else {
+        par.clone()
+    };
+    let lane_legs = |ei: usize, lo: usize, hi: usize, across: f64| -> f64 {
+        if !horizontal {
+            return 0.0;
+        }
+        let e = &g.edges[ei];
+        let off = lane_par.get(ei).copied().unwrap_or(0.0);
+        let centre = (bpos[lo] + bpos[hi]) / 2.0 + off;
+        let (c0, c1) = (centre - across / 2.0, centre + across / 2.0);
+        let mut deepest = 0.0f64;
+        for v in [lo, hi] {
+            // Lanes with a leg on `v`'s side facing this gap: into `lo`
+            // (its downstream side), out of `hi` (its upstream side).
+            let legs: Vec<usize> = g
+                .edges
+                .iter()
+                .enumerate()
+                .filter(|&(bj, b)| {
+                    back[bj]
+                        && b.from != b.to
+                        && alayer[b.from].abs_diff(alayer[b.to]) > 1
+                        && if v == lo { b.to == v } else { b.from == v }
+                })
+                .map(|(bj, _)| bj)
+                .collect();
+            if legs.is_empty() || (e.from != v && e.to != v) {
+                continue;
+            }
+            let p = Placed {
+                b: bpos[v],
+                l: 0.0,
+                bsize: absize[v],
+                lsize: alsize[v],
+                layer: alayer[v],
+            };
+            let span = crate::lanes::port_span(g.nodes[v].shape, &p);
+            // Twin lanes (same far end) step their ports inward.
+            let twins = legs
+                .iter()
+                .map(|&bj| {
+                    let far = |b: &crate::model::Edge| if b.from == v { b.to } else { b.from };
+                    legs.iter()
+                        .filter(|&&bk| far(&g.edges[bk]) == far(&g.edges[bj]))
+                        .count()
+                })
+                .max()
+                .unwrap_or(1);
+            let inward = (twins - 1) as f64 * crate::lanes::LANE_STAGGER;
+            if c1 > span.1 - inward || c0 < span.0 + inward {
+                let depth =
+                    crate::lanes::LANE_STUB + (legs.len() - 1) as f64 * crate::lanes::LANE_STAGGER;
+                deepest = deepest.max(depth);
+            }
+        }
+        2.0 * deepest
+    };
     for (ei, e) in g.edges.iter().enumerate() {
-        if e.from == e.to || back[ei] || matches!(e.kind, EdgeKind::Invisible) {
+        let short = alayer[e.from].abs_diff(alayer[e.to]) == 1;
+        // A back-edge between adjacent layers is drawn across their gap
+        // (`crate::lanes`: nothing lies between its ends), its label
+        // there too: the gap fits it like a forward edge's (a 2-cycle's
+        // two labels side by side).
+        if e.from == e.to || (back[ei] && !short) || matches!(e.kind, EdgeKind::Invisible) {
             continue;
         }
         let fan = match (branch(e.from), branch(e.to)) {
+            _ if back[ei] => None,
             (true, false) => Some((e.from, e.to)),
             (false, true) => Some((e.to, e.from)),
             _ => None,
         };
-        let short = alayer[e.from].abs_diff(alayer[e.to]) == 1;
         if let (Some((p, far)), true, false) = (fan, short, horizontal) {
             // Near its far end a fan's line runs at that end's port,
             // leaning toward the point on a box (see `scene::anchor`).
@@ -2473,7 +2575,8 @@ fn place(
         // either end of a labelled edge (`Graph::label_end_room`: glyph
         // and cardinalities) is kept at both.
         let label_room = 2.0 * g.label_end_room.get(ei).copied().unwrap_or(0.0);
-        short_labels[alayer[hi]].push((lo, hi, ext, room + label_room, fan.is_some()));
+        let room = (room + label_room).max(lane_legs(ei, lo, hi, across));
+        short_labels[alayer[hi]].push((lo, hi, ext, room, fan.is_some()));
         // In LR/RL a row along the layer axis costs a label's whole
         // width, and the scene never uses it: colliding labels there
         // slide apart ACROSS the flow (they are only LABEL_BOX_H tall),
@@ -2745,17 +2848,17 @@ fn centre_in_layer(
 
 /// Estimated breadth span `(lo, hi)` of what the scene will draw: every
 /// node with one FRAME_PAD per subgraph around it, every channel dummy
-/// (label slots included), and the sideways bow of every back-edge,
-/// which clears the nodes on the layers it spans by BOW_CLEAR plus half
-/// its label, on the side nearer its ends (as the scene draws it).
+/// (label slots included), and the lane of every back-edge, planned by
+/// the scene's own rule ([`back_lanes`]).
+#[allow(clippy::too_many_arguments)]
 fn drawn_breadth(
     g: &Graph,
-    back: &[bool],
     node_cluster: Option<&[Vec<usize>]>,
     absize: &[f64],
+    alsize: &[f64],
     alayer: &[usize],
     bpos: &[f64],
-    dummies: impl Iterator<Item = usize>,
+    edge_chain: &[Vec<usize>],
 ) -> (f64, f64) {
     let n = g.nodes.len();
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -2764,43 +2867,168 @@ fn drawn_breadth(
         lo = lo.min(bpos[v] - absize[v] / 2.0 - pad);
         hi = hi.max(bpos[v] + absize[v] / 2.0 + pad);
     }
-    for d in dummies {
+    for &d in edge_chain.iter().flatten() {
         lo = lo.min(bpos[d] - absize[d] / 2.0);
         hi = hi.max(bpos[d] + absize[d] / 2.0);
     }
-    for (ei, e) in g.edges.iter().enumerate() {
-        if !back[ei] || e.from == e.to || matches!(e.kind, EdgeKind::Invisible) {
-            continue;
-        }
-        let (l0, l1) = (
-            alayer[e.from].min(alayer[e.to]),
-            alayer[e.from].max(alayer[e.to]),
-        );
-        if l0 == l1 {
-            continue;
-        }
-        let (mut el, mut er) = (f64::INFINITY, f64::NEG_INFINITY);
-        for v in (0..n).filter(|&v| alayer[v] >= l0 && alayer[v] <= l1) {
-            el = el.min(bpos[v] - absize[v] / 2.0);
-            er = er.max(bpos[v] + absize[v] / 2.0);
-        }
-        let clear = BOW_CLEAR
-            + e.label
-                .as_ref()
-                .map_or(0.0, |l| text_width(l) + LABEL_PAD_W)
-                / 2.0;
-        let mid = (bpos[e.from] + bpos[e.to]) / 2.0;
-        if er + clear - mid <= mid - (el - clear) {
-            hi = hi.max(er + clear);
-        } else {
-            lo = lo.min(el - clear);
-        }
+    let at: Vec<Placed> = (0..n)
+        .map(|v| Placed {
+            b: bpos[v],
+            l: alayer[v] as f64,
+            bsize: absize[v],
+            lsize: alsize[v],
+            layer: alayer[v],
+        })
+        .collect();
+    let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
+    for (ei, lane) in back_lanes(g, &at, node_cluster, edge_chain, |d| {
+        (bpos[d], alayer[d] as f64)
+    }) {
+        let half = crate::lanes::label_breadth(g.edges[ei].label.as_deref(), horizontal) / 2.0;
+        lo = lo.min(lane.x - half);
+        hi = hi.max(lane.x + half);
     }
     if lo > hi {
         (0.0, 0.0)
     } else {
         (lo, hi)
     }
+}
+
+/// The lane of every back-edge that gets one (`(edge, lane)`; a state
+/// note card's link never does), by
+/// the rule [`crate::lanes`] states — the scene draws them, and the
+/// layout centres the drawing on them, from this one function. `at`
+/// holds every node with its LAYER INDEX as its `l` (whatever the
+/// caller's layer coordinates, the decisions are taken on the layers):
+/// what reaches into a back-edge's band is every node on a layer
+/// strictly between its ends, and a node on an end's own layer longer
+/// along the flow than that end by twice [`crate::lanes::LANE_REACH`]
+/// (it reaches that far past the end's side, nodes being centred on
+/// their layer). Inside subgraphs
+/// (`node_cluster`), the members of the innermost box holding both ends
+/// are its obstacles and the rest is foreign ([`crate::lanes::Want`]).
+/// The lane is judged for crossings against the skeletons of the other
+/// edges (end centres and channel points, `dummy(d)` = a dummy's
+/// (breadth, layer) — `edge_chain` lists each edge's), on the layers.
+pub(crate) fn back_lanes(
+    g: &Graph,
+    at: &[Placed],
+    node_cluster: Option<&[Vec<usize>]>,
+    edge_chain: &[Vec<usize>],
+    dummy: impl Fn(usize) -> (f64, f64),
+) -> Vec<(usize, crate::lanes::Lane)> {
+    use crate::lanes::{
+        blocks_direct, direct_port, label_breadth, plan, port_span, Skeleton, Want, LANE_CLEAR,
+    };
+    let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
+    let drawn = |e: &crate::model::Edge| e.from != e.to && !matches!(e.kind, EdgeKind::Invisible);
+    // A state note card's link elbows round as `scene::note_elbow` draws
+    // it, or crosses the gap: never a lane.
+    let card = |v: usize| {
+        let n = &g.nodes[v];
+        crate::style::is_note_card(&n.id, n.shape, &n.style)
+    };
+    let backs: Vec<usize> = (0..g.edges.len())
+        .filter(|&ei| {
+            let e = &g.edges[ei];
+            drawn(e) && at[e.to].layer < at[e.from].layer && !card(e.from) && !card(e.to)
+        })
+        .collect();
+    if backs.is_empty() {
+        return Vec::new();
+    }
+    let loops = crate::scene::loop_reach(g);
+    let skeletons: Vec<Skeleton> = g
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| drawn(e) && at[e.to].layer >= at[e.from].layer)
+        .map(|(ei, e)| {
+            let mut pts = vec![(at[e.from].b, at[e.from].l)];
+            pts.extend(edge_chain.get(ei).into_iter().flatten().map(|&d| dummy(d)));
+            pts.push((at[e.to].b, at[e.to].l));
+            Skeleton::new((e.from, e.to), pts)
+        })
+        .collect();
+    let shared = |e: &crate::model::Edge| -> Vec<usize> {
+        node_cluster.map_or_else(Vec::new, |nc| {
+            nc[e.from]
+                .iter()
+                .zip(&nc[e.to])
+                .take_while(|(x, y)| x == y)
+                .map(|(x, _)| *x)
+                .collect()
+        })
+    };
+    let wants: Vec<Want> = backs
+        .iter()
+        .map(|&ei| {
+            let e = &g.edges[ei];
+            let (a, b) = (&at[e.from], &at[e.to]);
+            let box_of = shared(e);
+            let (mut obstacles, mut foreign) = (Vec::new(), Vec::new());
+            let (mut between, mut beside) = (Vec::new(), Vec::new());
+            let reach = 2.0 * crate::lanes::LANE_REACH;
+            for (v, p) in at.iter().enumerate() {
+                if v == e.from || v == e.to {
+                    continue;
+                }
+                // A self-loop beside the node is in the way too.
+                let span = (p.b - p.bsize / 2.0, p.b + p.bsize / 2.0 + loops[v]);
+                if p.layer > b.layer && p.layer < a.layer {
+                    between.push(span);
+                } else if p.layer == a.layer && p.lsize > a.lsize + reach {
+                    beside.push((span, true));
+                } else if p.layer == b.layer && p.lsize > b.lsize + reach {
+                    beside.push((span, false));
+                } else {
+                    continue;
+                }
+                if node_cluster.map_or(true, |nc| nc[v].starts_with(&box_of)) {
+                    obstacles.push(span);
+                } else {
+                    foreign.push(span);
+                }
+            }
+            let label = label_breadth(e.label.as_deref(), horizontal);
+            let (sa, sb) = (g.nodes[e.from].shape, g.nodes[e.to].shape);
+            let ports = (direct_port(sa, a, b.b), direct_port(sb, b, a.b));
+            Want {
+                key: (a.layer - b.layer) as f64,
+                band: (b.layer as f64, a.layer as f64),
+                obstacles,
+                foreign,
+                blocked: blocks_direct(&between, &beside, ports, label / 2.0),
+                clear: LANE_CLEAR + label / 2.0,
+                label_half: label / 2.0,
+                spans: [port_span(sa, a), port_span(sb, b)],
+                ends: (e.from, e.to),
+            }
+        })
+        .collect();
+    let lanes = plan(&wants, |i, x, placed| {
+        let e = &g.edges[backs[i]];
+        let (a, b) = (&at[e.from], &at[e.to]);
+        let path = crate::lanes::judged_path(x, wants[i].spans, a.l, b.l, a.l - 0.5, b.l + 0.5);
+        // A planned lane's legs a little nearer its ends than this one's
+        // (on the layers both would sit mid-gap, on top of each other, and
+        // never properly cross): a leg across the gap then crosses the
+        // other lane running through it.
+        let planned = crate::lanes::planned_skeletons(&wants, placed, i, |j, xj| {
+            let f = &g.edges[backs[j]];
+            let (pa, pb) = (&at[f.from], &at[f.to]);
+            crate::lanes::judged_path(xj, wants[j].spans, pa.l, pb.l, pa.l - 0.4, pb.l + 0.4)
+        });
+        let ends = (e.from, e.to);
+        crate::lanes::crossings(&path, ends, wants[i].spans, &skeletons)
+            + crate::lanes::crossings(&path, ends, wants[i].spans, &planned)
+    });
+    backs
+        .iter()
+        .zip(lanes)
+        .filter_map(|(&ei, lane)| lane.map(|l| (ei, l)))
+        .collect()
 }
 
 /// Edge-node pairs where the straight skeleton of a drawn forward edge

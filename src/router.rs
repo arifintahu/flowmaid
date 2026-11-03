@@ -77,7 +77,9 @@ use crate::clearance::{
     EDGE_SPACING, FRAME_INSET, FRAME_SEP, MIN_OVERLAP_RUN, NODE_CLEARANCE, NODE_SEP, PARALLEL_COS,
     PORT_ZONE, SAMPLE_STEP, TIGHT_RUN_MIN, WIGGLE_TOL,
 };
-use crate::scene::{edge_polyline, grow_scene, title_head, Bbox, Scene, ARROW_MARKER_PX, MARGIN};
+use crate::scene::{
+    edge_drawn, edge_polyline, grow_scene, title_head, Bbox, Scene, ARROW_MARKER_PX, MARGIN,
+};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -151,6 +153,10 @@ const BAND_COST: f64 = 12.0;
 /// choose costs a back-edge (px): two bends' worth, so the chosen side
 /// wins unless the other is clearly shorter.
 const SIDE_SWITCH_COST: f64 = 2.0 * BEND_COST;
+/// What ending on a plain stub costs at a glyph end whose head grew
+/// longer than it ([`stub_len`]): two bends' worth, so the long stub
+/// wins unless it needs a clearly longer way round.
+const SHORT_STUB_COST: f64 = 2.0 * BEND_COST;
 /// A\* pops allowed per search in [`crate::scene::route`]; when
 /// exhausted the try finds nothing.
 const ROUTE_WORK_BUDGET: usize = 6_000;
@@ -233,7 +239,7 @@ const H_WEIGHT: f64 = 1.5;
 const ROUTE_MAX_EDGES: usize = 400;
 /// Corner rounding distance (px) of a candidate while it is searched
 /// and scored, capped at half the shorter leg.
-const CORNER_R: f64 = 14.0;
+pub(crate) const CORNER_R: f64 = 14.0;
 /// The widest corner rounding (px) a finished path gets where its legs
 /// and the free room round the corner allow (one soft-orthogonal style
 /// next to the builder's free curves).
@@ -433,9 +439,9 @@ fn outline_gap(r: R, shape: Shape, p: Pt) -> f64 {
 /// How bad one drawn edge is, compared lexicographically: unrelated
 /// nodes it crosses (G6: the worst, a line through a box reads as a
 /// connection); then foreign frames it enters and title chips it
-/// touches; then a flow-axis backtrack (so of two equal routes the
-/// monotone one wins); then px on top of accepted edges, crossings at
-/// an arrowhead, cramped nodes,
+/// touches; then px outside its own frame; then a flow-axis backtrack
+/// (so of two equal routes the monotone one wins); then px on top of
+/// accepted edges, crossings at an arrowhead, cramped nodes,
 /// crossings with accepted edges, px cramped beside accepted edges,
 /// other edges' labels it runs under, and px along frame borders and
 /// node sides.
@@ -445,6 +451,17 @@ struct Score {
     frame: usize,
     /// Frame title chips the path touches (G6).
     chip: usize,
+    /// px of path outside the innermost frame holding both its ends
+    /// (report §2.2): an edge between two members of a box belongs
+    /// inside it, as much as an edge keeps out of a box it has no end
+    /// in — so it ranks with the frames, ahead of a backtrack or a
+    /// crossing. Never a reason to reroute on its own (the repair asks
+    /// for node, frame and chip hits), but of the candidates a reroute
+    /// weighs the one that stays home wins: in `route()`, a member's
+    /// edge to its own box's entry member left the box through its
+    /// bottom and came back in, 798 px out, rather than backtrack along
+    /// the flow inside it (q21).
+    out: usize,
     wiggle: usize,
     /// px of parallel run on top of accepted edges (within
     /// [`EDGE_SPACING`]), over the pairs whose run passes
@@ -499,7 +516,13 @@ struct World {
     /// ([`NODE_CLEARANCE`]), as the wider rule costs a drag frame
     /// reroutes that lie on other edges instead (G1, G13).
     chip_reach: f64,
+    /// Every node's box, index-parallel with `sc.nodes`, then the box of
+    /// every self-loop (report P0 #13): a loop is drawn beside its node,
+    /// and a path through it reads as running through the node.
     nodes: Vec<(R, Shape)>,
+    /// Per entry of `nodes`: the node it belongs to (itself, or the
+    /// looped node), so an edge of that node is never its obstacle.
+    owner: Vec<usize>,
     frames: Vec<R>,
     chips: Vec<R>,
     /// (edge, label box) of every labelled edge, as placed so far.
@@ -526,6 +549,9 @@ struct Info {
     /// The two ends overlap along the flow (same rank): no path round
     /// what lies between them can be monotone, so none is asked for.
     sideways: bool,
+    /// The innermost frame holding both ends (two nodes), which the
+    /// path is priced for leaving ([`Score::out`]).
+    home: Option<usize>,
 }
 
 /// The accepted edges as later edges see them: their drawn segments in
@@ -640,7 +666,7 @@ fn end_node(e: EndRef) -> Option<usize> {
 
 impl World {
     fn new(g: &Graph, sc: &Scene) -> World {
-        let nodes = sc
+        let mut nodes: Vec<(R, Shape)> = sc
             .nodes
             .iter()
             .map(|n| {
@@ -655,6 +681,18 @@ impl World {
                 )
             })
             .collect();
+        let mut owner: Vec<usize> = (0..nodes.len()).collect();
+        // Self-loops: the box of each as drawn.
+        for e in sc.edges.iter().filter(|e| e.from == e.to && edge_drawn(e)) {
+            let Some(v) = sc.nodes.iter().position(|n| n.id == e.from) else {
+                continue;
+            };
+            let r = bounds(&edge_polyline(e));
+            if [r.0, r.1, r.2, r.3].iter().all(|c| c.is_finite()) {
+                nodes.push((r, Shape::Rect));
+                owner.push(v);
+            }
+        }
         let frames: Vec<R> = sc
             .clusters
             .iter()
@@ -687,6 +725,7 @@ impl World {
             dir: g.direction,
             chip_reach: CHIP_SEP,
             nodes,
+            owner,
             frames,
             chips,
             labels,
@@ -729,7 +768,13 @@ impl World {
     /// Whether a stub at `p` of an edge `info` stands in the open: off
     /// every node and chip, and out of every frame it must avoid.
     fn stub_free(&self, info: &Info, p: Pt) -> bool {
-        self.nodes.iter().all(|&(r, _)| !inside(r, p))
+        // An end's own self-loop is no obstacle to its stub; its own box is.
+        let ends = [end_node(info.ends.0), end_node(info.ends.1)];
+        let own_loop = |v: usize| self.owner[v] != v && ends.contains(&Some(self.owner[v]));
+        self.nodes
+            .iter()
+            .enumerate()
+            .all(|(v, &(r, _))| own_loop(v) || !inside(r, p))
             && self.chips.iter().all(|&r| !inside(r, p))
             && info
                 .blocked_frames
@@ -754,7 +799,7 @@ impl World {
         let bb = bounds(pts);
         let ends = [end_node(info.ends.0), end_node(info.ends.1)];
         for (v, &(r, shape)) in self.nodes.iter().enumerate() {
-            if ends.contains(&Some(v)) || !overlaps(grow(bb, CRAMP_NODE_GAP), r) {
+            if ends.contains(&Some(self.owner[v])) || !overlaps(grow(bb, CRAMP_NODE_GAP), r) {
                 continue;
             }
             // Only the part of each segment near the node is sampled, so
@@ -797,6 +842,22 @@ impl World {
             });
             if enters {
                 s.frame += 1;
+            }
+        }
+        // The run outside its own frame (sampled finely enough that a
+        // segment with one end out counts half).
+        if let Some(r) = info.home.and_then(|f| self.frames.get(f)) {
+            let r = grow(*r, FRAME_INSET);
+            if !(inside(r, (bb.0, bb.1)) && inside(r, (bb.2, bb.3))) {
+                self.look(pts.len());
+                let out: f64 = pts
+                    .windows(2)
+                    .map(|w| {
+                        let k = usize::from(!inside(r, w[0])) + usize::from(!inside(r, w[1]));
+                        dist(w[0], w[1]) * k as f64 / 2.0
+                    })
+                    .sum();
+                s.out = out.round() as usize;
             }
         }
         // Title chips it touches or passes closer than `chip_reach`,
@@ -843,7 +904,7 @@ impl World {
                 self.nodes
                     .iter()
                     .enumerate()
-                    .filter(|(v, _)| !ends.contains(&Some(*v)))
+                    .filter(|(v, _)| !ends.contains(&Some(self.owner[*v])))
                     .map(|(_, n)| n.0),
             );
         for r in sides.filter(|_| s.node == 0) {
@@ -2686,19 +2747,19 @@ fn free_slot(
 /// on each of the node's other sides at [`SIDE_SWITCH_COST`]: the side's
 /// midpoint, or on a straight side the free slot nearest it, at least
 /// [`PORT_SPACING`] from every end in `taken` there but edge `me`'s (so
-/// two reroutes never land on one port, G9).
+/// two reroutes never land on one port, G9). Each stub reaches `len` px
+/// out of its side ([`stub_len`]).
 fn terms(
     w: &World,
     end: EndRef,
     port: Pt,
     alt: bool,
-    clear: f64,
+    len: f64,
     taken: &[(EndRef, Pt, usize)],
     me: usize,
 ) -> Vec<Term> {
     let rect = w.end_rect(end);
     let side = side_of(rect, port);
-    let len = clear + STUB_EXTRA;
     let mut v = vec![Term {
         port,
         stub: stub_of(rect, side, port, len),
@@ -2720,6 +2781,26 @@ fn terms(
         }
     }
     v
+}
+
+/// How far (px) the stub of one end of edge `e` reaches out of its side
+/// on a lattice of clearance `clear`: just past the clearance
+/// ([`STUB_EXTRA`]) — or, at a glyph end under a head grown past
+/// [`ARROW_MARKER_PX`] (a wide `linkStyle` stroke,
+/// [`crate::scene::edge_head_len`]), the head's length plus a corner's
+/// radius ([`CORNER_R`]), so the rounded corner before the stub leaves
+/// the whole head on a straight run into the side. A 16 px stroke's
+/// 28 px head on a 14 px stub sat over the corner, and the painter's
+/// head, turning with the curve's last stretch, hooked past the side
+/// and doubled back into it (q72 `n1 ==> n7` in `route()`).
+fn stub_len(e: &crate::scene::SceneEdge, glyph: bool, clear: f64) -> f64 {
+    let plain = clear + STUB_EXTRA;
+    let head = crate::scene::edge_head_len(e);
+    if glyph && head > ARROW_MARKER_PX {
+        plain.max(head + CORNER_R)
+    } else {
+        plain
+    }
 }
 
 /// How one routing attempt may run.
@@ -2773,14 +2854,31 @@ fn route_edge(
     let (p0, p3) = drawn_ends(e);
     let o = w.outer;
     let usable = |t: &Term| inside(o, t.stub) && w.stub_free(info, t.stub);
-    let starts: Vec<Term> = terms(w, info.ends.0, p0, t.alt, clear, env.taken, me)
-        .into_iter()
-        .filter(usable)
-        .collect();
-    let goals: Vec<Term> = terms(w, info.ends.1, p3, t.alt, clear, env.taken, me)
-        .into_iter()
-        .filter(usable)
-        .collect();
+    // An end's terminals with its own stub length ([`stub_len`]); where
+    // that is longer than the plain one, the plain stubs come too, at
+    // [`SHORT_STUB_COST`]: the long stub wins where it costs about the
+    // same, never by a long way round.
+    let end_terms = |end: EndRef, port: Pt, glyph: bool| {
+        let (plain, len) = (clear + STUB_EXTRA, stub_len(e, glyph, clear));
+        let mut found: Vec<Term> = terms(w, end, port, t.alt, len, env.taken, me)
+            .into_iter()
+            .filter(usable)
+            .collect();
+        if len > plain {
+            found.extend(
+                terms(w, end, port, t.alt, plain, env.taken, me)
+                    .into_iter()
+                    .filter(usable)
+                    .map(|t| Term {
+                        cost: t.cost + SHORT_STUB_COST,
+                        ..t
+                    }),
+            );
+        }
+        found
+    };
+    let starts: Vec<Term> = end_terms(info.ends.0, p0, e.ends.start_marker(e.kind).is_some());
+    let goals: Vec<Term> = end_terms(info.ends.1, p3, e.ends.end_marker(e.kind).is_some());
     let stubs: Vec<Pt> = starts.iter().chain(&goals).map(|t| t.stub).collect();
     if stubs.is_empty() {
         return None;
@@ -3275,7 +3373,7 @@ fn place_group(f: &Fences, routes: &mut [Option<Vec<Pt>>], segs: &[Seg], grp: &[
     let scene_slab_at = |c: (f64, f64, f64), at: (f64, f64, f64)| {
         let mut slab = open;
         for (v, &(r, _)) in w.nodes.iter().enumerate() {
-            if own.contains(&EndRef::Node(v)) {
+            if own.contains(&EndRef::Node(w.owner[v])) {
                 continue;
             }
             let (a, b, lo, hi) = rect(grow(r, c.0));
@@ -3971,6 +4069,7 @@ fn reorder(
                     near: t.near + s.near,
                     cross: t.cross + s.cross,
                     tight: t.tight + s.tight,
+                    out: t.out + s.out,
                     label: t.label + s.label,
                     hug: t.hug + s.hug,
                 };
@@ -4044,12 +4143,18 @@ fn info_of(g: &Graph, w: &World, cx: &Ctx, i: usize) -> Option<Info> {
         (p.min(q), p.max(q))
     };
     let ((a0, a1), (b0, b1)) = (span(w.end_rect(a)), span(w.end_rect(b)));
+    // `node_frames` lists a node's frames innermost first.
+    let home = match (a, b) {
+        (EndRef::Node(_), EndRef::Node(_)) => fa.iter().copied().find(|f| fb.contains(f)),
+        _ => None,
+    };
     Some(Info {
         ends: (a, b),
         allowed,
         blocked_frames,
         back: cx.back.get(i).copied().unwrap_or(false),
         sideways: a1.min(b1) > a0.max(b0),
+        home,
     })
 }
 
@@ -4102,7 +4207,7 @@ fn narrow_px(w: &World, info: &Info, pts: &[Pt]) -> f64 {
             w.nodes
                 .iter()
                 .enumerate()
-                .filter(|(v, _)| !ends.contains(&Some(*v)))
+                .filter(|(v, _)| !ends.contains(&Some(w.owner[*v])))
                 .map(|(_, n)| n.0),
         )
         .filter(|&r| overlaps(probe, r))
@@ -4192,12 +4297,19 @@ pub(crate) fn repair(g: &Graph, sc: &mut Scene, cx: &Ctx, mode: Mode, moved: &mu
     let mut order: Vec<usize> = (0..ne).filter(|&i| infos[i].is_some()).collect();
     // Builder channel edges first; a path drawn orthogonally (a reroute
     // of an earlier pass) keeps its place, so a second pass sees the
-    // edges in the order the first did.
+    // edges in the order the first did. Before them, the back-edges in
+    // their lanes (orthogonal by construction, report §2.2): planned
+    // round every node in their band and round each other, they have
+    // the least room to move, so the forward edges are the ones priced
+    // and searched round them (taken after the channels, bench-75's
+    // static drawing crossed 17 more edges).
     let channel = |i: usize| {
         let e = &sc.edges[i];
         !e.waypoints.is_empty() && ortho_corners(e).is_none()
     };
-    order.sort_by_key(|&i| (!channel(i), i));
+    let lane =
+        |i: usize| infos[i].as_ref().is_some_and(|f| f.back) && !sc.edges[i].waypoints.is_empty();
+    order.sort_by_key(|&i| (!lane(i), !channel(i), i));
     let mut bad: Vec<(usize, usize)> = Vec::new(); // (class, edge): 0 hard, 1 soft
                                                    // Per edge: its score against the scene alone.
     let mut alone: Vec<Score> = vec![Score::default(); ne];
@@ -4468,7 +4580,19 @@ pub(crate) fn repair(g: &Graph, sc: &mut Scene, cx: &Ctx, mode: Mode, moved: &mu
             if best.as_ref().map_or(true, |b| s < b.0) {
                 best = Some((s, corners, pts));
             }
-            if s.hard() == 0 && s.wiggle == 0 && lone {
+            // A soft edge in the static scene (cramped, or riding a
+            // border, nothing broken) searches on while what it found
+            // does not beat its original: the wider lattice may
+            // (bench-75's `svc4 -> logs` rode the app frame's border for
+            // 99 px because the first candidate crossed one more edge at
+            // its arrowhead, and the search stopped there).
+            let beats = class == 0
+                || mode == Mode::Routed
+                || &s
+                    < base_acc.get_or_insert_with(|| {
+                        w.against(info, i, &simplify(&polys[i]), &mut accepted, base0, true)
+                    });
+            if s.hard() == 0 && s.wiggle == 0 && lone && beats {
                 break;
             }
         }
@@ -4652,6 +4776,7 @@ mod tests {
             blocked_frames: Vec::new(),
             back: false,
             sideways: false,
+            home: None,
         };
         w.score(&info, i, &edge_polyline(&sc.edges[i]), None)
     }
@@ -5231,6 +5356,7 @@ mod tests {
             dir: crate::model::Direction::LR,
             chip_reach: CHIP_SEP,
             nodes: nodes.iter().map(|&r| (r, Shape::Rect)).collect(),
+            owner: (0..nodes.len()).collect(),
             frames: frames.to_vec(),
             chips: Vec::new(),
             labels: Vec::new(),
@@ -5283,6 +5409,7 @@ mod tests {
             blocked_frames: Vec::new(),
             back: false,
             sideways: false,
+            home: None,
         };
         let mut e = scene(&parse("flowchart LR\nA-->B").unwrap()).edges[0].clone();
         e.waypoints.clear();
@@ -5310,6 +5437,7 @@ mod tests {
             blocked_frames: Vec::new(),
             back: false,
             sideways: false,
+            home: None,
         })
     }
 
@@ -5538,6 +5666,7 @@ mod tests {
             blocked_frames: Vec::new(),
             back: false,
             sideways: true,
+            home: None,
         };
         // Through the chip, then along the top border inside.
         let s = w.score(
@@ -5626,5 +5755,23 @@ mod tests {
             assert_eq!(rep.statik.edge_node_pairs, 0, "{name} static");
             assert_eq!(rep.routed.edge_node_pairs, 0, "{name} routed");
         }
+    }
+
+    #[test]
+    fn a_static_edge_riding_a_border_searches_past_a_first_candidate_that_loses() {
+        // bench-75's `svc4 -> logs`: its layout channel rides the app
+        // frame's right border for 99 px; the first (narrow) candidate
+        // crossed one more edge at its arrowhead than the original, the
+        // search stopped there and the edge kept the border. The wider
+        // lattice finds a channel off it that crosses no more heads.
+        let src = include_str!("../tests/fixtures/quality/bench-75.mmd");
+        let rep = measure_source(src, false).unwrap();
+        let rides: Vec<&String> = rep
+            .statik
+            .details
+            .iter()
+            .filter(|d| d.starts_with("svc4->logs border") || d.starts_with("svc4->logs hug"))
+            .collect();
+        assert!(rides.is_empty(), "{rides:?}");
     }
 }

@@ -28,7 +28,7 @@ pub(crate) const PORT_INSET: f64 = 8.0;
 const PORT_INSET_MIN: f64 = 4.0;
 /// Usable half-span of a diamond / circle side as a fraction of its
 /// half-size: ends stay on the part of the border that faces the side.
-const PORT_ROUND_SPAN: f64 = 0.45;
+pub(crate) const PORT_ROUND_SPAN: f64 = 0.45;
 /// Usable half-span of a stadium's round cap as a fraction of its
 /// radius: a cap faces its side more squarely than a circle's quadrant.
 const PORT_CAP_SPAN: f64 = 0.7;
@@ -336,25 +336,42 @@ fn port_order(a: &PortEnd, b: &PortEnd) -> std::cmp::Ordering {
 }
 
 /// Re-sorts each run of neighbouring parallel ends (one pair of ends,
-/// one way) in `ports`, sorted by [`port_order`], by where they are
-/// drawn, ties kept in heading order. The builders' parallel offsets
-/// order such edges alike at both ends, but seen from one end two of
-/// them converging on nearly one point at the other (a small
-/// `<<choice>>` diamond, a port the lean pinned to a box's corner) head
-/// the other way round: spaced in heading order, they would cross on
-/// the way, and the router would then reroute one of them.
-fn keep_parallel_order(ports: &mut [PortEnd], cx: &Ctx) {
+/// either way round) in `ports`, sorted by [`port_order`], by where they
+/// are drawn, ties by edge index. The builders' parallel offsets order
+/// such edges alike at both ends, but seen from one end two of them
+/// converging on nearly one point at the other (a small `<<choice>>`
+/// diamond, a port the lean pinned to a box's corner) head the other
+/// way round: spaced in heading order, they would cross on the way, and
+/// the router would then reroute one of them. A 2-cycle's two edges
+/// drawn as single curves across one gap are such a pair too: heading
+/// order puts the outgoing end first at each end, which crosses them;
+/// drawn order — the edge with the lower parallel offset (the lower
+/// index) first wherever the lean pinned both to one spot — keeps them
+/// side by side. (A return edge in a lane heads out to its lane, and
+/// heading order keeps it outside its twin.)
+fn keep_parallel_order(ports: &mut [PortEnd], cx: &Ctx, sc: &Scene) {
     let mut i = 0;
     while i < ports.len() {
         let mut j = i + 1;
-        while j < ports.len()
-            && ports[j].src == ports[i].src
-            && cx.ends.get(ports[j].edge) == cx.ends.get(ports[i].edge)
-        {
+        while j < ports.len() && same_pair(cx, sc, ports[i].edge, ports[j].edge) {
             j += 1;
         }
-        ports[i..j].sort_by(|a, b| a.want.total_cmp(&b.want));
+        ports[i..j].sort_by(|a, b| a.want.total_cmp(&b.want).then(a.edge.cmp(&b.edge)));
         i = j;
+    }
+}
+
+/// Whether edges `a` and `b` join the same two ends: the same way round,
+/// or the other way when both are drawn as single curves (a 2-cycle
+/// across one gap).
+fn same_pair(cx: &Ctx, sc: &Scene, a: usize, b: usize) -> bool {
+    let curve = |i: usize| sc.edges.get(i).is_some_and(|e| e.waypoints.is_empty());
+    match (
+        cx.ends.get(a).copied().flatten(),
+        cx.ends.get(b).copied().flatten(),
+    ) {
+        (Some(x), Some(y)) => x == y || (x.0 == y.1 && x.1 == y.0 && curve(a) && curve(b)),
+        _ => false,
     }
 }
 
@@ -484,7 +501,7 @@ fn place_ports(
         // Spacing keeps parallel edges in the order they are drawn;
         // only `reorder` re-places them in the order they head.
         if judge.is_none() {
-            keep_parallel_order(&mut ports, cx);
+            keep_parallel_order(&mut ports, cx, sc);
         }
         let k = ports.len();
         let glyph = ports.iter().any(|p| p.glyph);
@@ -511,9 +528,8 @@ fn place_ports(
         // Neighbouring ends of parallel edges (one pair of ends) on a
         // run flatter than the side's normal come that much closer in
         // between: spread them by the run's slant (G1).
-        let sibling = |a: &PortEnd, b: &PortEnd| {
-            a.src == b.src && cx.ends.get(a.edge) == cx.ends.get(b.edge) && a.edge != b.edge
-        };
+        let sibling =
+            |a: &PortEnd, b: &PortEnd| a.edge != b.edge && same_pair(cx, sc, a.edge, b.edge);
         let slant = ports
             .windows(2)
             .filter(|w| sibling(&w[0], &w[1]))
@@ -542,8 +558,11 @@ fn place_ports(
         }
         let d: Vec<f64> = ports.iter().map(|p| p.want).collect();
         let x = place(&d, s, lo, hi);
-        // The moved edges as they were, for the judge.
+        // The moved edges as they were, for the judge and the leg check
+        // below.
         let mut was: Vec<(usize, SceneEdge)> = Vec::new();
+        // The moved waypoint edges and the nodes they ran through then.
+        let mut legs_was: Vec<(usize, usize)> = Vec::new();
         let mut moves: Vec<(usize, usize, Pt)> = Vec::new();
         for (j, p) in ports.iter().enumerate() {
             let old = p.at;
@@ -552,8 +571,13 @@ fn place_ports(
             if p.spilled.is_none() && delta.0.abs() < PORT_EPS && delta.1.abs() < PORT_EPS {
                 continue;
             }
-            if judge.is_some() && was.iter().all(|w| w.0 != p.edge) {
+            // (Only after the router: `assign`'s moves are the router's
+            // input, and an edge they push through a node is rerouted.)
+            if (judge.is_some() || !spill_over) && was.iter().all(|w| w.0 != p.edge) {
                 was.push((p.edge, sc.edges[p.edge].clone()));
+                if !spill_over && !sc.edges[p.edge].waypoints.is_empty() {
+                    legs_was.push((p.edge, legs_through_nodes(sc, cx, p.edge)));
+                }
             }
             moves.push((p.edge, usize::from(!p.src), delta));
             let e = &mut sc.edges[p.edge];
@@ -562,6 +586,22 @@ fn place_ports(
             } else {
                 move_end(e, p.src, old, delta, side, p.back);
             }
+        }
+        // A move never drags an orthogonal path's leg through a node:
+        // `move_end` slides the straight leg out of a moved end along
+        // with it, and a long leg the router ran a dozen px past a box
+        // slid 20 px lands in it (r280 in `route()`: `N0 --> N3` up
+        // through `Queue validate`, its end re-spaced beside two lane
+        // legs). Such a side keeps its ends where they were: the router
+        // placed them clear of the taken ports.
+        if legs_was
+            .iter()
+            .any(|&(i, hits)| legs_through_nodes(sc, cx, i) > hits)
+        {
+            for (i, e) in was {
+                sc.edges[i] = e;
+            }
+            continue;
         }
         if let Some(judge) = judge.as_mut() {
             if !moves.is_empty() && !judge(sc, &was) {
@@ -718,6 +758,80 @@ fn label_hits(sc: &Scene, own: usize, m: Pt, w: f64) -> usize {
     nodes + borders + labels
 }
 
+/// How many nodes other than its own ends the straight legs between the
+/// waypoints of edge `i` run through (each box less a pixel all round,
+/// so a leg along a border does not count): what a port move must not
+/// add ([`place_ports`]).
+fn legs_through_nodes(sc: &Scene, cx: &Ctx, i: usize) -> usize {
+    let w = &sc.edges[i].waypoints;
+    if w.len() < 2 {
+        return 0;
+    }
+    let own = |v: usize| {
+        cx.ends
+            .get(i)
+            .copied()
+            .flatten()
+            .is_some_and(|(a, b)| a == EndRef::Node(v) || b == EndRef::Node(v))
+    };
+    let (mut x0, mut y0, mut x1, mut y1) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(x, y) in w {
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    sc.nodes
+        .iter()
+        .enumerate()
+        .filter(|&(v, n)| {
+            let r = (
+                n.x - n.w / 2.0 + 1.0,
+                n.y - n.h / 2.0 + 1.0,
+                n.x + n.w / 2.0 - 1.0,
+                n.y + n.h / 2.0 - 1.0,
+            );
+            r.0 < r.2
+                && r.1 < r.3
+                && r.0 < x1
+                && x0 < r.2
+                && r.1 < y1
+                && y0 < r.3
+                && !own(v)
+                && w.windows(2).any(|q| seg_meets_rect(q[0], q[1], r))
+        })
+        .count()
+}
+
+/// Whether segment `a`-`b` meets the open rectangle `r` = `(x0, y0, x1,
+/// y1)` (Liang-Barsky clipping).
+fn seg_meets_rect(a: Pt, b: Pt, r: (f64, f64, f64, f64)) -> bool {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for (p, q) in [
+        (-dx, a.0 - r.0),
+        (dx, r.2 - a.0),
+        (-dy, a.1 - r.1),
+        (dy, r.3 - a.1),
+    ] {
+        if p == 0.0 {
+            if q <= 0.0 {
+                return false;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+        }
+    }
+    t0 < t1
+}
+
 /// Heading key of an end at `p` steering to `q`, seen from `side`.
 fn heading_on(side: Side, p: Pt, q: Pt) -> f64 {
     let (pt, pn) = split(side, p);
@@ -758,6 +872,11 @@ fn spill(sc: &Scene, groups: &mut BTreeMap<(EndRef, Side), Vec<PortEnd>>) {
         // side.
         let (lo, hi, _, _) = span(sc, end, side);
         let hard_cap = (((hi - lo).max(0.0) / PORT_HARD_SPACING).floor() as usize + 1).max(cap);
+        // A back-edge's lane (an orthogonal path into this side, square to
+        // it) never goes round the corner: `turn_end` would swing its last
+        // leg into the neighbouring side at a slant (q10: a lane into an
+        // over-full side entered the top at 34 deg).
+        let lane = |p: &PortEnd| p.back && sc.edges[p.edge].waypoints.len() > 2;
         let mut out: Vec<(Side, PortEnd)> = Vec::new();
         loop {
             let n = ports.len();
@@ -765,8 +884,8 @@ fn spill(sc: &Scene, groups: &mut BTreeMap<(EndRef, Side), Vec<PortEnd>>) {
                 break;
             }
             let any = n > hard_cap;
-            let can_low = low_room > 0 && (any || !ports[0].back);
-            let can_high = high_room > 0 && (any || !ports[n - 1].back);
+            let can_low = low_room > 0 && !lane(&ports[0]) && (any || !ports[0].back);
+            let can_high = high_room > 0 && !lane(&ports[n - 1]) && (any || !ports[n - 1].back);
             if !(can_low || can_high) {
                 break;
             }
@@ -859,9 +978,19 @@ fn move_end(e: &mut SceneEdge, src: bool, old: Pt, delta: Pt, side: Side, back: 
     };
     let (pi, ci) = if src { (0, 1) } else { (3, 2) };
     if e.waypoints.is_empty() {
+        // A back-edge drawn across the gap leaves along its side's
+        // normal like a forward edge: its control moves with the end —
+        // as does one whose control at this end runs straight out of it
+        // (a labelled 2-cycle's twin bowed at its other end only,
+        // `scene::bowed`: pulled back, its head swung 30 deg off square
+        // in state `lr_right`).
+        let (ct, _) = split(side, e.bezier[ci]);
+        let (ot, _) = split(side, old);
+        let straight = (ct - ot).abs() < STUB_EPS;
+        let bowed = back && !straight && !across(&e.bezier, src, old);
         add(&mut e.bezier[pi]);
-        if back {
-            // A back-edge's controls set its bow round the nodes it
+        if bowed {
+            // A bowed back-edge's controls set its bow round the nodes it
             // passes: pull the control back by a third of the move, which
             // keeps the bow's apex (`(p0 + 3 c1 + 3 c2 + p3) / 8`) where
             // it was.
@@ -953,9 +1082,10 @@ fn move_end(e: &mut SceneEdge, src: bool, old: Pt, delta: Pt, side: Side, back: 
 fn turn_end(e: &mut SceneEdge, src: bool, old: Pt, new: Pt, side: Side, back: bool) {
     let (pi, ci) = if src { (0, 1) } else { (3, 2) };
     let nv = normal(side);
-    // A back-edge's control pulls back by a third of the move instead,
-    // so its bow's apex stays (see [`move_end`]).
-    let k = if back { -1.0 / 3.0 } else { 1.0 };
+    // A bowed back-edge's control pulls back by a third of the move
+    // instead, so its bow's apex stays (see [`move_end`]).
+    let bowed = back && !across(&e.bezier, src, old);
+    let k = if bowed { -1.0 / 3.0 } else { 1.0 };
     let reach = |c: Pt| {
         (
             c.0 + k * (new.0 - old.0) + nv.0 * SPILL_LIFT,
@@ -976,6 +1106,18 @@ fn turn_end(e: &mut SceneEdge, src: bool, old: Pt, new: Pt, side: Side, back: bo
         }
         e.bezier[pi] = new;
     }
+}
+
+/// Whether a back-edge's curve `b` crosses the gap as a forward edge
+/// does (the end being moved, at `old`, is its start when `src`): each
+/// control straight out of its end along one and the same axis, the
+/// sides' normal — not a bow round what lies between, nor an elbow
+/// turning from one axis to the other (a note card's link).
+fn across(b: &[Pt; 4], src: bool, old: Pt) -> bool {
+    let (p0, p3) = if src { (old, b[3]) } else { (b[0], old) };
+    let same_x = (b[1].0 - p0.0).abs() < STUB_EPS && (b[2].0 - p3.0).abs() < STUB_EPS;
+    let same_y = (b[1].1 - p0.1).abs() < STUB_EPS && (b[2].1 - p3.1).abs() < STUB_EPS;
+    same_x || same_y
 }
 
 /// Exactly the same point.
