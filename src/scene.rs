@@ -5167,9 +5167,17 @@ const ROUNDED_RX: f64 = 9.0;
 /// Most inset (px) of a hexagon's side points and of a parallelogram's
 /// slant; a quarter of the width on a narrower node.
 pub(crate) const SLANT_MAX: f64 = 14.0;
-/// Most half height (px) of a cylinder's cap ellipse; a quarter of the
-/// node's height on a shorter one.
-const CYLINDER_RY_MAX: f64 = 8.0;
+/// Half height (px) of a cylinder's cap ellipse as drawn (and picked):
+/// [`crate::layout::cylinder_cap_ry`] for its width, which the layout
+/// sized it for, and at most a quarter of its height (a host-sized node).
+pub(crate) fn cylinder_ry(w: f64, h: f64) -> f64 {
+    crate::layout::cylinder_cap_ry(w).min(h / 4.0)
+}
+/// How far (in cap radii) below the box centre a cylinder's label sits:
+/// in the middle of the body under the lid, where mermaid sets it, not
+/// up against the lid's front rim (the box centre is a cap radius above
+/// the body's).
+pub(crate) const CYLINDER_LABEL_DROP: f64 = 0.75;
 /// How far (px) a flattened arc of [`node_outline`] may bow off its
 /// chords: well under a pixel, so a distance to the polygon is a
 /// distance to the painted curve.
@@ -5238,7 +5246,7 @@ pub(crate) fn node_outline(n: &SceneNode) -> Vec<(f64, f64)> {
         Shape::Cylinder => {
             // The top cap's upper half, the right side, the bottom
             // cap's lower half; the left side closes the polygon.
-            let ry = CYLINDER_RY_MAX.min(h / 4.0);
+            let ry = cylinder_ry(w, h);
             let mut out = Vec::new();
             arc(&mut out, (cx, t + ry), w / 2.0, ry, PI, 2.0 * PI);
             arc(&mut out, (cx, b - ry), w / 2.0, ry, 0.0, PI);
@@ -5853,12 +5861,15 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
             s.push_str(&format!("<g><title>{}</title>\n", escape(&node_title)));
         }
         // Shape theme, overridden by any custom style/classDef colors.
+        // The width applies to the strokes drawn with the outline too:
+        // a cylinder's lid, a subroutine's bars, a final state's ring.
         let ss = crate::style::shape_style(n.shape);
+        let sw = n.style.stroke_width.unwrap_or(NODE_STROKE_WIDTH);
         let style = format!(
             "fill=\"{}\" stroke=\"{}\" stroke-width=\"{}\"",
             style_attr(n.style.fill.as_deref(), ss.fill),
             style_attr(n.style.stroke.as_deref(), ss.stroke),
-            n.style.stroke_width.unwrap_or(NODE_STROKE_WIDTH)
+            sw
         );
         match n.shape {
             Shape::Rect | Shape::Rounded | Shape::Stadium => {
@@ -5910,13 +5921,17 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
             }
             Shape::Cylinder => {
                 let (l, r, t, b) = (cx - w / 2.0, cx + w / 2.0, cy - h / 2.0, cy + h / 2.0);
-                let ry = CYLINDER_RY_MAX.min(h / 4.0); // cap ellipse radius
-                                                       // Body + bottom arc, then the top ellipse on top.
+                let ry = cylinder_ry(w, h); // cap ellipse radius
+                                            // The whole drum, over the lid's back arc, filled and
+                                            // stroked, so the lid is filled like the body (the old
+                                            // body ran under the front arc and left the lid hollow);
+                                            // then the lid's front arc on top, in the node's own
+                                            // stroke and width.
                 s.push_str(&format!(
-                    "<path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 0 {r:.1} {ty:.1} \
+                    "<path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 1 {r:.1} {ty:.1} \
                      L {r:.1} {by:.1} A {rx:.1} {ry:.1} 0 0 1 {l:.1} {by:.1} Z\" {style}/>\n\
-                     <path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 1 {r:.1} {ty:.1}\" \
-                     fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{NODE_STROKE_WIDTH}\"/>\n",
+                     <path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 0 {r:.1} {ty:.1}\" \
+                     fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{sw}\"/>\n",
                     l = l,
                     r = r,
                     ty = t + ry,
@@ -5931,8 +5946,8 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
                 let (l, t) = (cx - w / 2.0, cy - h / 2.0);
                 s.push_str(&format!(
                     "<rect x=\"{l:.1}\" y=\"{t:.1}\" width=\"{w:.1}\" height=\"{h:.1}\" rx=\"3\" {style}/>\n\
-                     <line x1=\"{l1:.1}\" y1=\"{t:.1}\" x2=\"{l1:.1}\" y2=\"{b:.1}\" stroke=\"{stroke}\" stroke-width=\"{NODE_STROKE_WIDTH}\"/>\n\
-                     <line x1=\"{r1:.1}\" y1=\"{t:.1}\" x2=\"{r1:.1}\" y2=\"{b:.1}\" stroke=\"{stroke}\" stroke-width=\"{NODE_STROKE_WIDTH}\"/>\n",
+                     <line x1=\"{l1:.1}\" y1=\"{t:.1}\" x2=\"{l1:.1}\" y2=\"{b:.1}\" stroke=\"{stroke}\" stroke-width=\"{sw}\"/>\n\
+                     <line x1=\"{r1:.1}\" y1=\"{t:.1}\" x2=\"{r1:.1}\" y2=\"{b:.1}\" stroke=\"{stroke}\" stroke-width=\"{sw}\"/>\n",
                     l = l, t = t, w = w, h = h, b = t + h, l1 = l + 8.0, r1 = l + w - 8.0,
                     stroke = style_attr(n.style.stroke.as_deref(), ss.stroke), style = style,
                 ));
@@ -5990,7 +6005,7 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
                 // Outer ring + filled core (UML final-state notation).
                 s.push_str(&format!(
                     "<circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{r:.1}\" fill=\"#ffffff\" \
-                     stroke=\"{stroke}\" stroke-width=\"{NODE_STROKE_WIDTH}\"/>\n\
+                     stroke=\"{stroke}\" stroke-width=\"{sw}\"/>\n\
                      <circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{ri:.1}\" {style}/>\n",
                     r = w / 2.0,
                     ri = w / 2.0 - 4.0,
@@ -6008,10 +6023,16 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
                 ));
             }
         }
+        // A cylinder's label sits in its body, under the lid.
+        let ly = if n.shape == Shape::Cylinder {
+            cy + CYLINDER_LABEL_DROP * cylinder_ry(w, h)
+        } else {
+            cy
+        };
         svg_text_multiline(
             &mut s,
             cx,
-            cy,
+            ly,
             &style_attr(n.style.color.as_deref(), TEXT_COLOR),
             &n.label,
         );
@@ -9136,7 +9157,7 @@ mod tests {
                 Shape::Diamond => n.w * n.h / 2.0,
                 Shape::Hexagon | Shape::Parallelogram | Shape::ParallelogramAlt => (n.w - k) * n.h,
                 Shape::Cylinder => {
-                    let ry = CYLINDER_RY_MAX.min(n.h / 4.0);
+                    let ry = cylinder_ry(n.w, n.h);
                     n.w * (n.h - 2.0 * ry) + pi * (n.w / 2.0) * ry
                 }
                 _ => unreachable!("not in this chart"),
@@ -9180,6 +9201,97 @@ mod tests {
         let dom = root_id(&svg).unwrap();
         assert!(svg.contains(&format!("id=\"{dom}-e1\"")), "{svg}");
         assert!(svg.contains("class=\"edge-animation-fast\""));
+    }
+
+    #[test]
+    fn cylinders_fill_their_lid_centre_their_label_and_take_their_stroke() {
+        // Report Q7. A narrow and a wide drum, one with a style width.
+        let src = "flowchart TD\n  A[(DB)] --> B[(A rather wide database name)]\n  \
+                   C[[Sub]]\n  style B stroke-width:4px\n  style C stroke-width:3px\n";
+        let g = parse(src).unwrap();
+        let sc = scene(&g);
+        let svg = to_svg(&sc);
+        let node = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+        let (a, b) = (node("A"), node("B"));
+        // The lid deepens with the width (mermaid's rx / (2.5 + w / 50),
+        // capped), within the drum's unchanged size.
+        let (ra, rb) = (cylinder_ry(a.w, a.h), cylinder_ry(b.w, b.h));
+        assert!(ra < rb && ra >= 7.0 && rb <= 10.0, "{ra} {rb}");
+        assert_eq!((a.h, b.h), (54.0, 54.0));
+        for (n, ry, sw) in [(a, ra, NODE_STROKE_WIDTH), (b, rb, 4.0)] {
+            let (l, r) = (n.x - n.w / 2.0, n.x + n.w / 2.0);
+            let ty = n.y - n.h / 2.0 + ry;
+            // The drum runs over the lid's back arc (sweep 1), so the lid
+            // is filled; the front arc is stroked on top in the node's
+            // own width (a style width reaches it).
+            let body = format!(
+                "<path d=\"M {l:.1} {ty:.1} A {:.1} {ry:.1} 0 0 1 {r:.1} {ty:.1} ",
+                n.w / 2.0
+            );
+            assert!(svg.contains(&body), "{body}\n{svg}");
+            let lid = format!(
+                "<path d=\"M {l:.1} {ty:.1} A {:.1} {ry:.1} 0 0 0 {r:.1} {ty:.1}\" fill=\"none\" \
+                 stroke=\"{}\" stroke-width=\"{sw}\"/>",
+                n.w / 2.0,
+                crate::style::shape_style(Shape::Cylinder).stroke
+            );
+            assert!(svg.contains(&lid), "{lid}\n{svg}");
+            // The label sits in the body under the lid.
+            let ly = n.y + CYLINDER_LABEL_DROP * ry;
+            assert!(svg.contains(&format!("y=\"{ly:.1}\"")), "{ly}\n{svg}");
+        }
+        // A subroutine's bars take its style width too.
+        let bars = svg
+            .lines()
+            .filter(|l| l.starts_with("<line ") && l.ends_with("stroke-width=\"3\"/>"))
+            .count();
+        assert_eq!(bars, 2, "{svg}");
+        // The advance writer draws the same drum.
+        let adv = crate::advance::render_advance_text_svg("lane l \"L\"\na[(DB)]\n").unwrap();
+        assert!(adv.contains(" 0 0 1 ") && adv.contains(" 0 0 0 "), "{adv}");
+    }
+
+    #[test]
+    fn ends_on_a_cylinders_cap_sit_on_its_arc() {
+        // Report Q7 / §2.5: an end off the middle of a drum's top floated
+        // above the lid's back arc, one under its bottom below the
+        // bottom arc. Fan in and out of a wide drum, both modes.
+        let src = "flowchart TD\n  A --> D[(A rather wide database)]\n  B --> D\n  C --> D\n  \
+                   D --> E\n  D --> F\n  D --> G\n";
+        let g = parse(src).unwrap();
+        let sc = scene(&g);
+        let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let routed = route(&g, &at);
+        for sc in [&sc, &routed] {
+            let d = sc.nodes.iter().find(|n| n.id == "D").unwrap();
+            let outline = node_outline(d);
+            let dist = |p: (f64, f64)| {
+                outline
+                    .windows(2)
+                    .map(|w| point_seg_dist(p.0, p.1, w[0], w[1]))
+                    .fold(f64::INFINITY, f64::min)
+            };
+            let mut off_centre = 0;
+            for e in &sc.edges {
+                let ends = edge_polyline(e);
+                let p = if e.to == "D" {
+                    ends[ends.len() - 1]
+                } else if e.from == "D" {
+                    ends[0]
+                } else {
+                    continue;
+                };
+                assert!(
+                    dist(p) < 0.5,
+                    "{} -> {} ends {:.1} px off D's outline",
+                    e.from,
+                    e.to,
+                    dist(p)
+                );
+                off_centre += usize::from((p.0 - d.x).abs() > 10.0);
+            }
+            assert!(off_centre >= 4, "the fans spread over the caps");
+        }
     }
 
     #[test]

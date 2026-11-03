@@ -167,7 +167,13 @@ fn quality_gate() {
 /// `queue -> job2` 57 px on the jobs frame's left, where `svc1 -> db`
 /// (87 px) and `svc6 -> db` (85 px) rode before (bench-75 274 -> 360 px,
 /// border_runs 4 -> 5). Ratcheted to just above that: 2070 -> 2065.
-const BORDER_LEN_MAX: (f64, f64) = (1_020.0, 2_065.0);
+/// B4 (report Q7): 1020 -> 1022 static, as an intended drawing change:
+/// an end on a cylinder's top or bottom now starts on the cap's arc
+/// instead of the box side (`edgepass::cap_ends`), so `dense-lr`'s hub
+/// `n12`'s bottom-corner ends `n12 -> n36` / `n12 -> n38` start 6 px up
+/// the bottom arc and their curves run 1-2 px longer beside g1's and
+/// g2's right borders (1018.7 -> 1021.7); no route changed.
+const BORDER_LEN_MAX: (f64, f64) = (1_022.0, 2_065.0);
 
 /// Edges keep off frame borders where their channel has room (G4).
 #[test]
@@ -485,11 +491,17 @@ fn channels_keep_edges_apart_and_off_chips() {
 /// and band_len 46 246 -> 47 104 (dense-td's `n43 -> n16`, whose ends
 /// lie 2 000 px apart across one gap, now runs in a lane beside its
 /// twin instead of sweeping along the gap through 8 edges).
+///
+/// B4 (report Q7): an end on a cylinder's top or bottom is put onto the
+/// cap's arc (`edgepass::cap_ends`), so the ends floating above a lid or
+/// below a drum are gone (dense-td's 5): end_gaps 11 | 11 -> 2 | 3 and
+/// end_gap_max 4.7 -> 4.5 (what is left is dense-lr's over-full hub,
+/// whose corner ports sit on its flanks where they curve in).
 const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
     ("end_tilt", 8.0, 11.0),
     ("end_tilt_max", 76.8, 128.4),
-    ("end_gaps", 11.0, 11.0),
-    ("end_gap_max", 4.7, 4.7),
+    ("end_gaps", 2.0, 3.0),
+    ("end_gap_max", 4.5, 4.5),
     ("lat_wiggles", 16.0, 16.0),
     ("lat_backtrack", 1_813.0, 696.1),
     ("own_frame_x", 0.0, 0.0),

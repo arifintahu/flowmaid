@@ -494,6 +494,19 @@ Minor, not patch: several class structs gain public fields (see
   busy hub this ranks with the other soft obstacles (a label still never
   covers a node, a head or another label to get it), so a dozen labels
   out of one node can still sit closer.
+- **Cylinders read as drums** (report Q7). The lid is filled like the
+  body (the drum used to run under the lid's front arc, so the canvas
+  showed through the lid), its depth follows the width as in mermaid
+  (`rx / (2.5 + w / 50)`: 7.5 px on the narrowest drum, up to 10 px from
+  about 80 px wide; it was a fixed 8 px) and the label sits in the body
+  under the lid (0.75 of the lid's depth below the box centre) instead
+  of up against its rim. Node sizes are unchanged. A `style` /
+  `classDef` `stroke-width` now reaches the lid's front arc and a
+  subroutine's bars (and a final state's ring), which kept the default
+  width. An edge end on a cylinder's top or bottom now meets the drum's
+  arc instead of the box side, in `scene()`, `route()` and every drag
+  frame (it floated up to 4 px above the lid's back arc, or below the
+  bottom arc, off the middle). The advance writer draws the same drum.
 - **Breaking** (needs a **minor** bump). Nothing public is removed or
   renamed, and every function keeps its signature. What breaks, and how to
   migrate:
