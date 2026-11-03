@@ -5718,18 +5718,21 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
     // passing the header strip never strike through the text — each
     // gets a translucent chip, mermaid-style.
     let mut cluster_titles = String::new();
+    // Each nesting depth a step deeper (style::cluster_style), its
+    // border readable on the canvas and on the frame round it (Q6).
     for (ci, c) in sc.clusters.iter().enumerate() {
         let (x, y) = t((c.x, c.y));
+        let cs = crate::style::cluster_style(c.depth);
         s.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"8\" \
-             fill=\"#f7f8fd\" stroke=\"#c9cfe8\" stroke-width=\"1.4\"/>\n",
-            x, y, c.w, c.h
+             fill=\"{}\" stroke=\"{}\" stroke-width=\"1.4\"/>\n",
+            x, y, c.w, c.h, cs.fill, cs.stroke
         ));
         let title = fit_cluster_title(&sc.clusters, ci, maxx + MARGIN);
         let tw = text_width(&title) * TITLE_SCALE;
         cluster_titles.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{}\" rx=\"4\" \
-             fill=\"#f7f8fd\" fill-opacity=\"0.9\"/>\n",
+             fill=\"{}\" fill-opacity=\"0.9\"/>\n",
             x + 6.0,
             y + 5.0,
             tw + 8.0,
@@ -5741,15 +5744,17 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
                 } else {
                     format!("{h:.1}")
                 }
-            }
+            },
+            cs.fill
         ));
         for (k, line) in title.split('\n').enumerate() {
             cluster_titles.push_str(&format!(
                 "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"{}\" font-weight=\"bold\" \
-                 fill=\"#6a7086\">{}</text>\n",
+                 fill=\"{}\">{}</text>\n",
                 x + 10.0,
                 y + 17.0 + k as f64 * TITLE_LINE_H,
                 crate::layout::TITLE_FONT,
+                crate::style::CLUSTER_TITLE,
                 rich(line)
             ));
         }
@@ -9292,6 +9297,37 @@ mod tests {
             }
             assert!(off_centre >= 4, "the fans spread over the caps");
         }
+    }
+
+    #[test]
+    fn nested_frames_step_by_depth_and_title_chips_take_their_fill() {
+        // Report Q6: every frame looked the same at any depth, its border
+        // 1.55:1 on white. Each depth now takes its own fill and a border
+        // readable on the frame round it; a title's chip takes its
+        // frame's fill, and titles still paint last (never struck).
+        let svg = svg_src(
+            "flowchart TD\n  subgraph A [Outer]\n    subgraph B [Middle]\n      subgraph C [Inner]\n        \
+             x --> y\n      end\n    end\n  end\n  q --> x\n",
+        );
+        for d in 0..3 {
+            let c = crate::style::cluster_style(d);
+            let frame = format!(
+                "rx=\"8\" fill=\"{}\" stroke=\"{}\" stroke-width=\"1.4\"/>",
+                c.fill, c.stroke
+            );
+            assert_eq!(svg.matches(&frame).count(), 1, "depth {d}\n{svg}");
+            let chip = format!("rx=\"4\" fill=\"{}\" fill-opacity=\"0.9\"/>", c.fill);
+            assert_eq!(svg.matches(&chip).count(), 1, "depth {d} chip\n{svg}");
+        }
+        let title = svg.find(">Inner</text>").unwrap();
+        assert!(
+            svg[title..].find("<path").is_none(),
+            "titles paint after the edges"
+        );
+        assert!(svg.contains(&format!(
+            "fill=\"{}\">Outer</text>",
+            crate::style::CLUSTER_TITLE
+        )));
     }
 
     #[test]
@@ -14613,13 +14649,13 @@ mod tests {
         let svg = svg_src("flowchart LR\n  subgraph s1 [\"`*Italic* title`\"]\n    A\n  end\n");
         assert!(
             svg.contains(
-                "fill=\"#6a7086\"><tspan font-style=\"italic\">Italic</tspan> title</text>"
+                "fill=\"#4a5070\"><tspan font-style=\"italic\">Italic</tspan> title</text>"
             ),
             "{svg}"
         );
         // Plain titles are byte-identical to the old escape().
         let svg = svg_src("flowchart LR\n  subgraph s1 [a & b]\n    A\n  end\n");
-        assert!(svg.contains("fill=\"#6a7086\">a &amp; b</text>"));
+        assert!(svg.contains("fill=\"#4a5070\">a &amp; b</text>"));
     }
 
     // --- issue #61: edge labels must not cover node boxes or each other ---

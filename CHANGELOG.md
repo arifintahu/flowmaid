@@ -109,7 +109,6 @@ Minor, not patch: several class structs gain public fields (see
   `dense-td` static). `tests/quality.rs` gates them at today's fixture
   values (`DEFECT_BASELINE`, `INK_MEAN_MIN`), to be lowered as the
   defects are fixed. No rendering change.
-
 - **`classDef default …` styles every flowchart node**, as in mermaid
   (report Q9). It used to be an ordinary class nobody carried, so the
   standard way to give a diagram a neutral look did nothing. It is now the
@@ -117,6 +116,9 @@ Minor, not patch: several class structs gain public fields (see
   `:::`) and `style` lines still win property by property, as mermaid
   compiles `default`, then the node's classes. A borderless shape (`text`,
   braces) takes only its text colour and keeps no box.
+- **`style::cluster_style(depth)`, `style::CLUSTER_STYLES` and
+  `style::CLUSTER_TITLE`**: the subgraph frame colours the SVG uses, for
+  hosts that paint frames from the scene (`SceneCluster::depth`).
 
 ### Changed
 
@@ -507,6 +509,16 @@ Minor, not patch: several class structs gain public fields (see
   arc instead of the box side, in `scene()`, `route()` and every drag
   frame (it floated up to 4 px above the lid's back arc, or below the
   bottom arc, off the middle). The advance writer draws the same drum.
+- **Nested subgraph frames read apart, and their borders read at all**
+  (report Q6). Every frame used to be the same `#f7f8fd` with a `#c9cfe8`
+  border, 1.55:1 on the white canvas, so nesting was hard to see and edges
+  ended on barely visible lines. Each nesting depth now takes a cool grey a
+  step deeper (four steps, then the deepest), with a border at least 3:1
+  on the canvas, on the frame round it and on its own fill; a title's chip
+  takes its frame's fill and the title ink is `#4a5070` (5.7:1 or better
+  on every depth; `#6a7086` fell under 4.5:1 on a nested frame). State
+  diagram composites draw the same way. Layout and titles' placement are
+  unchanged; titles still paint after the edges, never struck.
 - **Breaking** (needs a **minor** bump). Nothing public is removed or
   renamed, and every function keeps its signature. What breaks, and how to
   migrate:

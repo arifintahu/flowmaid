@@ -83,6 +83,46 @@ pub fn shape_style(shape: Shape) -> ShapeStyle {
     }
 }
 
+/// Subgraph frame colours by nesting depth, outermost first (report Q6):
+/// a cool grey a step deeper per level, so a nested frame reads apart
+/// from the one round it, and a border at least 3:1 against what it is
+/// drawn on — the white canvas, the parent frame's fill and its own —
+/// where the old single `#c9cfe8` border managed 1.55:1 and every depth
+/// looked the same. Greyer than the indigo node fill, so a node still
+/// stands out of its frame; deliberately no hue per frame, which would
+/// compete with the semantic node palette. Depths past the last share it
+/// (see [`cluster_style`]).
+pub const CLUSTER_STYLES: [ShapeStyle; 4] = [
+    ShapeStyle {
+        fill: "#f6f7fb",
+        stroke: "#858db0",
+    },
+    ShapeStyle {
+        fill: "#eceef6",
+        stroke: "#7b83a6",
+    },
+    ShapeStyle {
+        fill: "#e2e5f0",
+        stroke: "#71799c",
+    },
+    ShapeStyle {
+        fill: "#d8dcea",
+        stroke: "#687093",
+    },
+];
+
+/// Fill and border of a subgraph frame `depth` levels in (0 = outermost,
+/// as `SceneCluster::depth` counts): [`CLUSTER_STYLES`], the deepest
+/// entry for anything deeper.
+pub fn cluster_style(depth: usize) -> ShapeStyle {
+    CLUSTER_STYLES[depth.min(CLUSTER_STYLES.len() - 1)]
+}
+
+/// Ink of a subgraph frame's title: at least 5.7:1 on every
+/// [`CLUSTER_STYLES`] fill (its chip takes the frame's fill), where the
+/// old `#6a7086` fell under 4.5:1 on a nested frame.
+pub const CLUSTER_TITLE: &str = "#4a5070";
+
 /// Accent palette for ER entity headers (and anything else that
 /// wants a stable per-item color). Mid-luminance by design: text on
 /// these fills takes its colour from [`text_on`], never a fixed white.
@@ -560,6 +600,30 @@ mod tests {
         let (c, b) = (rgb(c), rgb(base));
         let k = c[1] / b[1];
         k <= 1.0 + 1e-9 && (0..3).all(|i| (c[i] - b[i] * k).abs() <= 1.5)
+    }
+
+    #[test]
+    fn cluster_frames_step_by_depth_with_borders_that_read() {
+        // Report Q6: every border reaches 3:1 on what it is drawn on (the
+        // canvas, its parent frame's fill, its own fill), each depth's
+        // fill differs from its parent's, and the title stays AA on all.
+        let mut parent = "#ffffff";
+        for (d, c) in CLUSTER_STYLES.iter().enumerate() {
+            for on in ["#ffffff", parent, c.fill] {
+                let k = contrast_ratio(c.stroke, on).unwrap();
+                assert!(k >= 3.0, "depth {d}: border {} on {on} {k:.2}", c.stroke);
+            }
+            let step = contrast_ratio(c.fill, parent).unwrap();
+            assert!(
+                step >= 1.05,
+                "depth {d}: fill too close to its parent's ({step:.3})"
+            );
+            let t = contrast_ratio(CLUSTER_TITLE, c.fill).unwrap();
+            assert!(t >= MIN_TEXT_CONTRAST, "depth {d}: title {t:.2}");
+            assert_eq!(cluster_style(d), *c);
+            parent = c.fill;
+        }
+        assert_eq!(cluster_style(99), CLUSTER_STYLES[3]);
     }
 
     #[test]
