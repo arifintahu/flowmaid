@@ -88,7 +88,7 @@ cat examples/lr.mmd | ./target/release/flowmaid > lr.svg
 # fold a long linear chain to fit 300 px along the flow axis
 ./target/release/flowmaid examples/lr.mmd --compact 300 -o lr-compact.svg
 
-# drop the white background so the SVG sits on any page colour
+# drop the canvas background so the SVG sits on any page colour
 # (combines with --compact, --advance and --advance-text)
 ./target/release/flowmaid examples/demo.mmd --transparent -o demo.svg
 

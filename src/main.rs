@@ -23,7 +23,7 @@ fn print_help() {
          \x20                       the flow axis (serpentine layout)\n\
          \x20 --advance             render advance / swimlane JSON input\n\
          \x20 --advance-text        render advance / swimlane text DSL input\n\
-         \x20 --transparent         omit the white background rect (transparent SVG)\n\
+         \x20 --transparent         omit the background rect (transparent SVG)\n\
          \x20 --theme <name>        colour theme: flowmaid (default), default (mermaid's),\n\
          \x20                       neutral, dark or forest; beats a theme the source\n\
          \x20                       names (%%{{init}}%% or frontmatter)\n\
