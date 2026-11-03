@@ -32,7 +32,7 @@ use crate::scene::{
     escape, svg_label_box, svg_open_a11y, A11y, Scene, SceneCluster, SceneEdge, SceneNode,
     SvgOptions, EDGE_COLOR, TEXT_COLOR,
 };
-use crate::style::accent;
+use crate::style::{accent, Theme};
 
 /// Canvas margin around the whole diagram.
 pub const PAD: f64 = 24.0;
@@ -80,6 +80,10 @@ const ICON_GAP: f64 = 6.0;
 /// Centre of a group title below the frame's top edge (inside the
 /// `GROUP_PAD + GROUP_TITLE_H` band above the first child).
 const TITLE_CY: f64 = 20.0;
+/// A group box's fill and border in the default theme (another theme
+/// takes its frame colours, [`crate::style::Palette::cluster_style`]).
+const GROUP_FILL: &str = "#f7f8fc";
+const GROUP_STROKE: &str = "#d5d9ec";
 /// How far a route runs straight out of its port before it may turn.
 const STUB: f64 = 16.0;
 /// Clearance a route keeps from every service box it passes.
@@ -2859,6 +2863,12 @@ pub fn to_svg_with(as_: &ArchScene, opts: &SvgOptions) -> String {
 /// [`A11y`]).
 pub(crate) fn to_svg_a11y_with(as_: &ArchScene, a11y: &A11y, opts: &SvgOptions) -> String {
     let (title, desc) = a11y.resolve("Architecture diagram");
+    let pal = opts.palette();
+    // The scene's own colours (a tint per top-level group) are the
+    // default theme's; another theme paints services, groups and
+    // junctions in its own node, frame and line colours, alike as
+    // mermaid paints them.
+    let themed = pal.theme != Theme::Flowmaid;
     let mut s = String::new();
     svg_open_a11y(
         &mut s,
@@ -2870,26 +2880,39 @@ pub(crate) fn to_svg_a11y_with(as_: &ArchScene, a11y: &A11y, opts: &SvgOptions) 
         opts,
     );
 
+    // Marker ids are page-global: in a colour other than the default
+    // they carry it, so diagrams of two themes inlined on one page keep
+    // their own heads.
+    let mk = if pal.line == EDGE_COLOR {
+        String::new()
+    } else {
+        format!("-{}", pal.line.trim_start_matches('#'))
+    };
     s.push_str(&format!(
         "<defs>\
-         <marker id='flowmaid-arch-arrow-end' markerWidth='10' markerHeight='10' \
+         <marker id='flowmaid-arch-arrow-end{1}' markerWidth='10' markerHeight='10' \
          refX='9' refY='5' orient='auto' markerUnits='userSpaceOnUse'>\
          <path d='M 0,0 L 10,5 L 0,10 L 1,5 z' fill='{0}'/>\
          </marker>\
-         <marker id='flowmaid-arch-arrow-start' markerWidth='10' markerHeight='10' \
+         <marker id='flowmaid-arch-arrow-start{1}' markerWidth='10' markerHeight='10' \
          refX='1' refY='5' orient='auto' markerUnits='userSpaceOnUse'>\
          <path d='M 10,0 L 0,5 L 10,10 L 9,5 z' fill='{0}'/>\
          </marker>\
          </defs>\n",
-        EDGE_COLOR
+        pal.line, mk
     ));
 
     // Group boxes, outermost first.
     for (g, c) in as_.scene.clusters.iter().enumerate() {
+        let (fill, stroke) = if themed {
+            pal.cluster_style(c.depth)
+        } else {
+            (GROUP_FILL, GROUP_STROKE)
+        };
         s.push_str(&format!(
             "<rect x='{:.1}' y='{:.1}' width='{:.1}' height='{:.1}' \
-             rx='8' fill='#f7f8fc' stroke='#d5d9ec' stroke-width='2'/>\n",
-            c.x, c.y, c.w, c.h
+             rx='8' fill='{}' stroke='{}' stroke-width='2'/>\n",
+            c.x, c.y, c.w, c.h, fill, stroke
         ));
         if !c.title.is_empty() {
             let (tx, ty) = as_
@@ -2902,7 +2925,7 @@ pub(crate) fn to_svg_a11y_with(as_: &ArchScene, a11y: &A11y, opts: &SvgOptions) 
                  fill='{}'>{}</text>\n",
                 tx,
                 ty,
-                TEXT_COLOR,
+                pal.tuned(TEXT_COLOR, &pal.cluster_title),
                 escape(&c.title)
             ));
         }
@@ -2914,8 +2937,15 @@ pub(crate) fn to_svg_a11y_with(as_: &ArchScene, a11y: &A11y, opts: &SvgOptions) 
         if n.shape == Shape::Circle {
             continue; // a junction: its dot goes over the edges below
         }
-        let fill = crate::scene::style_attr(n.style.fill.as_deref(), "#ffffff");
-        let stroke = crate::scene::style_attr(n.style.stroke.as_deref(), EDGE_COLOR);
+        let (fill, stroke) = if themed {
+            let (f, s) = pal.node_style(n.shape);
+            (f.to_string(), s.to_string())
+        } else {
+            (
+                crate::scene::style_attr(n.style.fill.as_deref(), "#ffffff"),
+                crate::scene::style_attr(n.style.stroke.as_deref(), EDGE_COLOR),
+            )
+        };
         s.push_str(&format!(
             "<rect x='{:.1}' y='{:.1}' width='{:.1}' height='{:.1}' \
              rx='8' fill='{}' stroke='{}' stroke-width='{:.1}'/>\n",
@@ -2952,7 +2982,7 @@ pub(crate) fn to_svg_a11y_with(as_: &ArchScene, a11y: &A11y, opts: &SvgOptions) 
                  fill='{}'>{}</text>\n",
                 n.x,
                 top + LINE_H * (k as f64 + 0.5),
-                TEXT_COLOR,
+                pal.node_text,
                 escape(line)
             ));
         }
@@ -2970,20 +3000,22 @@ pub(crate) fn to_svg_a11y_with(as_: &ArchScene, a11y: &A11y, opts: &SvgOptions) 
         // A single auto-oriented marker can only point one way, so the two
         // arrowheads need distinct marker instances with explicit orientation.
         if as_.arrow_ends.get(i).copied().unwrap_or(false) {
-            markers.push_str(" marker-end='url(#flowmaid-arch-arrow-end)'");
+            markers.push_str(&format!(" marker-end='url(#flowmaid-arch-arrow-end{mk})'"));
         }
         if as_.arrow_starts.get(i).copied().unwrap_or(false) {
-            markers.push_str(" marker-start='url(#flowmaid-arch-arrow-start)'");
+            markers.push_str(&format!(
+                " marker-start='url(#flowmaid-arch-arrow-start{mk})'"
+            ));
         }
         s.push_str(&format!(
             "<polyline points='{}' fill='none' stroke='{}' stroke-width='2' \
              stroke-linejoin='round'{} />\n",
-            points, EDGE_COLOR, markers
+            points, pal.line, markers
         ));
     }
     for e in &as_.scene.edges {
         if let Some((text, c, w)) = &e.label {
-            svg_label_box(&mut s, text, *c, *w);
+            svg_label_box(&mut s, text, *c, *w, &pal);
         }
     }
 
@@ -2994,7 +3026,11 @@ pub(crate) fn to_svg_a11y_with(as_: &ArchScene, a11y: &A11y, opts: &SvgOptions) 
             n.x,
             n.y,
             n.w / 2.0,
-            crate::scene::style_attr(n.style.fill.as_deref(), EDGE_COLOR)
+            if themed {
+                pal.line.clone()
+            } else {
+                crate::scene::style_attr(n.style.fill.as_deref(), EDGE_COLOR)
+            }
         ));
     }
 

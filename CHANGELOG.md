@@ -119,6 +119,49 @@ Minor, not patch: several class structs gain public fields (see
 - **`style::cluster_style(depth)`, `style::CLUSTER_STYLES` and
   `style::CLUSTER_TITLE`**: the subgraph frame colours the SVG uses, for
   hosts that paint frames from the scene (`SceneCluster::depth`).
+- **Colour themes** (report M10). flowmaid's semantic palette stays the
+  default, byte for byte; mermaid's looks are options:
+  `style::Theme::{Flowmaid, Mermaid, Neutral, Dark, Forest}` — mermaid's
+  `default` (lavender `#ececff` nodes, `#9370db` borders, `#333333` lines),
+  `neutral` (white nodes in one `#333333` ink), `dark` (light ink on a
+  `#1e1f22` canvas) and `forest` (green nodes). Every diagram type takes
+  them: flowchart and state nodes, frames, edges, heads, labels and notes;
+  class boxes, ER tables and sequence participants in the theme's one node
+  paint (as mermaid paints them) instead of an accent each; and the charts
+  (pie, journey, timeline, git graph, sankey, mindmap, architecture) keep
+  their categorical colours while their text, lines and canvas follow the
+  theme. Every theme keeps text at 4.5:1 and lines and borders at 3:1 on
+  what they are drawn over — the dark one included, where mermaid's own
+  frame borders and edge-label text fall short; mermaid's `#aaaa33` frame
+  and note borders are darkened, hue kept, to reach it. Frames still step
+  a shade per nesting level. `style`, `classDef` and `linkStyle` colours
+  win over any theme; a `style` fill without a `color` gets text that reads
+  on it when a theme's ink would not (a pale highlight under the dark
+  theme's light text). New: `SvgOptions::theme` (`Option<Theme>`),
+  `style::Palette` (every colour a theme paints with, for hosts that paint
+  a scene: `SvgOptions::palette()`), `Theme::from_name` / `name` / `ALL` /
+  `palette`, `style::readable_on`. The advance writer takes an explicit
+  theme too: lanes as its outermost frame, edges, text and chips in its
+  colours, unless the diagram sets its own.
+- **The theme a diagram names is honoured** (report P1: "theme from
+  init/frontmatter ignored"). `%%{init: {"theme": "dark"}}%%` (also
+  `%%{initialize: …}%%`, single quotes or bare words, over one line or
+  several) and `theme:` under a YAML frontmatter's `config:` pick the
+  theme, a directive winning over the frontmatter as in mermaid. Their
+  `themeVariables` `background`, `primaryColor`, `primaryBorderColor`,
+  `primaryTextColor`, `lineColor` and `textColor` recolour the matching
+  roles (a `primaryColor` without a text colour gets text that reads on
+  it). An unknown theme name is the default theme, without error, as in
+  mermaid; `base` reads as `default`, `neo` as `neutral` and `neo-dark` as
+  `dark`. An explicit `SvgOptions::theme` beats the source — its theme and
+  its variables alike; `Some(Theme::Flowmaid)` renders a themed source in
+  flowmaid's own colours. `render_svg` / `render_svg_advanced` read the
+  source themselves; `SvgOptions::with_source_theme(source)` does it for
+  callers that parse first and render through `render::*_with`.
+- **`flowmaid --theme <name>`** (`flowmaid`, `default`, `neutral`, `dark`,
+  `forest`) picks a theme for every input mode, beating one the source
+  names; an unknown name warns and renders the default theme. Without the
+  flag the CLI now honours the source's theme.
 
 ### Changed
 
@@ -585,6 +628,11 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Fixed
 
+- **A `%%{ … }%%` directive written over several lines parses.** Its inner
+  lines were read as diagram statements — `%%{\n  init: {\n    "theme":
+  "dark"\n  }\n}%%` failed every diagram type with "expected a node id".
+  The lines are now blanked before parsing (line numbers stay true), as the
+  frontmatter block is.
 - **Spacing an edge's end never slides its path into a node.** When the
   ports stage moved the end of an orthogonal path along its side, the
   straight leg out of that end slid with it — a long leg the router ran a

@@ -15,9 +15,7 @@
 
 use crate::layout::{text_width, wrap_text, LINE_H, TEXT_CALIBRATION};
 use crate::model::{Timeline, TimelineDirection, TimelinePeriod};
-use crate::scene::{
-    escape, svg_open_a11y, svg_text_lines, svg_text_multiline, A11y, SvgOptions, TEXT_COLOR,
-};
+use crate::scene::{escape, svg_open_a11y, svg_text_lines, svg_text_multiline, A11y, SvgOptions};
 use crate::style::accent;
 
 /// Canvas margin.
@@ -428,6 +426,10 @@ pub fn to_svg_with(ts: &TimelineScene, opts: &SvgOptions) -> String {
 /// accessible name, then "Timeline".
 pub(crate) fn to_svg_a11y_with(ts: &TimelineScene, a11y: &A11y, opts: &SvgOptions) -> String {
     let (title, desc) = a11y.resolve(ts.title.as_deref().unwrap_or("Timeline"));
+    // Sections keep their accents in every theme; the axis, task lines,
+    // tick rings and text follow it.
+    let pal = opts.palette();
+    let axis = pal.tuned(AXIS_COLOR, &pal.guide);
     let mut s = String::new();
     svg_open_a11y(&mut s, ts.width, ts.height, FONT, &title, desc, opts);
 
@@ -439,7 +441,7 @@ pub(crate) fn to_svg_a11y_with(ts: &TimelineScene, a11y: &A11y, opts: &SvgOption
             ts.title_pos.0,
             ts.title_pos.1,
             TITLE_FONT,
-            TEXT_COLOR,
+            pal.text,
             escape(title)
         ));
     }
@@ -473,24 +475,34 @@ pub(crate) fn to_svg_a11y_with(ts: &TimelineScene, a11y: &A11y, opts: &SvgOption
             sec.axis_y,
             sec.x + sec.w,
             sec.axis_y,
-            AXIS_COLOR
+            axis
         ));
+        // The unnamed leading section's ticks are the axis's colour.
+        let tick = if sec.color == UNNAMED_COLOR {
+            axis
+        } else {
+            sec.color
+        };
 
         for p in &sec.periods {
             // Dashed task line in the gaps between events, then the
-            // tick on top of the axis (white ring keeps it crisp where
-            // it sits on the line).
+            // tick on top of the axis (a ring in the canvas colour keeps
+            // it crisp where it sits on the line).
             for &(y0, y1) in &p.line_segments {
                 s.push_str(&format!(
                     "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{}\" \
                      stroke-width=\"1.2\" stroke-dasharray=\"4,4\"/>\n",
-                    p.cx, y0, p.cx, y1, TASK_LINE_COLOR
+                    p.cx,
+                    y0,
+                    p.cx,
+                    y1,
+                    pal.tuned(TASK_LINE_COLOR, &pal.guide)
                 ));
             }
             s.push_str(&format!(
-                "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{}\" stroke=\"#ffffff\" \
+                "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{}\" stroke=\"{}\" \
                  stroke-width=\"1.5\"/>\n",
-                p.cx, sec.axis_y, TICK_R, sec.color
+                p.cx, sec.axis_y, TICK_R, tick, pal.background
             ));
 
             // Period label (bold, above the axis) and its events (below).
@@ -498,13 +510,13 @@ pub(crate) fn to_svg_a11y_with(ts: &TimelineScene, a11y: &A11y, opts: &SvgOption
                 &mut s,
                 p.cx,
                 p.label_y,
-                TEXT_COLOR,
+                &pal.text,
                 &p.label,
                 " font-weight=\"bold\"",
                 false,
             );
             for (text, y) in &p.events {
-                svg_text_multiline(&mut s, p.cx, *y, TEXT_COLOR, text);
+                svg_text_multiline(&mut s, p.cx, *y, &pal.text, text);
             }
         }
     }

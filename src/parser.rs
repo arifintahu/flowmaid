@@ -27,6 +27,7 @@ use crate::model::{
     TimelinePeriod, TimelineSection, Visibility,
 };
 use crate::shapedata;
+use crate::style::{Theme, ThemeVars};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
@@ -294,6 +295,47 @@ fn strip_frontmatter(source: &str) -> Result<Cow<'_, str>, ParseError> {
         .collect::<Vec<_>>()
         .join("\n");
     Ok(Cow::Owned(out))
+}
+
+/// Blank every line of a `%%{ … }%%` directive that spans lines
+/// (mermaid's multi-line `%%{\n  init: {…}\n}%%`, the usual way to
+/// write `themeVariables`): its inner lines are not `%%` comments, so
+/// every diagram parser would read them as statements. A directive
+/// opens on a line starting `%%{` and runs to the first `}%%`; text
+/// after that on its last line is kept. One-line directives are left
+/// alone (they are `%%` comment lines already), and blanking rather
+/// than removing keeps every later line number exact, as
+/// [`strip_frontmatter`] does. [`theme_directive`] reads the directives
+/// from the unstripped source.
+fn strip_directives(source: &str) -> Cow<'_, str> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out: Option<Vec<String>> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let opens = lines[i].trim_start().starts_with("%%{");
+        if opens && !lines[i].contains("}%%") {
+            let Some(end) = (i + 1..lines.len()).find(|&k| lines[k].contains("}%%")) else {
+                break; // never closed: leave the source to the parsers
+            };
+            let o = out.get_or_insert_with(|| lines.iter().map(|l| l.to_string()).collect());
+            for line in o.iter_mut().take(end).skip(i) {
+                line.clear();
+            }
+            let tail = &lines[end][lines[end].find("}%%").unwrap() + 3..];
+            o[end] = if tail.trim().is_empty() {
+                String::new()
+            } else {
+                tail.to_string()
+            };
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    match out {
+        Some(o) => Cow::Owned(o.join("\n")),
+        None => Cow::Borrowed(source),
+    }
 }
 
 /// If `line` is a YAML frontmatter fence — leading spaces/tabs, then
@@ -1537,6 +1579,7 @@ pub fn parse_document(source: &str) -> Result<Document, ParseError> {
     // header tak terdeteksi dengan error yang menyesatkan.
     let raw_source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let stripped = strip_frontmatter(raw_source)?;
+    let stripped = strip_directives(&stripped);
     let source: &str = &stripped;
     for (i, raw) in source.lines().enumerate() {
         let line = raw.trim();
@@ -1589,7 +1632,7 @@ pub fn parse(source: &str) -> Result<Graph, ParseError> {
     // juga, jadi dapat perlakuan yang sama (BOM + frontmatter).
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let stripped = strip_frontmatter(source)?;
-    parse_flowchart(&stripped)
+    parse_flowchart(&strip_directives(&stripped))
 }
 
 /// The flowchart parse body, on a source that has ALREADY had its BOM
@@ -6079,6 +6122,237 @@ fn frontmatter_section<'a>(source: &'a str, section: &str) -> Vec<(usize, &'a st
     out
 }
 
+// ------------------------------------------------------------------
+// Theme directives
+// ------------------------------------------------------------------
+
+/// The colour theme a diagram's source asks for (report M10, P1 "theme
+/// from init/frontmatter ignored"): `theme:` and `themeVariables:`
+/// under its YAML frontmatter's `config:`, then every `%%{init: …}%%`
+/// (or `%%{initialize: …}%%`) directive in source order, a later one
+/// winning — mermaid lays directives over the frontmatter config. A
+/// theme name [`Theme::from_name`] does not know is the default theme,
+/// `Some(Theme::Flowmaid)`, as mermaid falls back to its default; the
+/// theme is `None` when nothing names one. Never fails: a directive
+/// that does not parse is skipped, as the diagram parsers skip it.
+pub(crate) fn theme_directive(source: &str) -> (Option<Theme>, ThemeVars) {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let named = |n: &str| Some(Theme::from_name(n).unwrap_or_default());
+    let mut theme = frontmatter_config_value(source, "theme").and_then(|v| named(&unquote_yaml(v)));
+    let mut vars = ThemeVars::default();
+    // Only `themeVariables`' direct children: a nested namespace
+    // (`themeVariables.sankey`) holds no theme colour.
+    let lines = frontmatter_section(source, "themeVariables");
+    if let Some(direct) = lines.iter().map(|(ind, _)| *ind).min() {
+        for (_, t) in lines.iter().filter(|(ind, _)| *ind == direct) {
+            if let Some((k, v)) = yaml_pair(t) {
+                vars.set(k, &unquote_yaml(v));
+            }
+        }
+    }
+    for body in init_directives(source) {
+        if let Some(Json::Str(name)) = json_get(&body, "theme") {
+            theme = named(name);
+        }
+        if let Some(Json::Obj(entries)) = json_get(&body, "themeVariables") {
+            for (k, v) in entries {
+                if let Json::Str(v) = v {
+                    vars.set(k, v);
+                }
+            }
+        }
+    }
+    (theme, vars)
+}
+
+/// The value of a scalar `config.<key>: value` line in YAML frontmatter
+/// — a DIRECT child of `config:` (raw: run it through
+/// [`unquote_yaml`]), `None` when there is none or it opens a block.
+fn frontmatter_config_value<'a>(source: &'a str, key: &str) -> Option<&'a str> {
+    let body = frontmatter_body(source)?;
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    let mut config_at: Option<usize> = None;
+    let mut child_at: Option<usize> = None;
+    let mut found = None;
+    for line in body {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let ind = indent_of(line);
+        if let Some(outer) = config_at {
+            if ind > outer {
+                let direct = *child_at.get_or_insert(ind);
+                if ind == direct {
+                    if let Some((k, v)) = yaml_pair(t) {
+                        if k == key && !v.trim().is_empty() {
+                            found = Some(v);
+                        }
+                    }
+                }
+                continue;
+            }
+            config_at = None;
+            child_at = None;
+        }
+        if t == "config:" {
+            config_at = Some(ind);
+        }
+    }
+    found
+}
+
+/// The configuration object of every `%%{init: {…}}%%` /
+/// `%%{initialize: {…}}%%` directive in `source`, in order. A
+/// directive may span lines (it runs to its `}%%`); other directive
+/// kinds (`%%{wrap}%%`) and bodies that do not parse are skipped.
+fn init_directives(source: &str) -> Vec<Vec<(String, Json)>> {
+    let mut out = Vec::new();
+    let mut rest = source;
+    while let Some(open) = rest.find("%%{") {
+        let after = &rest[open + 3..];
+        let Some(close) = after.find("}%%") else {
+            break;
+        };
+        let inner = after[..close].trim_start();
+        rest = &after[close + 3..];
+        let name_len = inner
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(inner.len());
+        if !matches!(&inner[..name_len], "init" | "initialize") {
+            continue;
+        }
+        let Some(value) = inner[name_len..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let mut at = 0;
+        if let Some(Json::Obj(body)) = json_value(value, &mut at) {
+            out.push(body);
+        }
+    }
+    out
+}
+
+/// A value in a directive's JSON body, read leniently as mermaid's own
+/// directive parser does: single or double quotes, bare keys, and bare
+/// words as strings (`theme: dark`). Arrays are skipped whole.
+#[derive(Debug, Clone, PartialEq)]
+enum Json {
+    Str(String),
+    Obj(Vec<(String, Json)>),
+    Other,
+}
+
+/// The value of `key` in a parsed object (the last one, as in JSON).
+fn json_get<'a>(obj: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
+    obj.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+fn json_skip_ws(s: &str, at: &mut usize) {
+    let b = s.as_bytes();
+    while b.get(*at).is_some_and(|c| c.is_ascii_whitespace()) {
+        *at += 1;
+    }
+}
+
+/// One JSON value starting at byte `*at` (whitespace first), leaving
+/// `*at` just past it; `None` where it is not one.
+fn json_value(s: &str, at: &mut usize) -> Option<Json> {
+    json_skip_ws(s, at);
+    let b = s.as_bytes();
+    match *b.get(*at)? {
+        b'{' => {
+            *at += 1;
+            let mut out = Vec::new();
+            loop {
+                json_skip_ws(s, at);
+                if b.get(*at) == Some(&b'}') {
+                    *at += 1;
+                    return Some(Json::Obj(out));
+                }
+                let key = match *b.get(*at)? {
+                    b'"' | b'\'' => json_string(s, at)?,
+                    _ => json_bare(s, at)?,
+                };
+                json_skip_ws(s, at);
+                if b.get(*at) != Some(&b':') {
+                    return None;
+                }
+                *at += 1;
+                let v = json_value(s, at)?;
+                out.push((key, v));
+                json_skip_ws(s, at);
+                match b.get(*at)? {
+                    b',' => *at += 1,
+                    b'}' => {}
+                    _ => return None,
+                }
+            }
+        }
+        b'[' => {
+            // Skip to the matching `]`, minding strings.
+            let mut depth = 0usize;
+            while let Some(&c) = b.get(*at) {
+                match c {
+                    b'"' | b'\'' => {
+                        json_string(s, at)?;
+                        continue;
+                    }
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            *at += 1;
+                            return Some(Json::Other);
+                        }
+                    }
+                    _ => {}
+                }
+                *at += 1;
+            }
+            None
+        }
+        b'"' | b'\'' => json_string(s, at).map(Json::Str),
+        _ => json_bare(s, at).map(Json::Str),
+    }
+}
+
+/// A quoted string at `*at` (either quote), backslash escapes taken
+/// literally (`\"` is `"`).
+fn json_string(s: &str, at: &mut usize) -> Option<String> {
+    let q = s[*at..].chars().next()?;
+    let mut out = String::new();
+    let mut chars = s[*at + 1..].char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == q {
+            *at += 1 + i + 1;
+            return Some(out);
+        }
+        if c == '\\' {
+            if let Some((_, e)) = chars.next() {
+                out.push(e);
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    None
+}
+
+/// A bare word at `*at` (a key or an unquoted value): everything up to
+/// whitespace or JSON punctuation; `None` when empty.
+fn json_bare(s: &str, at: &mut usize) -> Option<String> {
+    let rest = &s[*at..];
+    let len = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, ',' | ':' | '{' | '}' | '[' | ']'))
+        .unwrap_or(rest.len());
+    if len == 0 {
+        return None;
+    }
+    *at += len;
+    Some(rest[..len].to_string())
+}
+
 /// Apply one `config.sankey.<key>: <value>` pair. A value that does not
 /// parse leaves the mermaid default in place rather than failing the
 /// whole diagram — config is decoration, not structure.
@@ -7981,6 +8255,121 @@ mod tests {
         }
         // The flowchart-only entry point gets the same courtesy.
         assert!(parse("\u{feff}A --> B").is_ok());
+    }
+
+    /// Report M10 + P1 "theme from init/frontmatter ignored": the theme
+    /// a source names, and its `themeVariables`, are read from both
+    /// places mermaid takes them, directives winning.
+    #[test]
+    fn theme_directive_reads_init_and_frontmatter() {
+        use crate::style::{Theme, ThemeVars};
+        let theme = |src: &str| theme_directive(src).0;
+        assert_eq!(theme("flowchart TD\nA --> B"), None);
+        assert_eq!(
+            theme("%%{init: {\"theme\": \"dark\"}}%%\nflowchart TD\nA --> B"),
+            Some(Theme::Dark)
+        );
+        assert_eq!(
+            theme("%%{ init : { 'theme' : 'forest' } }%%\npie\n\"a\" : 1"),
+            Some(Theme::Forest)
+        );
+        assert_eq!(
+            theme("%%{initialize: {theme: neutral}}%%\nA --> B"),
+            Some(Theme::Neutral)
+        );
+        assert_eq!(
+            theme("%%{init: {\"theme\": \"default\"}}%%\nA --> B"),
+            Some(Theme::Mermaid)
+        );
+        // A name mermaid does not know is its default theme: ours.
+        assert_eq!(
+            theme("%%{init: {\"theme\": \"redux\"}}%%\nA --> B"),
+            Some(Theme::Flowmaid)
+        );
+        // Other directives, and bodies that are no JSON, name none.
+        assert_eq!(theme("%%{wrap}%%\nA --> B"), None);
+        assert_eq!(theme("%%{init: {\"theme\": }}%%\nA --> B"), None);
+        assert_eq!(theme("%%{init: \"dark\"}%%\nA --> B"), None);
+        // An unclosed directive is skipped rather than read to the end.
+        assert_eq!(theme("%%{init: {\"theme\": \"dark\"}\nA --> B"), None);
+        // Multi-line, with a nested config beside the theme.
+        let ml =
+            "%%{\n  init: {\n    'theme': 'base',\n    'flowchart': {'curve': 'linear'},\n    \
+                  'themeVariables': {\n      'primaryColor': '#BB2528',\n      \
+                  'lineColor': 'rgb(0, 128, 0)',\n      'fontSize': '16px'\n    }\n  }\n}%%\n\
+                  flowchart TD\nA --> B";
+        let (t, v) = theme_directive(ml);
+        assert_eq!(t, Some(Theme::Mermaid));
+        assert_eq!(v.primary, Some([0xbb, 0x25, 0x28]));
+        assert_eq!(v.line, Some([0, 128, 0]));
+        assert_eq!(v.primary_border, None);
+
+        // Frontmatter: `config.theme` and `config.themeVariables`.
+        let fm = "---\ntitle: T\nconfig:\n  theme: forest\n  themeVariables:\n    \
+                  primaryColor: \"#ffcc00\" # gold\n    background: '#fafafa'\n    sankey:\n      \
+                  lineColor: \"#123456\"\n  flowchart:\n    theme: dark\n---\nflowchart TD\nA --> B";
+        let (t, v) = theme_directive(fm);
+        assert_eq!(t, Some(Theme::Forest), "only config's own `theme:` counts");
+        assert_eq!(v.primary, Some([0xff, 0xcc, 0x00]));
+        assert_eq!(v.background, Some([0xfa, 0xfa, 0xfa]));
+        assert_eq!(v.line, None, "a nested namespace holds no theme colour");
+        // A directive beats the frontmatter, variable by variable.
+        let both = "---\nconfig:\n  theme: forest\n  themeVariables:\n    \
+                    primaryColor: \"#ffcc00\"\n    background: '#fafafa'\n---\n\
+                    %%{init: {\"theme\": \"dark\", \"themeVariables\": {\"background\": \"#000\"}}}%%\n\
+                    flowchart TD\nA --> B";
+        let (t, v) = theme_directive(both);
+        assert_eq!(t, Some(Theme::Dark));
+        assert_eq!(v.background, Some([0, 0, 0]));
+        assert_eq!(
+            v.primary,
+            Some([0xff, 0xcc, 0x00]),
+            "kept from the frontmatter"
+        );
+        assert_eq!(
+            theme_directive("\u{feff}%%{init: {'theme':'dark'}}%%\nA-->B").0,
+            Some(Theme::Dark)
+        );
+        assert_eq!(
+            theme_directive("---\nconfig:\n  theme:\n---\nA-->B"),
+            (None, ThemeVars::default())
+        );
+    }
+
+    /// A directive written over several lines (mermaid's usual layout
+    /// for `themeVariables`) used to be read as diagram statements.
+    #[test]
+    fn multi_line_directives_parse_for_every_diagram_type() {
+        let dir = "%%{\n  init: {\n    \"theme\": \"dark\"\n  }\n}%%\n";
+        for body in [
+            "flowchart TD\nA --> B",
+            "erDiagram\nA ||--o{ B : has",
+            "classDiagram\nAnimal <|-- Dog",
+            "sequenceDiagram\nA->>B: hi",
+            "pie\n\"a\" : 1",
+            "stateDiagram-v2\n[*] --> A",
+            "mindmap\n  root\n    child",
+            "journey\n  section S\n    Task: 5: Me",
+            "gitGraph\n  commit",
+            "timeline\n  2020 : a",
+            "sankey-beta\nA,B,1",
+            "architecture-beta\n  service a(server)[A]",
+        ] {
+            let src = format!("{dir}{body}");
+            assert!(
+                parse_document(&src).is_ok(),
+                "{body}: {:?}",
+                parse_document(&src).err()
+            );
+        }
+        // Text after the closing `}%%` stays; line numbers stay true.
+        let g = parse("%%{init:\n {}\n}%% \nA --> B\nB --> C").unwrap();
+        assert_eq!(g.nodes.len(), 3);
+        let e = parse("%%{init:\n {}\n}%%\nA --> B\nB -->").unwrap_err();
+        assert_eq!(e.line, 5, "{e}");
+        // An unclosed directive is left to the parsers, as before: its
+        // first line is a `%%` comment.
+        assert_eq!(parse("%%{init: {\nA --> B").unwrap().nodes.len(), 2);
     }
 
     #[test]

@@ -18,7 +18,7 @@
 
 use crate::layout::{text_width, TEXT_CALIBRATION};
 use crate::model::PieChart;
-use crate::scene::{escape, svg_open_a11y, A11y, SvgOptions, EDGE_COLOR, TEXT_COLOR};
+use crate::scene::{escape, svg_open_a11y, A11y, SvgOptions};
 use std::f64::consts::{FRAC_PI_2, TAU};
 
 /// Pie radius in pixels.
@@ -114,8 +114,9 @@ pub struct PieLabel {
     pub y: f64,
     /// `true`: centred inside its wedge, inked with
     /// [`crate::style::text_on`] of the slice colour. `false`: outside
-    /// the rim on the white canvas, inked with `TEXT_COLOR`, with
-    /// `x` at the end of [`PieLabel::leader`].
+    /// the rim on the canvas, inked with the theme's text colour
+    /// ([`crate::style::Palette::text`]), with `x` at the end of
+    /// [`PieLabel::leader`].
     pub inside: bool,
     /// SVG `text-anchor`: `middle` inside; `start` (right half) or
     /// `end` (left half) outside.
@@ -492,6 +493,9 @@ fn separator_w(a: &Slice, b: &Slice, r: f64) -> f64 {
 /// accessible name, then "Pie chart".
 pub(crate) fn to_svg_a11y_with(ps: &PieScene, a11y: &A11y, opts: &SvgOptions) -> String {
     let (title, desc) = a11y.resolve(ps.title.as_deref().unwrap_or("Pie chart"));
+    // Slices keep their categorical colours in every theme; the title,
+    // labels, legend, leaders and separators follow it.
+    let pal = opts.palette();
     let mut s = String::new();
     svg_open_a11y(&mut s, ps.width, ps.height, FONT as u32, &title, desc, opts);
 
@@ -502,7 +506,7 @@ pub(crate) fn to_svg_a11y_with(ps: &PieScene, a11y: &A11y, opts: &SvgOptions) ->
             ps.title_pos.0,
             ps.title_pos.1,
             TITLE_FONT,
-            TEXT_COLOR,
+            pal.text,
             escape(t)
         ));
     }
@@ -517,7 +521,7 @@ pub(crate) fn to_svg_a11y_with(ps: &PieScene, a11y: &A11y, opts: &SvgOptions) ->
         s.push_str(&format!(
             "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"none\" \
              stroke=\"{}\" stroke-width=\"1.6\"/>\n",
-            ps.cx, ps.cy, ps.r, EDGE_COLOR
+            ps.cx, ps.cy, ps.r, pal.line
         ));
     }
     for (i, sl) in ps.slices.iter().enumerate() {
@@ -555,20 +559,22 @@ pub(crate) fn to_svg_a11y_with(ps: &PieScene, a11y: &A11y, opts: &SvgOptions) ->
             ));
         }
     }
-    // Separators: one radial white line per boundary between drawn
-    // wedges (the last wedge meets the first at 12 o'clock).
+    // Separators: one radial line per boundary between drawn wedges
+    // (the last wedge meets the first at 12 o'clock), in the canvas
+    // colour so a wedge reads cut out of it.
     let drawn: Vec<&Slice> = ps.slices.iter().filter(|sl| sl.frac > 0.0).collect();
     if drawn.len() >= 2 {
         for (k, sl) in drawn.iter().enumerate() {
             let prev = drawn[(k + drawn.len() - 1) % drawn.len()];
             let p = polar(ps.cx, ps.cy, ps.r, sl.start_angle);
             s.push_str(&format!(
-                "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"#ffffff\" \
+                "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{}\" \
                  stroke-width=\"{:.2}\"/>\n",
                 ps.cx,
                 ps.cy,
                 p.0,
                 p.1,
+                pal.background,
                 separator_w(prev, sl, ps.r)
             ));
         }
@@ -588,9 +594,9 @@ pub(crate) fn to_svg_a11y_with(ps: &PieScene, a11y: &A11y, opts: &SvgOptions) ->
             s.push_str(&format!(
                 "<polyline points=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"1\"/>\n",
                 pts.join(" "),
-                EDGE_COLOR
+                pal.line
             ));
-            TEXT_COLOR
+            &pal.text
         };
         s.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" text-anchor=\"{}\" \
@@ -617,7 +623,7 @@ pub(crate) fn to_svg_a11y_with(ps: &PieScene, a11y: &A11y, opts: &SvgOptions) ->
             "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" fill=\"{}\">{}</text>\n",
             row.x + SWATCH + 8.0,
             row.y,
-            TEXT_COLOR,
+            pal.text,
             escape(&row.text)
         ));
     }

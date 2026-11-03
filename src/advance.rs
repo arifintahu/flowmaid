@@ -5512,12 +5512,33 @@ fn layout_inner(d: &AdvanceDiagram, route: bool) -> AdvanceScene {
 
 const FONT_SIZE: u32 = 13;
 
-fn shape_style(shape: Shape) -> (String, String) {
-    let ss = crate::style::shape_style(shape);
-    (ss.fill.to_string(), ss.stroke.to_string())
+/// `style` with every colour still at its default swapped for `pal`'s
+/// (a non-default theme, see [`to_svg_with`]).
+fn themed(style: &AdvanceStyle, pal: &crate::style::Palette) -> AdvanceStyle {
+    let pick = |own: &str, default: &str, theme: &str| {
+        if own == default { theme } else { own }.to_string()
+    };
+    let (lane_fill, lane_stroke) = pal.cluster_style(0);
+    AdvanceStyle {
+        lane_fill: pick(&style.lane_fill, DEFAULT_LANE_FILL, lane_fill),
+        lane_stroke: pick(&style.lane_stroke, DEFAULT_LANE_STROKE, lane_stroke),
+        edge_color: pick(&style.edge_color, DEFAULT_EDGE_COLOR, &pal.line),
+        text_color: pick(&style.text_color, DEFAULT_TEXT_COLOR, &pal.text),
+        label_fill: pick(&style.label_fill, DEFAULT_LABEL_FILL, &pal.label_fill),
+    }
 }
 
-fn render_node(s: &mut String, n: &AdvanceSceneNode, text_color: &str) {
+fn shape_style(shape: Shape, pal: &crate::style::Palette) -> (String, String) {
+    let (fill, stroke) = pal.node_style(shape);
+    (fill.to_string(), stroke.to_string())
+}
+
+fn render_node(
+    s: &mut String,
+    n: &AdvanceSceneNode,
+    text_color: &str,
+    pal: &crate::style::Palette,
+) {
     let cx = n.x;
     let cy = n.y;
     let w = n.w;
@@ -5525,7 +5546,7 @@ fn render_node(s: &mut String, n: &AdvanceSceneNode, text_color: &str) {
     // Every colour below is escaped on its way into an attribute: it may
     // come from a `style` line, from JSON, or from a caller assembling an
     // AdvanceScene by hand, and none of those are vetted.
-    let (mut fill, mut stroke) = shape_style(n.shape);
+    let (mut fill, mut stroke) = shape_style(n.shape, pal);
     if let Some(v) = &n.style.fill {
         fill = escape(v);
     }
@@ -5537,7 +5558,10 @@ fn render_node(s: &mut String, n: &AdvanceSceneNode, text_color: &str) {
         "fill=\"{}\" stroke=\"{}\" stroke-width=\"{:.1}\"",
         fill, stroke, sw
     );
-    let label_color = crate::scene::style_attr(n.style.color.as_deref(), text_color);
+    let label_color = crate::scene::style_attr(
+        n.style.color.as_deref(),
+        pal.ink_on_fill(n.style.fill.as_deref(), text_color),
+    );
 
     match n.shape {
         Shape::Rect | Shape::Rounded | Shape::Stadium => {
@@ -5706,11 +5730,11 @@ fn render_node(s: &mut String, n: &AdvanceSceneNode, text_color: &str) {
             .style
             .stroke
             .clone()
-            .unwrap_or_else(|| shape_style(n.shape).1);
+            .unwrap_or_else(|| shape_style(n.shape, pal).1);
         let node_text_raw = n.style.color.as_deref().unwrap_or(text_color).to_string();
         for (i, el) in n.elements.iter().enumerate() {
             let has_children = n.elements.iter().any(|c| c.parent == Some(i));
-            let fill = crate::scene::style_attr(el.style.fill.as_deref(), "#ffffff");
+            let fill = crate::scene::style_attr(el.style.fill.as_deref(), &pal.surface);
             let stroke = crate::scene::style_attr(el.style.stroke.as_deref(), &node_stroke_raw);
             let color = crate::scene::style_attr(el.style.color.as_deref(), &node_text_raw);
             s.push_str(&format!(
@@ -5751,8 +5775,20 @@ pub fn to_svg(sc: &AdvanceScene) -> String {
     to_svg_with(sc, &SvgOptions::default())
 }
 
-/// Render with explicit viewport options.
+/// Render with explicit viewport options. A theme other than the
+/// default ([`SvgOptions::theme`]) recolours every [`AdvanceStyle`]
+/// colour still at its default — lanes as the theme's outermost frame,
+/// edges, text and label chips in its colours — and every unstyled node;
+/// colours the diagram sets itself are kept.
 pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
+    let pal = opts.palette();
+    let themed_style;
+    let style = if pal.theme == crate::style::Theme::Flowmaid {
+        &sc.style
+    } else {
+        themed_style = themed(&sc.style, &pal);
+        &themed_style
+    };
     let mut s = String::new();
     let svg_title = sc.title.as_deref().unwrap_or("Advance diagram");
     svg_open(&mut s, sc.width, sc.height, FONT_SIZE, svg_title, opts);
@@ -5767,7 +5803,12 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
     // process, so two diagrams rendered separately and inlined on one
     // page both emitted `advance-arrow-1` and the second one's arrows
     // took the first one's colours.
-    let key = scene_key(sc);
+    // A theme's colours give the same scene other heads: its name joins
+    // the key, so two themes of one diagram on a page keep their own.
+    let key = match pal.theme {
+        crate::style::Theme::Flowmaid => scene_key(sc),
+        theme => format!("{}-{}", scene_key(sc), theme.name()),
+    };
     // (colour, how far the stroke stops short of the tip, id): a stroke
     // wider than the usual cut stops further back, its head set further
     // ahead to keep the tip on the route's end.
@@ -5776,7 +5817,7 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
         if matches!(e.kind, EdgeKind::Invisible) || !e.kind.has_arrow() {
             continue;
         }
-        let color = crate::scene::style_attr(e.style.color.as_deref(), &sc.style.edge_color);
+        let color = crate::scene::style_attr(e.style.color.as_deref(), &style.edge_color);
         let trim = crate::scene::arrow_trim(advance_edge_width(e));
         if !markers.iter().any(|(c, t, _)| *c == color && *t == trim) {
             let id = format!("advance-arrow-{}-{}", key, markers.len() + 1);
@@ -5802,8 +5843,8 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
             lane.y,
             lane.w,
             lane.h,
-            escape(&sc.style.lane_fill),
-            escape(&sc.style.lane_stroke)
+            escape(&style.lane_fill),
+            escape(&style.lane_stroke)
         ));
         let (tx, ty) = if sc.direction == AdvanceDirection::Horizontal {
             (lane.x + 12.0, lane.y + lane.h / 2.0)
@@ -5819,7 +5860,7 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
             tx,
             ty,
             FONT_SIZE,
-            escape(&sc.style.text_color),
+            escape(&style.text_color),
             escape(&lane.title)
         ));
     }
@@ -5829,7 +5870,7 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
         if matches!(e.kind, EdgeKind::Invisible) {
             continue;
         }
-        let color = crate::scene::style_attr(e.style.color.as_deref(), &sc.style.edge_color);
+        let color = crate::scene::style_attr(e.style.color.as_deref(), &style.edge_color);
         // An explicit style dash wins over the kind-based dotted style
         // (the flowchart writer's dots, scaled with the stroke);
         // otherwise Thick stays solid.
@@ -5891,7 +5932,7 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
             };
             let lw = text_width(label) + 14.0;
             let label_fill =
-                crate::scene::style_attr(e.style.label_fill.as_deref(), &sc.style.label_fill);
+                crate::scene::style_attr(e.style.label_fill.as_deref(), &style.label_fill);
             s.push_str(&format!(
                 "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"18\" \
                  fill=\"{}\" stroke=\"{}\" stroke-width=\"1\" rx=\"3\"/>\n",
@@ -5899,7 +5940,7 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
                 ly - 9.0,
                 lw,
                 label_fill,
-                escape(&sc.style.lane_stroke)
+                escape(&style.lane_stroke)
             ));
             s.push_str(&format!(
                 "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" text-anchor=\"middle\" \
@@ -5907,7 +5948,7 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
                 lx,
                 ly,
                 FONT_SIZE,
-                escape(&sc.style.text_color),
+                escape(&style.text_color),
                 escape(label)
             ));
         }
@@ -5915,7 +5956,7 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
 
     // Nodes
     for n in &sc.nodes {
-        render_node(&mut s, n, &sc.style.text_color);
+        render_node(&mut s, n, &style.text_color, &pal);
     }
 
     s.push_str("</svg>\n");

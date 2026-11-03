@@ -34,8 +34,9 @@ use crate::model::{
 use crate::scene::{
     edge_end_chord, edge_path_d, edge_polyline, edge_stroke_width, escape, fit_top_left,
     route_sized, sample_cubic, scene_sized, svg_label_box, svg_open_a11y, svg_text_multiline, A11y,
-    Scene, SceneEdge, SceneNode, SvgOptions, EDGE_COLOR, TEXT_COLOR,
+    Scene, SceneEdge, SceneNode, SvgOptions,
 };
+use crate::style::{ItemPaint, Palette};
 
 /// Name-compartment height in pixels (without stereotype lines).
 pub const HEADER_H: f64 = 28.0;
@@ -3250,6 +3251,7 @@ pub(crate) fn to_svg_a11y_with(cs: &ClassScene, a11y: &A11y, opts: &SvgOptions) 
     let (title, desc) = a11y.resolve("Class diagram");
     let fitted = fit_top_left(&cs.scene);
     let sc = &*fitted;
+    let pal = opts.palette();
     let mut s = String::new();
     svg_open_a11y(&mut s, sc.width, sc.height, 13, &title, desc, opts);
 
@@ -3268,15 +3270,17 @@ pub(crate) fn to_svg_a11y_with(cs: &ClassScene, a11y: &A11y, opts: &SvgOptions) 
         s.push_str(&format!(
             "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{}\"{}/>\n",
             edge_path_d(e, |p| p),
-            EDGE_COLOR,
+            pal.line,
             edge_stroke_width(e),
             dash
         ));
     }
 
-    // Class boxes — each gets a stable accent color, counted over the
-    // boxes alone (a lollipop takes none, so adding one recolours no
-    // class) — and lollipop interfaces' names.
+    // Class boxes — each gets a stable accent color (in the default
+    // theme; a mermaid-like theme paints them all alike, see
+    // `Palette::item`), counted over the boxes alone (a lollipop takes
+    // none, so adding one recolours no class) — and lollipop
+    // interfaces' names.
     let mut accent = 0;
     for (n, b) in sc.nodes.iter().zip(&cs.boxes) {
         if b.lollipop {
@@ -3285,16 +3289,15 @@ pub(crate) fn to_svg_a11y_with(cs: &ClassScene, a11y: &A11y, opts: &SvgOptions) 
                  fill=\"{}\">{}</text>\n",
                 n.x,
                 n.y,
-                TEXT_COLOR,
+                pal.text,
                 escape(&b.name)
             ));
         } else {
-            write_box(&mut s, n, b, crate::style::accent(accent));
+            write_box(&mut s, n, b, pal.item(accent), &pal);
             accent += 1;
         }
     }
     // Note cards.
-    let note = crate::style::NOTE_STYLE;
     for (n, nb) in sc.nodes[cs.boxes.len()..].iter().zip(&cs.notes) {
         s.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"2\" \
@@ -3303,22 +3306,22 @@ pub(crate) fn to_svg_a11y_with(cs: &ClassScene, a11y: &A11y, opts: &SvgOptions) 
             n.y - n.h / 2.0,
             n.w,
             n.h,
-            note.fill,
-            note.stroke
+            pal.note_fill,
+            pal.note_stroke
         ));
-        svg_text_multiline(&mut s, n.x, n.y, TEXT_COLOR, &escape(&nb.text));
+        svg_text_multiline(&mut s, n.x, n.y, &pal.note_text, &escape(&nb.text));
     }
 
     // End glyphs over the boxes they touch (a glyph under its box
     // loses whatever part the box covers), then the cardinalities.
     let heads = heads_of(sc, &cs.rels);
     for h in &heads {
-        write_head(&mut s, h);
+        write_head(&mut s, h, &pal);
     }
     for (rel, spots) in cs.rels.iter().zip(place_cards(sc, &cs.rels, &heads)) {
         for (text, at) in [(&rel.from_card, spots[0]), (&rel.to_card, spots[1])] {
             if let (Some(text), Some(at)) = (text, at) {
-                card_text(&mut s, at, text, sc.width, sc.height);
+                card_text(&mut s, at, text, sc.width, sc.height, &pal.text);
             }
         }
     }
@@ -3326,7 +3329,7 @@ pub(crate) fn to_svg_a11y_with(cs: &ClassScene, a11y: &A11y, opts: &SvgOptions) 
     // Relationship labels on top of everything.
     for e in &sc.edges {
         if let Some((text, m, w)) = &e.label {
-            svg_label_box(&mut s, text, *m, *w);
+            svg_label_box(&mut s, text, *m, *w, &pal);
         }
     }
 
@@ -3334,18 +3337,19 @@ pub(crate) fn to_svg_a11y_with(cs: &ClassScene, a11y: &A11y, opts: &SvgOptions) 
     s
 }
 
-/// One class box: white body, accent name band (only its top corners
-/// rounded, so it meets the body square), stereotype lines and name,
-/// compartments with accent dividers, then the border on top so no
-/// divider breaks it.
-fn write_box(s: &mut String, n: &SceneNode, b: &ClassBox, accent: &str) {
+/// One class box: white (the theme's surface) body, accent name band
+/// (only its top corners rounded, so it meets the body square),
+/// stereotype lines and name, compartments with accent dividers, then
+/// the border on top so no divider breaks it. `paint` is the box's
+/// [`crate::style::Palette::item`] colours.
+fn write_box(s: &mut String, n: &SceneNode, b: &ClassBox, paint: ItemPaint, pal: &Palette) {
     let x0 = n.x - n.w / 2.0;
     let y0 = n.y - n.h / 2.0;
     let (x1, hh) = (x0 + n.w, b.header_h());
     s.push_str(&format!(
         "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"4\" \
-         fill=\"#ffffff\"/>\n",
-        x0, y0, n.w, n.h
+         fill=\"{}\"/>\n",
+        x0, y0, n.w, n.h, pal.surface
     ));
     // Name compartment: rounded top corners, square bottom ones.
     s.push_str(&format!(
@@ -3367,11 +3371,11 @@ fn write_box(s: &mut String, n: &SceneNode, b: &ClassBox, accent: &str) {
         y0 + 4.0,
         x1,
         y0 + hh,
-        accent
+        paint.fill
     ));
     // Header text takes white or dark ink by contrast with the
     // accent band (white failed AA on six of the eight accents).
-    let ink = crate::style::text_on(accent);
+    let ink = paint.ink;
     for (k, a) in b.annotations.iter().enumerate() {
         s.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" text-anchor=\"middle\" \
@@ -3395,16 +3399,16 @@ fn write_box(s: &mut String, n: &SceneNode, b: &ClassBox, accent: &str) {
     // Divider under the name, then fields, then a divider, then
     // methods. Empty compartments still get their band + line.
     let fields_top = y0 + hh;
-    divider(s, x0, fields_top, n.w, accent);
-    write_rows(s, &b.fields, x0, fields_top);
+    divider(s, x0, fields_top, n.w, paint.stroke);
+    write_rows(s, &b.fields, x0, fields_top, &pal.text);
     let methods_top = fields_top + compartment_h(b.fields.len());
-    divider(s, x0, methods_top, n.w, accent);
-    write_rows(s, &b.methods, x0, methods_top);
+    divider(s, x0, methods_top, n.w, paint.stroke);
+    write_rows(s, &b.methods, x0, methods_top, &pal.text);
 
     s.push_str(&format!(
         "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"4\" \
          fill=\"none\" stroke=\"{}\" stroke-width=\"1.6\"/>\n",
-        x0, y0, n.w, n.h, accent
+        x0, y0, n.w, n.h, paint.stroke
     ));
 }
 
@@ -3423,7 +3427,7 @@ fn divider(s: &mut String, x0: f64, y: f64, w: f64, accent: &str) {
     ));
 }
 
-fn write_rows(s: &mut String, rows: &[ClassRow], x0: f64, top: f64) {
+fn write_rows(s: &mut String, rows: &[ClassRow], x0: f64, top: f64, ink: &str) {
     for (i, row) in rows.iter().enumerate() {
         let ty = top + COMP_PAD + i as f64 * ROW_H + ROW_H / 2.0;
         let style = match (row.is_static, row.is_abstract) {
@@ -3439,14 +3443,16 @@ fn write_rows(s: &mut String, rows: &[ClassRow], x0: f64, top: f64) {
             "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" fill=\"{}\"{}>{}</text>\n",
             x0 + PAD,
             ty,
-            TEXT_COLOR,
+            ink,
             style,
             escape(&row.text)
         ));
     }
 }
 
-fn write_head(s: &mut String, h: &Head) {
+/// One end glyph in the theme's line colour; a hollow one is filled
+/// with the canvas so it reads hollow over the line beneath it.
+fn write_head(s: &mut String, h: &Head, pal: &Palette) {
     if !h.polygon.is_empty() {
         let pts = h
             .polygon
@@ -3454,30 +3460,30 @@ fn write_head(s: &mut String, h: &Head) {
             .map(|(x, y)| format!("{:.1},{:.1}", x, y))
             .collect::<Vec<_>>()
             .join(" ");
-        let fill = if h.filled { EDGE_COLOR } else { "#ffffff" };
+        let fill = if h.filled { &pal.line } else { &pal.background };
         s.push_str(&format!(
             "<polygon points=\"{}\" fill=\"{}\" stroke=\"{}\" stroke-width=\"1.6\" \
              stroke-linejoin=\"round\"/>\n",
-            pts, fill, EDGE_COLOR
+            pts, fill, pal.line
         ));
     }
     for [a, b] in &h.segments {
         s.push_str(&format!(
             "<path d=\"M {:.1} {:.1} L {:.1} {:.1}\" fill=\"none\" stroke=\"{}\" \
              stroke-width=\"1.6\"/>\n",
-            a.0, a.1, b.0, b.1, EDGE_COLOR
+            a.0, a.1, b.0, b.1, pal.line
         ));
     }
     if let Some((c, r)) = h.circle {
         s.push_str(&format!(
-            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"#ffffff\" stroke=\"{}\" \
+            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{}\" stroke=\"{}\" \
              stroke-width=\"1.6\"/>\n",
-            c.0, c.1, r, EDGE_COLOR
+            c.0, c.1, r, pal.background, pal.line
         ));
     }
 }
 
-fn card_text(s: &mut String, at: (f64, f64), text: &str, cw: f64, ch: f64) {
+fn card_text(s: &mut String, at: (f64, f64), text: &str, cw: f64, ch: f64, ink: &str) {
     // Clamp to the canvas so a long cardinality can't spill off-edge
     // (the scene bbox is sized for boxes/edges, not these labels).
     let hw = card_w(text) / 2.0;
@@ -3488,7 +3494,7 @@ fn card_text(s: &mut String, at: (f64, f64), text: &str, cw: f64, ch: f64) {
          fill=\"{}\" font-size=\"{}\">{}</text>\n",
         px,
         py,
-        TEXT_COLOR,
+        ink,
         SMALL_FONT,
         escape(text)
     ));

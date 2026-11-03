@@ -30,8 +30,7 @@
 use crate::layout::{text_width, TEXT_CALIBRATION};
 use crate::model::{CommitKind, EdgeKind, EdgeMeta, GitGraph, GitOrientation, NodeStyle, Shape};
 use crate::scene::{
-    edge_path_d, escape, style_attr, svg_open, Scene, SceneEdge, SceneNode, SvgOptions, EDGE_COLOR,
-    TEXT_COLOR,
+    edge_path_d, escape, style_attr, svg_open, Scene, SceneEdge, SceneNode, SvgOptions, TEXT_COLOR,
 };
 use crate::style::{accent, accent_ink, text_on, ACCENTS, ACCENT_INKS};
 
@@ -90,17 +89,19 @@ const TAG_H: f64 = 18.0;
 const TAG_PX: f64 = 6.0;
 const TAG_HOLE: f64 = 6.0;
 /// Tag pill fill (the canvas white: the tag text is lane ink, made to
-/// read on white), distinct from the solid branch-name pills.
+/// read on white), distinct from the solid branch-name pills; in another
+/// theme the canvas colour, under lane ink made to read on it.
 const TAG_FILL: &str = "#ffffff";
 /// Branch-name pill height and text padding.
 const PILL_H: f64 = 22.0;
 const PILL_PX: f64 = 9.0;
 /// Dashed guide along every lane.
 const GUIDE_COLOR: &str = "#c9cdd9";
-/// Knock-out behind commit ids (the canvas colour): a line that passes
-/// close by never shows through the letters.
-const HALO: &str = "#ffffff";
-/// Fill of a merge commit's centre and of a highlight commit's inset.
+/// Knock-out behind commit ids (the canvas colour, so a line that
+/// passes close by never shows through the letters) and fill of a merge
+/// commit's centre, in the default theme: the theme's
+/// [`crate::style::Palette::background`] in any.
+#[cfg(test)]
 const HOLE_FILL: &str = "#ffffff";
 /// Outline of a HIGHLIGHT commit's square.
 const HIGHLIGHT_STROKE: &str = TEXT_COLOR;
@@ -869,6 +870,21 @@ pub fn to_svg(gs: &GitScene) -> String {
 /// [`to_svg`] with explicit viewport options (see [`SvgOptions`]).
 pub fn to_svg_with(gs: &GitScene, opts: &SvgOptions) -> String {
     let (w, h) = (gs.scene.width, gs.scene.height);
+    // Lanes keep their accents in every theme. The scene's canvas-side
+    // colours — commit-id ink, a highlight's outline, lane-ink names and
+    // tags made to read on white, the white knock-outs — are the default
+    // theme's; `ink` / `pal.background` give each theme's own.
+    let pal = opts.palette();
+    let guide = pal.tuned(GUIDE_COLOR, &pal.guide);
+    let ink = |c: &str| -> String {
+        if c == TEXT_COLOR {
+            pal.text.clone()
+        } else if let Some(i) = ACCENT_INKS.iter().position(|&k| k == c) {
+            pal.accent_ink(i)
+        } else {
+            c.to_string()
+        }
+    };
     let mut s = String::new();
     svg_open(&mut s, w, h, FONT, "Git graph diagram", opts);
 
@@ -885,7 +901,7 @@ pub fn to_svg_with(gs: &GitScene, opts: &SvgOptions) -> String {
         if gx1 > gx0 || gy1 > gy0 {
             s.push_str(&format!(
                 "<line x1=\"{gx0:.1}\" y1=\"{gy0:.1}\" x2=\"{gx1:.1}\" y2=\"{gy1:.1}\" \
-                 stroke=\"{GUIDE_COLOR}\" stroke-width=\"1\" stroke-dasharray=\"3 4\"/>\n"
+                 stroke=\"{guide}\" stroke-width=\"1\" stroke-dasharray=\"3 4\"/>\n"
             ));
         }
     }
@@ -904,7 +920,7 @@ pub fn to_svg_with(gs: &GitScene, opts: &SvgOptions) -> String {
 
     // Branch lines, forks and merges.
     for e in &gs.scene.edges {
-        let stroke = style_attr(e.meta.style.stroke.as_deref(), EDGE_COLOR);
+        let stroke = style_attr(e.meta.style.stroke.as_deref(), &pal.line);
         let sw = e.meta.style.stroke_width.unwrap_or(EDGE_W);
         s.push_str(&format!(
             "<path d=\"{}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{sw:.1}\" \
@@ -916,7 +932,10 @@ pub fn to_svg_with(gs: &GitScene, opts: &SvgOptions) -> String {
     // Commit glyphs.
     for n in &gs.scene.nodes {
         let fill = style_attr(n.style.fill.as_deref(), accent(0));
-        let stroke = style_attr(n.style.stroke.as_deref(), EDGE_COLOR);
+        let stroke = match n.style.stroke.as_deref() {
+            Some(HIGHLIGHT_STROKE) => pal.text.clone(),
+            other => style_attr(other, &pal.line),
+        };
         let sw = n.style.stroke_width.unwrap_or(2.0);
         let r = n.w.min(n.h) / 2.0;
         match n.shape {
@@ -940,15 +959,16 @@ pub fn to_svg_with(gs: &GitScene, opts: &SvgOptions) -> String {
         }
         if n.shape == Shape::DoubleCircle {
             s.push_str(&format!(
-                "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{HOLE_FILL}\"/>\n",
+                "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{}\"/>\n",
                 n.x,
                 n.y,
-                r * 0.45
+                r * 0.45,
+                pal.background
             ));
         }
         if n.label == REVERSE_MARK {
             let k = r * 0.45;
-            let ink = style_attr(n.style.color.as_deref(), HOLE_FILL);
+            let ink = style_attr(n.style.color.as_deref(), &pal.background);
             s.push_str(&format!(
                 "<path d=\"M {:.1} {:.1} L {:.1} {:.1} M {:.1} {:.1} L {:.1} {:.1}\" \
                  stroke=\"{ink}\" stroke-width=\"2.5\" stroke-linecap=\"round\"/>\n",
@@ -966,24 +986,26 @@ pub fn to_svg_with(gs: &GitScene, opts: &SvgOptions) -> String {
 
     // Commit ids, haloed, and tags on their luggage-label pills.
     for l in &gs.commit_ids {
-        write_label(&mut s, l, l.color, Some(HALO));
+        write_label(&mut s, l, &ink(l.color), Some(&pal.background));
     }
     for l in &gs.tags {
         let (x0, y0, x1, y1) = tag_pill(l);
-        let ink = escape(l.color);
+        let tag_ink = ink(l.color);
+        let ink = escape(&tag_ink);
         s.push_str(&format!(
             "<rect x=\"{x0:.1}\" y=\"{y0:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"{:.1}\" \
-             fill=\"{TAG_FILL}\" stroke=\"{}\" stroke-width=\"1.2\"/>\n\
+             fill=\"{}\" stroke=\"{}\" stroke-width=\"1.2\"/>\n\
              <circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"1.6\" fill=\"{}\"/>\n",
             x1 - x0,
             y1 - y0,
             TAG_H / 2.0,
+            pal.tuned(TAG_FILL, &pal.background),
             ink,
             x0 + TAG_HOLE / 2.0 + 3.0,
             l.y,
             ink
         ));
-        write_label(&mut s, l, l.color, None);
+        write_label(&mut s, l, &tag_ink, None);
     }
 
     s.push_str("</svg>\n");
@@ -1048,6 +1070,7 @@ mod tests {
     use super::*;
     use crate::model::Document;
     use crate::parser::parse_document;
+    use crate::scene::EDGE_COLOR;
 
     fn git(src: &str) -> GitGraph {
         match parse_document(src).unwrap() {

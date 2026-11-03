@@ -1,6 +1,11 @@
 //! Shared color theme, exposed so hosts (GUI painters) can match
 //! the SVG writers exactly.
 //!
+//! The default theme, [`Theme::Flowmaid`], is described below; the
+//! others ([`Theme`]: mermaid's `default`, `neutral`, `dark`, `forest`)
+//! are options, resolved into a [`Palette`] — every colour a writer
+//! paints with — by [`crate::SvgOptions::palette`].
+//!
 //! Flowchart nodes are colored by shape semantics — the shape
 //! already encodes meaning in Mermaid (stadium = start/end,
 //! diamond = decision, ...), so color reinforces it for free.
@@ -12,6 +17,7 @@
 //! readable (≥ 4.5:1) whatever accent they land on.
 
 use crate::model::Shape;
+use std::borrow::Cow;
 
 /// Fill + stroke pair, as `#rrggbb` hex strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +284,602 @@ pub fn text_on(fill: &str) -> &'static str {
     } else {
         "#000000"
     }
+}
+
+// ------------------------------------------------------------------
+// Themes
+// ------------------------------------------------------------------
+
+/// A colour theme for the SVG writers (report M10).
+///
+/// [`Theme::Flowmaid`] is the default and paints exactly what flowmaid
+/// always has: nodes coloured by shape semantics, class / ER /
+/// sequence items in a stable accent each. The others are options for
+/// a mermaid-like look, every node alike: pick one with
+/// [`crate::SvgOptions::theme`], `flowmaid --theme <name>`, or from the
+/// diagram source (`%%{init: {"theme": "dark"}}%%`, or `theme:` under
+/// a YAML frontmatter's `config:`).
+///
+/// Charts keep their categorical colours in every theme (pie slices,
+/// git branches, journey actors, timeline sections, sankey nodes,
+/// mindmap branches), as mermaid's do; their text, lines and canvas
+/// follow the theme. `style`, `classDef` and `linkStyle` colours always
+/// win over the theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum Theme {
+    /// flowmaid's own semantic palette (the default).
+    #[default]
+    Flowmaid,
+    /// mermaid's `default` theme: lavender `#ececff` nodes with a
+    /// `#9370db` border, `#333333` lines and text, pale yellow frames.
+    Mermaid,
+    /// White nodes and one dark ink for borders, lines and text; grey
+    /// frames (mermaid's `neutral`, with the white nodes of its newer
+    /// look).
+    Neutral,
+    /// Light text, lines and borders on a near-black `#1e1f22` canvas
+    /// (mermaid's `dark`); every text keeps 4.5:1 and every line 3:1.
+    Dark,
+    /// Green nodes with a deep green border, black lines (mermaid's
+    /// `forest`).
+    Forest,
+}
+
+impl Theme {
+    /// Every theme, the default first.
+    pub const ALL: [Theme; 5] = [
+        Theme::Flowmaid,
+        Theme::Mermaid,
+        Theme::Neutral,
+        Theme::Dark,
+        Theme::Forest,
+    ];
+
+    /// The theme a name stands for, as mermaid spells them (`default`,
+    /// `neutral`, `dark`, `forest`; any case, surrounding space
+    /// ignored), plus `flowmaid` and `mermaid` (the same as `default`).
+    /// mermaid's `base` (a theme meant to be recoloured through
+    /// `themeVariables`) reads as `default`, its newer `neo` look as
+    /// `neutral` and `neo-dark` as `dark`. `None` for any other name —
+    /// callers fall back to the default, as mermaid does.
+    pub fn from_name(name: &str) -> Option<Theme> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "flowmaid" => Some(Theme::Flowmaid),
+            "default" | "mermaid" | "base" => Some(Theme::Mermaid),
+            "neutral" | "neo" => Some(Theme::Neutral),
+            "dark" | "neo-dark" => Some(Theme::Dark),
+            "forest" => Some(Theme::Forest),
+            _ => None,
+        }
+    }
+
+    /// The theme's name: what [`Theme::from_name`] reads back to it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Theme::Flowmaid => "flowmaid",
+            Theme::Mermaid => "default",
+            Theme::Neutral => "neutral",
+            Theme::Dark => "dark",
+            Theme::Forest => "forest",
+        }
+    }
+
+    /// The theme's colours ([`Palette::new`]).
+    pub fn palette(self) -> Palette {
+        Palette::new(self)
+    }
+
+    fn table(self) -> &'static ThemeTable {
+        match self {
+            Theme::Flowmaid => &FLOWMAID,
+            Theme::Mermaid => &MERMAID,
+            Theme::Neutral => &NEUTRAL,
+            Theme::Dark => &DARK,
+            Theme::Forest => &FOREST,
+        }
+    }
+}
+
+/// One theme's colours, as written in the source (see [`Palette`] for
+/// what each role paints).
+struct ThemeTable {
+    background: &'static str,
+    text: &'static str,
+    muted_text: &'static str,
+    line: &'static str,
+    guide: &'static str,
+    surface: &'static str,
+    label_fill: &'static str,
+    label_border: &'static str,
+    /// Every node's fill and border; `None`: by shape ([`shape_style`]).
+    node: Option<ShapeStyle>,
+    node_text: &'static str,
+    clusters: [ShapeStyle; 4],
+    cluster_title: &'static str,
+    note: ShapeStyle,
+    note_text: &'static str,
+    pseudo: &'static str,
+}
+
+/// [`Theme::Flowmaid`]: the colours every writer used before themes
+/// existed, so the default output is unchanged byte for byte.
+const FLOWMAID: ThemeTable = ThemeTable {
+    background: "#ffffff",
+    text: crate::scene::TEXT_COLOR,
+    muted_text: crate::er::TYPE_COLOR,
+    line: crate::scene::EDGE_COLOR,
+    guide: "#aeb6d8",
+    surface: "#ffffff",
+    label_fill: "#ffffff",
+    label_border: crate::scene::LABEL_BORDER,
+    node: None,
+    node_text: crate::scene::TEXT_COLOR,
+    clusters: CLUSTER_STYLES,
+    cluster_title: CLUSTER_TITLE,
+    note: NOTE_STYLE,
+    note_text: crate::scene::TEXT_COLOR,
+    pseudo: crate::scene::EDGE_COLOR,
+};
+
+/// [`Theme::Mermaid`]: mermaid's `default` colours. Its frame and note
+/// borders (`#aaaa33`, 2.4:1) are darkened, hue kept, to the 3:1 a
+/// border needs on what it is drawn on, and the frames step a shade
+/// deeper per nesting level as flowmaid's own do.
+const MERMAID: ThemeTable = ThemeTable {
+    background: "#ffffff",
+    text: "#333333",
+    muted_text: "#666666",
+    line: "#333333",
+    guide: "#888888",
+    surface: "#ffffff",
+    label_fill: "#e8e8e8",
+    label_border: "#cccccc",
+    node: Some(ShapeStyle {
+        fill: "#ececff",
+        stroke: "#9370db",
+    }),
+    node_text: "#333333",
+    clusters: [
+        ShapeStyle {
+            fill: "#ffffde",
+            stroke: "#97972d",
+        },
+        ShapeStyle {
+            fill: "#f9f9cb",
+            stroke: "#92922c",
+        },
+        ShapeStyle {
+            fill: "#f3f3b8",
+            stroke: "#8d8d2a",
+        },
+        ShapeStyle {
+            fill: "#ededa5",
+            stroke: "#8a8a29",
+        },
+    ],
+    cluster_title: "#333333",
+    note: ShapeStyle {
+        fill: "#fff5ad",
+        stroke: "#90902b",
+    },
+    note_text: "#333333",
+    pseudo: "#333333",
+};
+
+/// [`Theme::Neutral`]: white nodes, one `#333333` ink.
+const NEUTRAL: ThemeTable = ThemeTable {
+    background: "#ffffff",
+    text: "#333333",
+    muted_text: "#666666",
+    line: "#333333",
+    guide: "#888888",
+    surface: "#ffffff",
+    label_fill: "#ffffff",
+    label_border: "#cccccc",
+    node: Some(ShapeStyle {
+        fill: "#ffffff",
+        stroke: "#333333",
+    }),
+    node_text: "#333333",
+    clusters: [
+        ShapeStyle {
+            fill: "#f7f7f7",
+            stroke: "#8a8a8a",
+        },
+        ShapeStyle {
+            fill: "#eeeeee",
+            stroke: "#898989",
+        },
+        ShapeStyle {
+            fill: "#e5e5e5",
+            stroke: "#838383",
+        },
+        ShapeStyle {
+            fill: "#dcdcdc",
+            stroke: "#7c7c7c",
+        },
+    ],
+    cluster_title: "#333333",
+    note: ShapeStyle {
+        fill: "#f2f2f2",
+        stroke: "#666666",
+    },
+    note_text: "#333333",
+    pseudo: "#333333",
+};
+
+/// [`Theme::Dark`]: mermaid's `dark` idea — light text, lines and
+/// borders on near-black — on a deeper canvas than its `#333333`, so
+/// every [`ACCENTS`] line (git lanes, mindmap branches) keeps 3:1 on it,
+/// with nodes and frames a step lighter than the canvas. Where mermaid
+/// falls short on a dark page (its frame border is a 25% white, its
+/// edge-label text 4.4:1 on the chip) every border and line here keeps
+/// 3:1 and every text 4.5:1.
+const DARK: ThemeTable = ThemeTable {
+    background: "#1e1f22",
+    text: "#e6e6e6",
+    muted_text: "#b4b4b4",
+    line: "#d0d0d0",
+    guide: "#8a8a8a",
+    surface: "#2b2d31",
+    label_fill: "#2b2d31",
+    label_border: "#5a5d63",
+    node: Some(ShapeStyle {
+        fill: "#2b2d31",
+        stroke: "#c8c8c8",
+    }),
+    node_text: "#e6e6e6",
+    clusters: [
+        ShapeStyle {
+            fill: "#26282c",
+            stroke: "#7a7d82",
+        },
+        ShapeStyle {
+            fill: "#2e3035",
+            stroke: "#7a7d82",
+        },
+        ShapeStyle {
+            fill: "#36393e",
+            stroke: "#7f8287",
+        },
+        ShapeStyle {
+            fill: "#3e4147",
+            stroke: "#898b90",
+        },
+    ],
+    cluster_title: "#f0f0f0",
+    note: ShapeStyle {
+        fill: "#3d3a26",
+        stroke: "#a69641",
+    },
+    note_text: "#f2f2f2",
+    pseudo: "#f0f0f0",
+};
+
+/// [`Theme::Forest`]: mermaid's `forest` greens; frame and note borders
+/// darkened to 3:1 as in [`Theme::Mermaid`].
+const FOREST: ThemeTable = ThemeTable {
+    background: "#ffffff",
+    text: "#000000",
+    muted_text: "#4d4d4d",
+    line: "#000000",
+    guide: "#6f8f62",
+    surface: "#ffffff",
+    label_fill: "#e8e8e8",
+    label_border: "#cccccc",
+    node: Some(ShapeStyle {
+        fill: "#cde498",
+        stroke: "#13540c",
+    }),
+    node_text: "#000000",
+    clusters: [
+        ShapeStyle {
+            fill: "#cdffb2",
+            stroke: "#639942",
+        },
+        ShapeStyle {
+            fill: "#bdf3a0",
+            stroke: "#5c8f3d",
+        },
+        ShapeStyle {
+            fill: "#aee78f",
+            stroke: "#568539",
+        },
+        ShapeStyle {
+            fill: "#9fdb7e",
+            stroke: "#507c35",
+        },
+    ],
+    cluster_title: "#000000",
+    note: ShapeStyle {
+        fill: "#fff5ad",
+        stroke: "#639942",
+    },
+    note_text: "#000000",
+    pseudo: "#000000",
+};
+
+/// mermaid `themeVariables` a diagram's source may set, as sRGB
+/// channels: Copy, so [`crate::SvgOptions`] can carry them. Only the
+/// handful that recolour the roles every writer shares are read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ThemeVars {
+    pub(crate) background: Option<[u8; 3]>,
+    pub(crate) primary: Option<[u8; 3]>,
+    pub(crate) primary_border: Option<[u8; 3]>,
+    pub(crate) primary_text: Option<[u8; 3]>,
+    pub(crate) line: Option<[u8; 3]>,
+    pub(crate) text: Option<[u8; 3]>,
+}
+
+impl ThemeVars {
+    /// Take one `themeVariables` entry: `background`, `primaryColor`,
+    /// `primaryBorderColor`, `primaryTextColor`, `lineColor` or
+    /// `textColor`, any colour [`css_rgb`] reads. Other keys, and
+    /// values that are no colour, are ignored (theme config is
+    /// decoration, never a reason to fail).
+    pub(crate) fn set(&mut self, key: &str, value: &str) {
+        let slot = match key {
+            "background" => &mut self.background,
+            "primaryColor" => &mut self.primary,
+            "primaryBorderColor" => &mut self.primary_border,
+            "primaryTextColor" => &mut self.primary_text,
+            "lineColor" => &mut self.line,
+            "textColor" => &mut self.text,
+            _ => return,
+        };
+        if let Some(rgb) = css_rgb(value) {
+            *slot = Some(rgb);
+        }
+    }
+}
+
+fn hex([r, g, b]: [u8; 3]) -> String {
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// Every colour a theme paints with, resolved: the shared roles the
+/// SVG writers draw from, so a host painting a [`crate::scene::Scene`]
+/// can match the SVG exactly (`opts.palette()` for the options it
+/// renders with, see [`crate::SvgOptions::palette`]). All colours are
+/// `#rrggbb`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Palette {
+    /// The theme the colours come from.
+    pub theme: Theme,
+    /// The canvas (the background `<rect>`).
+    pub background: String,
+    /// Text on the canvas and on light boxes: edge labels, member rows,
+    /// messages, captions.
+    pub text: String,
+    /// Secondary text: ER attribute types.
+    pub muted_text: String,
+    /// Edges, relationship lines, messages and their end glyphs.
+    pub line: String,
+    /// Faint structural lines: lifelines, frames, axes, rails.
+    pub guide: String,
+    /// The fill of plain boxes on the canvas: class and ER bodies,
+    /// activation bars, architecture services, hollow end glyphs.
+    pub surface: String,
+    /// The chip behind an edge or relationship label.
+    pub label_fill: String,
+    /// The chip's border.
+    pub label_border: String,
+    /// Text inside a node (and a class / ER / sequence header when the
+    /// theme paints items alike, see [`Palette::node_style`]).
+    pub node_text: String,
+    /// A subgraph / composite title.
+    pub cluster_title: String,
+    /// A note card's fill.
+    pub note_fill: String,
+    /// A note card's border.
+    pub note_stroke: String,
+    /// A note card's text.
+    pub note_text: String,
+    /// State start / end dots and fork bars.
+    pub pseudo: String,
+    node_fill: Option<String>,
+    node_stroke: Option<String>,
+    clusters: Vec<(String, String)>,
+}
+
+impl Palette {
+    /// `theme`'s colours.
+    pub fn new(theme: Theme) -> Palette {
+        Palette::with_vars(theme, &ThemeVars::default())
+    }
+
+    /// `theme`'s colours with the source's `themeVariables` laid over
+    /// them. A `primaryColor` without a `primaryTextColor` keeps the
+    /// theme's node text where it still reads (4.5:1), else takes
+    /// [`text_on`] the new fill.
+    pub(crate) fn with_vars(theme: Theme, vars: &ThemeVars) -> Palette {
+        let t = theme.table();
+        let pick = |v: Option<[u8; 3]>, base: &str| v.map_or_else(|| base.to_string(), hex);
+        let node_fill = vars.primary.map(hex).or(t.node.map(|n| n.fill.to_string()));
+        let node_stroke = vars
+            .primary_border
+            .map(hex)
+            .or(t.node.map(|n| n.stroke.to_string()));
+        let node_text = match (vars.primary_text, vars.primary) {
+            (Some(c), _) => hex(c),
+            (None, Some(fill)) => {
+                let fill = hex(fill);
+                let reads =
+                    contrast_ratio(t.node_text, &fill).is_some_and(|c| c >= MIN_TEXT_CONTRAST);
+                if reads {
+                    t.node_text.to_string()
+                } else {
+                    text_on(&fill).to_string()
+                }
+            }
+            (None, None) => t.node_text.to_string(),
+        };
+        Palette {
+            theme,
+            background: pick(vars.background, t.background),
+            text: pick(vars.text, t.text),
+            muted_text: t.muted_text.to_string(),
+            line: pick(vars.line, t.line),
+            guide: t.guide.to_string(),
+            surface: t.surface.to_string(),
+            label_fill: t.label_fill.to_string(),
+            label_border: t.label_border.to_string(),
+            node_text,
+            cluster_title: t.cluster_title.to_string(),
+            note_fill: t.note.fill.to_string(),
+            note_stroke: t.note.stroke.to_string(),
+            note_text: t.note_text.to_string(),
+            pseudo: t.pseudo.to_string(),
+            node_fill,
+            node_stroke,
+            clusters: t
+                .clusters
+                .iter()
+                .map(|c| (c.fill.to_string(), c.stroke.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Fill and border of an unstyled node of `shape`: the theme's one
+    /// node paint, or, in [`Theme::Flowmaid`], [`shape_style`]'s colour
+    /// for the shape. State start / end dots and fork bars are
+    /// [`Palette::pseudo`] in every theme.
+    pub fn node_style(&self, shape: Shape) -> (&str, &str) {
+        if matches!(shape, Shape::StateStart | Shape::StateEnd | Shape::ForkBar) {
+            return (&self.pseudo, &self.pseudo);
+        }
+        let by_shape = shape_style(shape);
+        (
+            self.node_fill.as_deref().unwrap_or(by_shape.fill),
+            self.node_stroke.as_deref().unwrap_or(by_shape.stroke),
+        )
+    }
+
+    /// Fill and border of a subgraph frame `depth` levels in (0 =
+    /// outermost), a step deeper per level like [`cluster_style`].
+    pub fn cluster_style(&self, depth: usize) -> (&str, &str) {
+        let (f, s) = &self.clusters[depth.min(self.clusters.len() - 1)];
+        (f, s)
+    }
+
+    /// How item `index` of a class / ER / sequence diagram is painted:
+    /// its own [`accent`] (text on it by [`text_on`], on the canvas in
+    /// [`accent_ink`]) while nodes are coloured by shape, else the
+    /// theme's node paint for every item, as mermaid paints them.
+    pub(crate) fn item(&self, index: usize) -> ItemPaint<'_> {
+        match &self.node_fill {
+            None => {
+                let a = accent(index);
+                ItemPaint {
+                    fill: a,
+                    stroke: a,
+                    ink: text_on(a),
+                    canvas_ink: Cow::Owned(self.accent_ink(index)),
+                }
+            }
+            Some(fill) => ItemPaint {
+                fill,
+                stroke: self.node_stroke.as_deref().unwrap_or(&self.line),
+                ink: &self.node_text,
+                canvas_ink: Cow::Borrowed(&self.text),
+            },
+        }
+    }
+
+    /// [`accent_ink`] for item `index` made readable on this canvas:
+    /// the accent darkened for white as it is, or, where that falls
+    /// under 4.5:1 (a dark canvas), the accent lightened until it reads
+    /// ([`readable_on`]).
+    pub fn accent_ink(&self, index: usize) -> String {
+        let ink = accent_ink(index);
+        if contrast_ratio(ink, &self.background).is_some_and(|c| c >= MIN_TEXT_CONTRAST) {
+            ink.to_string()
+        } else {
+            readable_on(accent(index), &self.background)
+        }
+    }
+
+    /// The text ink for a node whose fill the author may have set
+    /// (`style` / `classDef` without a `color`): the theme's `ink`, or,
+    /// outside [`Theme::Flowmaid`], [`text_on`] that fill where the
+    /// theme's ink does not read on it (4.5:1) — a theme changes the
+    /// ink under fills the author picked for flowmaid's dark one (a
+    /// pale highlight under [`Theme::Dark`]'s light text). The default
+    /// theme keeps its ink, so its output is unchanged.
+    pub(crate) fn ink_on_fill<'a>(&self, fill: Option<&str>, ink: &'a str) -> &'a str {
+        if self.theme == Theme::Flowmaid {
+            return ink;
+        }
+        match fill.and_then(css_hex) {
+            Some(fill) if contrast_ratio(ink, &fill).is_some_and(|c| c < MIN_TEXT_CONTRAST) => {
+                text_on(&fill)
+            }
+            _ => ink,
+        }
+    }
+
+    /// `flowmaid` — one writer's own tuned constant for a role (the
+    /// sequence lifeline grey, the timeline axis, ...) — in
+    /// [`Theme::Flowmaid`], so the default output keeps every one of
+    /// them exactly; `token`, the theme's colour for the role, in any
+    /// other theme.
+    pub(crate) fn tuned<'a>(&'a self, flowmaid: &'a str, token: &'a str) -> &'a str {
+        if self.theme == Theme::Flowmaid {
+            flowmaid
+        } else {
+            token
+        }
+    }
+}
+
+/// [`Palette::item`]: one class box's, ER entity's or sequence
+/// participant's colours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ItemPaint<'a> {
+    /// The header band / box fill.
+    pub(crate) fill: &'a str,
+    /// Its border (and dividers).
+    pub(crate) stroke: &'a str,
+    /// Text on `fill`.
+    pub(crate) ink: &'a str,
+    /// Text in the item's colour straight on the canvas (an actor's
+    /// name under its stick figure), readable there.
+    pub(crate) canvas_ink: Cow<'a, str>,
+}
+
+/// `color` as `#rrggbb`, moved toward white (on a dark `bg`) or black
+/// (on a light one) just far enough to reach [`MIN_TEXT_CONTRAST`]
+/// against `bg`; unchanged where it already does. A colour that is not
+/// `#rgb`, `#rrggbb`, a CSS name or `rgb()` comes back as it is.
+pub fn readable_on(color: &str, bg: &str) -> String {
+    let (Some(rgb), Some(bg_hex)) = (css_rgb(color), css_hex(bg)) else {
+        return color.to_string();
+    };
+    let reads = |c: &str| contrast_ratio(c, &bg_hex).is_some_and(|k| k >= MIN_TEXT_CONTRAST);
+    let start = hex(rgb);
+    if reads(&start) {
+        return start;
+    }
+    let to_white = relative_luminance(&bg_hex).is_some_and(|l| l < 0.18);
+    // 64 even steps: enough to land within a few units of the least
+    // move that reads, and the far end (white / black) always does on
+    // a background past the 0.18 split.
+    for k in 1..=64 {
+        let t = f64::from(k) / 64.0;
+        let mixed = rgb.map(|c| {
+            let c = f64::from(c);
+            let target = if to_white { 255.0 } else { 0.0 };
+            (c + (target - c) * t).round() as u8
+        });
+        let h = hex(mixed);
+        if reads(&h) {
+            return h;
+        }
+    }
+    text_on(&bg_hex).to_string()
 }
 
 /// CSS Color 4's named colours (lower case, sorted for a binary search).
@@ -730,6 +1332,292 @@ mod tests {
                 assert!(d >= 20.0, "{a} vs {b}: ΔE {d:.1}");
             }
         }
+    }
+
+    #[test]
+    fn theme_names_read_back_and_unknown_ones_are_none() {
+        for t in Theme::ALL {
+            assert_eq!(Theme::from_name(t.name()), Some(t));
+        }
+        assert_eq!(Theme::default(), Theme::Flowmaid);
+        assert_eq!(Theme::from_name(" Dark "), Some(Theme::Dark));
+        assert_eq!(Theme::from_name("MERMAID"), Some(Theme::Mermaid));
+        assert_eq!(Theme::from_name("base"), Some(Theme::Mermaid));
+        assert_eq!(Theme::from_name("neo"), Some(Theme::Neutral));
+        assert_eq!(Theme::from_name("neo-dark"), Some(Theme::Dark));
+        for bad in ["", "redux", "darkest", "default-dark"] {
+            assert_eq!(Theme::from_name(bad), None, "{bad}");
+        }
+    }
+
+    /// The default theme's palette is exactly the colours every writer
+    /// used before themes existed — the root of the default output
+    /// staying byte-identical.
+    #[test]
+    fn flowmaid_palette_is_the_historical_colours() {
+        let p = Palette::new(Theme::Flowmaid);
+        assert_eq!(p.background, "#ffffff");
+        assert_eq!(p.text, crate::scene::TEXT_COLOR);
+        assert_eq!(p.line, crate::scene::EDGE_COLOR);
+        assert_eq!(p.label_border, crate::scene::LABEL_BORDER);
+        assert_eq!(p.muted_text, crate::er::TYPE_COLOR);
+        assert_eq!(
+            (p.surface.as_str(), p.label_fill.as_str()),
+            ("#ffffff", "#ffffff")
+        );
+        assert_eq!(p.cluster_title, CLUSTER_TITLE);
+        assert_eq!(
+            (p.note_fill.as_str(), p.note_stroke.as_str()),
+            (NOTE_STYLE.fill, NOTE_STYLE.stroke)
+        );
+        for shape in ALL_SHAPES {
+            let ss = shape_style(shape);
+            assert_eq!(p.node_style(shape), (ss.fill, ss.stroke), "{shape:?}");
+        }
+        for d in 0..6 {
+            let c = cluster_style(d);
+            assert_eq!(p.cluster_style(d), (c.fill, c.stroke));
+        }
+        for i in 0..20 {
+            let it = p.item(i);
+            assert_eq!(
+                (it.fill, it.stroke, it.ink),
+                (accent(i), accent(i), text_on(accent(i)))
+            );
+            assert_eq!(it.canvas_ink, accent_ink(i));
+            assert_eq!(p.accent_ink(i), accent_ink(i));
+        }
+        assert_eq!(p.tuned("#123456", "#abcdef"), "#123456");
+        assert_eq!(
+            Palette::new(Theme::Dark).tuned("#123456", "#abcdef"),
+            "#abcdef"
+        );
+    }
+
+    const ALL_SHAPES: [Shape; 15] = [
+        Shape::Rect,
+        Shape::Rounded,
+        Shape::Stadium,
+        Shape::Diamond,
+        Shape::Circle,
+        Shape::DoubleCircle,
+        Shape::Cylinder,
+        Shape::Subroutine,
+        Shape::Hexagon,
+        Shape::Parallelogram,
+        Shape::ParallelogramAlt,
+        Shape::StateStart,
+        Shape::StateEnd,
+        Shape::ForkBar,
+        Shape::Rect,
+    ];
+
+    /// Report M10 / §2.11: every theme's text reaches 4.5:1 on whatever
+    /// it is drawn on, and its lines and borders 3:1 — the dark theme
+    /// above all, where the default colours would vanish.
+    #[test]
+    fn every_theme_keeps_text_and_lines_readable() {
+        let ok = |a: &str, b: &str, min: f64, what: &str| {
+            let c = contrast_ratio(a, b).unwrap();
+            assert!(c >= min, "{what}: {a} on {b} is {c:.2}:1");
+        };
+        for t in Theme::ALL {
+            let p = Palette::new(t);
+            let name = t.name();
+            for (ink, what) in [(&p.text, "text"), (&p.muted_text, "muted text")] {
+                for bg in [&p.background, &p.surface] {
+                    ok(ink, bg, MIN_TEXT_CONTRAST, &format!("{name} {what}"));
+                }
+            }
+            ok(
+                &p.text,
+                &p.label_fill,
+                MIN_TEXT_CONTRAST,
+                &format!("{name} label"),
+            );
+            ok(
+                &p.note_text,
+                &p.note_fill,
+                MIN_TEXT_CONTRAST,
+                &format!("{name} note"),
+            );
+            ok(
+                &p.note_stroke,
+                &p.note_fill,
+                3.0,
+                &format!("{name} note border"),
+            );
+            ok(&p.line, &p.background, 3.0, &format!("{name} line"));
+            ok(&p.line, &p.surface, 3.0, &format!("{name} line on surface"));
+            ok(
+                &p.pseudo,
+                &p.background,
+                3.0,
+                &format!("{name} pseudostate"),
+            );
+            // ER keys are drawn in the line colour, on the table body.
+            ok(
+                &p.line,
+                &p.surface,
+                MIN_TEXT_CONTRAST,
+                &format!("{name} keys"),
+            );
+            for shape in ALL_SHAPES {
+                let (fill, stroke) = p.node_style(shape);
+                if matches!(shape, Shape::StateStart | Shape::StateEnd | Shape::ForkBar) {
+                    continue;
+                }
+                ok(
+                    &p.node_text,
+                    fill,
+                    MIN_TEXT_CONTRAST,
+                    &format!("{name} {shape:?} text"),
+                );
+                if t != Theme::Flowmaid {
+                    ok(
+                        stroke,
+                        &p.background,
+                        3.0,
+                        &format!("{name} {shape:?} border"),
+                    );
+                }
+            }
+            let mut parent = p.background.clone();
+            for d in 0..4 {
+                let (fill, stroke) = p.cluster_style(d);
+                for on in [p.background.as_str(), parent.as_str(), fill] {
+                    ok(stroke, on, 3.0, &format!("{name} frame {d} border"));
+                }
+                ok(
+                    &p.cluster_title,
+                    fill,
+                    MIN_TEXT_CONTRAST,
+                    &format!("{name} frame {d} title"),
+                );
+                parent = fill.to_string();
+            }
+            for i in 0..16 {
+                let it = p.item(i);
+                ok(
+                    it.ink,
+                    it.fill,
+                    MIN_TEXT_CONTRAST,
+                    &format!("{name} item {i}"),
+                );
+                ok(
+                    &it.canvas_ink,
+                    &p.background,
+                    MIN_TEXT_CONTRAST,
+                    &format!("{name} item ink {i}"),
+                );
+                ok(
+                    &p.accent_ink(i),
+                    &p.background,
+                    MIN_TEXT_CONTRAST,
+                    &format!("{name} accent ink {i}"),
+                );
+            }
+            if t == Theme::Flowmaid {
+                continue; // its tuned guides are faint by design
+            }
+            ok(&p.guide, &p.background, 3.0, &format!("{name} guide"));
+            // Lines drawn in an accent (git lanes, mindmap branches) keep
+            // 3:1 on the dark canvas, chosen for it; on white they are
+            // the default theme's palette as it always was.
+            if t == Theme::Dark {
+                for &a in ACCENTS {
+                    ok(a, &p.background, 3.0, &format!("{name} accent line"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn themed_palettes_paint_nodes_alike() {
+        for t in [Theme::Mermaid, Theme::Neutral, Theme::Dark, Theme::Forest] {
+            let p = Palette::new(t);
+            let rect = p.node_style(Shape::Rect);
+            for shape in ALL_SHAPES {
+                if !matches!(shape, Shape::StateStart | Shape::StateEnd | Shape::ForkBar) {
+                    assert_eq!(p.node_style(shape), rect, "{t:?} {shape:?}");
+                }
+            }
+            assert_eq!(p.item(0), p.item(7), "{t:?}: items alike");
+            assert_eq!(p.item(0).fill, rect.0);
+        }
+        // M10's yardstick: neutral is white nodes in one ink.
+        let n = Palette::new(Theme::Neutral);
+        assert_eq!(n.node_style(Shape::Diamond), ("#ffffff", "#333333"));
+        assert_eq!((n.text.as_str(), n.line.as_str()), ("#333333", "#333333"));
+        let m = Palette::new(Theme::Mermaid);
+        assert_eq!(m.node_style(Shape::Stadium), ("#ececff", "#9370db"));
+    }
+
+    #[test]
+    fn theme_variables_recolour_the_shared_roles() {
+        let mut v = ThemeVars::default();
+        v.set("primaryColor", "#1a237e");
+        v.set("lineColor", "red");
+        v.set("background", "rgb(250, 250, 250)");
+        v.set("textColor", "not a colour");
+        v.set("someOtherKey", "#ffffff");
+        let p = Palette::with_vars(Theme::Mermaid, &v);
+        assert_eq!(p.node_style(Shape::Rect), ("#1a237e", "#9370db"));
+        assert_eq!(p.line, "#ff0000");
+        assert_eq!(p.background, "#fafafa");
+        assert_eq!(p.text, "#333333", "a value that is no colour is ignored");
+        // The theme's dark node text no longer reads on the deep fill.
+        assert_eq!(p.node_text, "#ffffff");
+        v.set("primaryTextColor", "#ffeb3b");
+        v.set("primaryBorderColor", "#000");
+        let p = Palette::with_vars(Theme::Mermaid, &v);
+        assert_eq!(p.node_text, "#ffeb3b");
+        assert_eq!(p.node_style(Shape::Diamond).1, "#000000");
+        // In the default theme a fill alone keeps each shape's border.
+        let mut v = ThemeVars::default();
+        v.set("primaryColor", "#fafafa");
+        let p = Palette::with_vars(Theme::Flowmaid, &v);
+        assert_eq!(
+            p.node_style(Shape::Diamond),
+            ("#fafafa", shape_style(Shape::Diamond).stroke)
+        );
+        assert_eq!(p.node_text, crate::scene::TEXT_COLOR, "still reads");
+    }
+
+    #[test]
+    fn readable_on_moves_a_colour_just_far_enough() {
+        // Already readable: unchanged (normalised to #rrggbb).
+        assert_eq!(readable_on("#5B6DC0", "#ffffff"), "#5b6dc0");
+        // Too dark for a dark canvas: lightened, hue kept roughly.
+        let dark = Palette::new(Theme::Dark).background;
+        for &a in ACCENTS.iter().chain(ACCENTS_DEEP) {
+            let r = readable_on(a, &dark);
+            let c = contrast_ratio(&r, &dark).unwrap();
+            assert!(c >= MIN_TEXT_CONTRAST, "{a} -> {r}: {c:.2}");
+            // Lighter, never past white.
+            assert!(relative_luminance(&r).unwrap() >= relative_luminance(a).unwrap());
+        }
+        // Too light for white: darkened.
+        let r = readable_on("#ffeb3b", "#ffffff");
+        assert!(
+            contrast_ratio(&r, "#ffffff").unwrap() >= MIN_TEXT_CONTRAST,
+            "{r}"
+        );
+        assert_eq!(readable_on("var(--x)", "#000"), "var(--x)");
+    }
+
+    #[test]
+    fn a_theme_keeps_text_readable_on_an_authors_fill() {
+        let dark = Palette::new(Theme::Dark);
+        // A pale highlight picked for flowmaid's dark ink.
+        assert_eq!(dark.ink_on_fill(Some("#fef3c7"), &dark.node_text), DARK_INK);
+        // A fill the theme's ink reads on, no fill, or no colour: kept.
+        assert_eq!(dark.ink_on_fill(Some("#1e293b"), "#e6e6e6"), "#e6e6e6");
+        assert_eq!(dark.ink_on_fill(None, "#e6e6e6"), "#e6e6e6");
+        assert_eq!(dark.ink_on_fill(Some("transparent"), "#e6e6e6"), "#e6e6e6");
+        // The default theme never second-guesses an author.
+        let fm = Palette::new(Theme::Flowmaid);
+        assert_eq!(fm.ink_on_fill(Some("#000000"), "#232840"), "#232840");
     }
 
     #[test]
