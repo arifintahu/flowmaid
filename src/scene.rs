@@ -4718,7 +4718,7 @@ pub fn route_partial(
     // label text), and a node's box follows its text: an edit to any of
     // them must not keep stale geometry.
     let label_text = |e: &SceneEdge| e.label.as_ref().map(|l| l.0.clone());
-    let lines_up = sc.edges.len() == base.edges.len()
+    let same_graph = sc.edges.len() == base.edges.len()
         && sc.edges.iter().zip(&base.edges).all(|(a, b)| {
             a.from == b.from
                 && a.to == b.to
@@ -4731,10 +4731,24 @@ pub fn route_partial(
             .nodes
             .iter()
             .zip(&base.nodes)
-            .all(|(a, b)| a.id == b.id && a.label == b.label && a.shape == b.shape)
-        && clusters_line_up(g, base);
-    if !lines_up {
-        return route_labelled(g, centers, &raw_sizes, &labels);
+            .all(|(a, b)| a.id == b.id && a.label == b.label && a.shape == b.shape);
+    // A full `route()` still keeps the note links a drag leaves (see
+    // `note_link_kept`) while the graph is the base's: a static frame
+    // that does not stand for `route()`'s (one the layout drew wider
+    // than its members, as composite states' often are) sends every
+    // drag of such a diagram here.
+    let full = |mut sc: Scene| {
+        if same_graph {
+            for i in 0..g.edges.len().min(sc.edges.len()) {
+                if let Some(kept) = note_link_kept(g, base, centers, base_centers, &moved, i) {
+                    sc.edges[i] = kept;
+                }
+            }
+        }
+        sc
+    };
+    if !same_graph || !clusters_line_up(g, base) {
+        return full(route_labelled(g, centers, &raw_sizes, &labels));
     }
     type R = (f64, f64, f64, f64);
     let node_rect = |nd: &SceneNode| -> R {
@@ -4831,7 +4845,13 @@ pub fn route_partial(
     for (i, e) in sc.edges.iter_mut().enumerate() {
         let b = &base.edges[i];
         let own = own_moved.contains(&(b.from.as_str(), b.to.as_str()));
-        if moved_end(&b.from) || moved_end(&b.to) || own || clash[i] {
+        if let Some(kept) = (!own && !clash[i])
+            .then(|| note_link_kept(g, base, centers, base_centers, &moved, i))
+            .flatten()
+        {
+            // A state note card's link drawn as the drag leaves it.
+            *e = kept;
+        } else if moved_end(&b.from) || moved_end(&b.to) || own || clash[i] {
             fixed[i] = false;
             redrawn += 1;
         } else {
@@ -4842,7 +4862,7 @@ pub fn route_partial(
     // Most of the drawing redrawn afresh (not merely near the drag): a
     // full route() costs about the same and draws it better.
     if redrawn as f64 > PARTIAL_ROUTE_SHARE * fixed.len() as f64 {
-        return route_labelled(g, centers, &raw_sizes, &labels);
+        return full(route_labelled(g, centers, &raw_sizes, &labels));
     }
     sc.clusters = clusters;
     // The base canvas already covers the kept geometry; the pipeline's
@@ -4851,6 +4871,126 @@ pub fn route_partial(
     sc.height = base.height;
     crate::edgepass::finish_fixed(g, &mut sc, crate::edgepass::Mode::Routed, &fixed);
     sc
+}
+
+/// How far (px) a drag may move a state note card or the node it notes
+/// before [`route_partial`] redraws their link instead of letting it
+/// follow ([`note_link_kept`]): a node's clearance from the edges round
+/// it ([`crate::clearance::CRAMP_NODE_GAP`]), so a link that follows
+/// never comes nearer anything than its node already did.
+const NOTE_FOLLOW: f64 = crate::clearance::CRAMP_NODE_GAP;
+
+/// The drawing of `base`'s edge `i` that [`route_partial`] keeps when it
+/// links a state note card ([`crate::style::is_note_card`]) to a node
+/// and the drag moved neither end, or moved one of them (or both alike)
+/// by at most [`NOTE_FOLLOW`]: the base link itself, its moved end (and
+/// the run into it) carried along — unless one of the moved nodes' new
+/// boxes now meets it, which redraws it as `route()` would. `None` for
+/// any other edge. A note link is short and its ends are pinned, but
+/// redrawn afresh it took `route()`'s course, which can differ from
+/// `scene()`'s (a router path round its state's composite): a 1 px drag
+/// near it, or of its card or state, threw it 20-70 px (verifier: 22 of
+/// 206 composite-state diagrams).
+fn note_link_kept(
+    g: &Graph,
+    base: &Scene,
+    centers: &[(f64, f64)],
+    base_centers: &[(f64, f64)],
+    moved: &[bool],
+    i: usize,
+) -> Option<SceneEdge> {
+    let ge = g.edges.get(i)?;
+    let b = base.edges.get(i)?;
+    let card = |v: usize| {
+        base.nodes
+            .get(v)
+            .is_some_and(|n| crate::style::is_note_card(&n.id, n.shape, &n.style))
+    };
+    if ge.from == ge.to || !(card(ge.from) || card(ge.to)) {
+        return None;
+    }
+    let delta = |v: usize| {
+        (
+            centers[v].0 - base_centers[v].0,
+            centers[v].1 - base_centers[v].1,
+        )
+    };
+    let small = |d: (f64, f64)| d.0.hypot(d.1) <= NOTE_FOLLOW;
+    let (da, db) = (delta(ge.from), delta(ge.to));
+    let mut e = b.clone();
+    match (moved[ge.from], moved[ge.to]) {
+        (false, false) => {}
+        (true, true) if (da.0 - db.0).abs() < 1e-9 && (da.1 - db.1).abs() < 1e-9 && small(da) => {
+            for p in e.bezier.iter_mut().chain(e.waypoints.iter_mut()) {
+                *p = (p.0 + da.0, p.1 + da.1);
+            }
+        }
+        (true, false) if small(da) => follow_end(&mut e, true, da),
+        (false, true) if small(db) => follow_end(&mut e, false, db),
+        _ => return None,
+    }
+    // A moved node's new box newly over the link (closer than the
+    // clearance that counts as crossing it): redraw it.
+    let (was, pts) = (edge_polyline(b), edge_polyline(&e));
+    let c = crate::clearance::NODE_CLEARANCE;
+    let meets = |pts: &[(f64, f64)], v: usize, at: (f64, f64)| {
+        let n = &base.nodes[v];
+        let r = (
+            at.0 - n.w / 2.0 - c,
+            at.1 - n.h / 2.0 - c,
+            at.0 + n.w / 2.0 + c,
+            at.1 + n.h / 2.0 + c,
+        );
+        pts.windows(2).any(|w| seg_meets_rect(w[0], w[1], r))
+    };
+    let hit = (0..g.nodes.len())
+        .filter(|&v| moved[v] && v != ge.from && v != ge.to)
+        .any(|v| meets(&pts, v, centers[v]) && !meets(&was, v, base_centers[v]));
+    (!hit).then_some(e)
+}
+
+/// Carry the start (`src`) or the end of `e` along by `d`, with the run
+/// into it: a curve's control at that end; a path's waypoints on its
+/// first leg (those sharing the end's line across the leg) slid across
+/// the leg only, so an orthogonal leg stays straight and the corner it
+/// turns into keeps its other leg.
+fn follow_end(e: &mut SceneEdge, src: bool, d: (f64, f64)) {
+    let add = |p: &mut (f64, f64), dx: f64, dy: f64| {
+        p.0 += dx;
+        p.1 += dy;
+    };
+    let (pi, ci) = if src { (0, 1) } else { (3, 2) };
+    if e.waypoints.len() < 2 {
+        add(&mut e.bezier[pi], d.0, d.1);
+        add(&mut e.bezier[ci], d.0, d.1);
+        return;
+    }
+    let n = e.waypoints.len();
+    let order: Vec<usize> = if src {
+        (0..n).collect()
+    } else {
+        (0..n).rev().collect()
+    };
+    let end = e.waypoints[order[0]];
+    let vertical = (e.waypoints[order[1]].0 - end.0).abs() < 1e-9;
+    let level = (e.waypoints[order[1]].1 - end.1).abs() < 1e-9;
+    add(&mut e.waypoints[order[0]], d.0, d.1);
+    for &k in &order[1..] {
+        let q = e.waypoints[k];
+        if vertical && (q.0 - end.0).abs() < 1e-9 {
+            add(&mut e.waypoints[k], d.0, 0.0);
+        } else if level && !vertical && (q.1 - end.1).abs() < 1e-9 {
+            add(&mut e.waypoints[k], 0.0, d.1);
+        } else {
+            break;
+        }
+    }
+    let (w0, w1) = (e.waypoints[0], e.waypoints[n - 1]);
+    if e.bezier[0] == e.bezier[1] && e.bezier[2] == e.bezier[3] {
+        e.bezier = [w0, w0, w1, w1];
+    } else {
+        add(&mut e.bezier[pi], d.0, d.1);
+    }
 }
 
 /// Whether `base`'s frames still stand for `g`'s subgraphs, so
@@ -15752,7 +15892,13 @@ mod tests {
     #[test]
     fn note_links_hold_their_ends_and_corners_in_scene_route_and_drag() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/notes");
-        for name in ["spread-face", "spread-bottom", "nested-composite"] {
+        for name in [
+            "spread-face",
+            "spread-bottom",
+            "nested-composite",
+            "straight-link",
+            "wide-frames",
+        ] {
             let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");
             let g = match crate::parser::parse_document(&src).unwrap() {
                 crate::model::Document::State(g) => g,
@@ -15795,7 +15941,24 @@ mod tests {
                 };
                 let routed = name == "nested-composite"
                     && (card(&a.from) == Some("in458") || card(&a.to) == Some("in458"));
-                if elbow_of(a) || routed {
+                // A straight link (B7 review r1 #4, `straight-link`: a
+                // comb kept in `scene()` and not in `route()` pushed its
+                // pinned end 4.2 px aside): the same line.
+                let straight = a.waypoints.is_empty()
+                    && (a.bezier[0].0 - a.bezier[3].0).abs() < 1e-6
+                    && a.bezier.iter().all(|p| (p.0 - a.bezier[0].0).abs() < 1e-6);
+                if straight {
+                    assert!(
+                        b.waypoints.is_empty()
+                            && b.bezier.iter().all(|p| (p.0 - a.bezier[0].0).abs() < 1e-6),
+                        "{name} {} -> {}: {:?} vs {:?}",
+                        a.from,
+                        a.to,
+                        a.bezier,
+                        b.bezier
+                    );
+                    held += 1;
+                } else if elbow_of(a) || routed {
                     assert!(
                         same(a, b),
                         "{name} {} -> {}: {:?} {:?}\nvs {:?} {:?}",
@@ -15810,38 +15973,43 @@ mod tests {
                 }
             }
             assert!(held >= 1, "{name}: no link compared");
+            // A 1 px drag of any node, card or state, its frames redrawn
+            // or the whole drawing handed to `route()` (B7 review r1 #4:
+            // `wide-frames`' composites are drawn wider than `route()`
+            // draws them, so every drag of it is a full `route()`): a
+            // link neither end of which moved stays as drawn, and one
+            // whose card or state moved follows it by that 1 px.
             for v in 0..g.nodes.len() {
-                if is_note_card(&s.nodes[v]) {
-                    continue;
-                }
                 let mut moved = at.clone();
                 moved[v].0 += 1.0;
                 let p = route_partial(&g, &moved, &s, &at);
-                // A drag `route_partial` hands to `route()` whole redraws
-                // every free curve with `route()`'s own tangents (a node
-                // with a box's worth of edges): not this check's business.
-                let whole = (0..g.edges.len()).any(|ei| {
+                for &ei in &links {
                     let e = &g.edges[ei];
-                    e.from != v
-                        && e.to != v
-                        && !links.contains(&ei)
-                        && s.edges[ei].waypoints.is_empty()
-                        && s.edges[ei].bezier != p.edges[ei].bezier
-                });
-                if whole {
-                    continue;
-                }
-                for &ei in links.iter().filter(|&&ei| {
-                    let e = &g.edges[ei];
-                    e.from != v && e.to != v
-                }) {
-                    assert!(
-                        same(&s.edges[ei], &p.edges[ei]),
-                        "{name}: dragging {} moved {} -> {}",
-                        g.nodes[v].id,
-                        s.edges[ei].from,
-                        s.edges[ei].to
-                    );
+                    let (a, b) = (&s.edges[ei], &p.edges[ei]);
+                    if e.from != v && e.to != v {
+                        assert!(
+                            same(a, b),
+                            "{name}: dragging {} moved {} -> {}",
+                            g.nodes[v].id,
+                            a.from,
+                            a.to
+                        );
+                        continue;
+                    }
+                    let pts = |e: &SceneEdge| -> Vec<(f64, f64)> {
+                        e.bezier.iter().chain(&e.waypoints).copied().collect()
+                    };
+                    let (pa, pb) = (pts(a), pts(b));
+                    assert_eq!(pa.len(), pb.len(), "{name}: {} -> {}", a.from, a.to);
+                    for (x, y) in pa.iter().zip(&pb) {
+                        assert!(
+                            (x.0 - y.0).abs() <= 1.0 + 1e-6 && (x.1 - y.1).abs() < 1e-6,
+                            "{name}: dragging {} threw {} -> {}: {x:?} -> {y:?}",
+                            g.nodes[v].id,
+                            a.from,
+                            a.to
+                        );
+                    }
                 }
             }
         }

@@ -188,9 +188,16 @@ Minor, not patch: several class structs gain public fields (see
   free spot beside the kept fan instead, so a 1 px drag never re-spaces
   the fan of a node it does not touch. A
   state note card's link holds its end whatever else shares its node's
-  side, and keeps the router's corners, so `scene()` and `route()` draw
-  it alike and a drag that leaves its ends put never moves it (its elbow
-  ends used to sit 7-18 px apart in the two). Class and ER diagrams,
+  side (an even spread never pushes it aside), and keeps the router's
+  corners, so `scene()` and `route()` draw an elbow or straight link
+  alike (its elbow ends used to sit 7-18 px apart in the two, a straight
+  one 4 px); a link the router redrew round something may still take
+  another course in a full `route()`. A drag (`route_partial`) keeps a
+  note link exactly as drawn while neither its card nor its state moves
+  (unless the dragged node now lies across it), and carries it along
+  when one of them moves up to 8 px, also when the drag is redrawn by a
+  full `route()`; a 1 px drag used to throw it 20-70 px in about one
+  composite-state diagram in ten. Class and ER diagrams,
   whose painters set their own ends, are unchanged. The layout search
   judges a candidate on the old depths, so the head room never changes
   a layering or ordering choice.

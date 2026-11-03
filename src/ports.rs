@@ -906,10 +906,10 @@ fn place_ports(
                 .any(|(j, a)| ports[j + 1..].iter().any(|b| sibling(a, b))))
         .then(|| even_comb(&ports, kept, s, room, lo, hi))
         .filter(|x| {
-            ports
-                .iter()
-                .zip(x)
-                .all(|(p, &t)| !kept(p) || (t - split(side, p.at).0).abs() < PORT_EPS)
+            ports.iter().zip(x).all(|(p, &t)| {
+                let held = kept(p) || p.weight >= NOTE_WEIGHT;
+                !held || (t - split(side, p.at).0).abs() < PORT_EPS
+            })
         }) {
             // (Parallel edges — a 2-cycle's twins too, even with a note
             // link's end between them — keep the spacing their run's
@@ -918,9 +918,13 @@ fn place_ports(
             // a twin's bow into its head.)
             //
             // In `route_partial` the ends a drag keeps ([`Ctx::fixed`])
-            // pin the comb, and a comb that would move one is not used:
-            // the plain rule below then leaves the side as drawn while
-            // it stays spaced. The base scene's ports came out of the
+            // pin the comb, and a comb that would move one — or a note
+            // link's pinned end, which the span may push it off — is not
+            // used: the plain rule below then leaves the side as drawn
+            // while it stays spaced, and spaces the others round a pin.
+            // (A comb kept in `scene()` and dropped in `route()`, where
+            // a back-edge's end heads the other way, moved a note link's
+            // end 4.2 px between the two.) The base scene's ports came out of the
             // router, the respacing and the nudge after this comb, and
             // combing them afresh made a hub's fan jump 20-50 px under
             // a 1 px drag of a node none of its edges touch.
