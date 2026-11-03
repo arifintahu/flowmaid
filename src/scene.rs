@@ -5118,8 +5118,19 @@ pub(crate) const EDGE_WIDTH_THICK: f64 = 3.5;
 /// Default stroke width of a node's outline — and of the strokes drawn
 /// with it: a cylinder's lid, a subroutine's bars, a final state's ring.
 const NODE_STROKE_WIDTH: f64 = 1.8;
-/// Dash pattern of a dotted (`-.->`) edge.
-const EDGE_DOTTED_DASH: &str = "5 4";
+/// Dash pattern of a dotted (`-.->`) edge stroked `width` px wide:
+/// square dots one stroke width long, a stroke and a half apart — `2 3`
+/// at [`EDGE_WIDTH`]. Mermaid draws `2 2` at its 2 px edge; the slightly
+/// wider gap keeps the line reading as dots rather than as a fainter
+/// solid line, and long dashes (the old `5 4`) read as dashed, which is
+/// what `linkStyle stroke-dasharray` is for. The pattern scales with the
+/// stroke, so a `linkStyle stroke-width` dotted edge stays dotted (a
+/// fixed `2 3` under a 6 px stroke reads as stripes). Shared with the
+/// advance writer.
+pub(crate) fn dotted_dash(width: f64) -> String {
+    let r = |v: f64| (v * 10.0).round() / 10.0;
+    format!("{} {}", r(width), r(width * 1.5))
+}
 /// Size of an end glyph in default edge strokes.
 const ARROW_MARKER_UNITS: f64 = 5.5;
 /// Length and width (px, user space) of every edge end glyph — the
@@ -5741,15 +5752,15 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
         if !edge_drawn(e) {
             continue; // layout-only link — never drawn
         }
-        let dash =
-            matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen).then_some(EDGE_DOTTED_DASH);
         // `linkStyle` paint overrides the kind's look per property.
         let st = &e.meta.style;
         let sw = edge_stroke_width(e);
+        let dotted =
+            matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen).then(|| dotted_dash(sw));
         let dash = st
             .stroke_dasharray
             .as_deref()
-            .or(dash)
+            .or(dotted.as_deref())
             .map_or(String::new(), |d| {
                 format!(" stroke-dasharray=\"{}\"", escape(d))
             });
@@ -8822,7 +8833,7 @@ mod tests {
         assert!(p[0].contains("class=\"edge-animation-fast\""), "{svg}");
         assert!(p[1].contains("class=\"edge-animation-slow\""));
         assert!(
-            p[1].contains("stroke-dasharray=\"5 4\""),
+            p[1].contains("stroke-dasharray=\"2 3\""),
             "dotted dash stays"
         );
         assert!(!p[2].contains("class="));
@@ -11453,6 +11464,30 @@ mod tests {
     }
 
     #[test]
+    fn dotted_edges_draw_dots_that_scale_with_their_stroke() {
+        // Report Q9: `-.->` reads as dotted — dots one stroke long, a
+        // stroke and a half apart (mermaid: `2 2` at 2 px), not the
+        // long `5 4` dashes that read as dashed.
+        let svg = svg_src(
+            "flowchart LR\nA -.-> B\nC -.- D\nE -.-> F\nG -.-> H\n\
+             linkStyle 2 stroke-width:4px\nlinkStyle 3 stroke-dasharray: 5 5\n",
+        );
+        let p = edge_paths(&svg);
+        assert!(p[0].contains("stroke-dasharray=\"2 3\""), "{svg}");
+        assert!(p[1].contains("stroke-dasharray=\"2 3\""), "{svg}");
+        // A wider stroke keeps the same look, not stripes.
+        assert!(p[2].contains("stroke-dasharray=\"4 6\""), "{svg}");
+        // A user dash still wins.
+        assert!(p[3].contains("stroke-dasharray=\"5 5\""), "{svg}");
+        assert_eq!(dotted_dash(EDGE_WIDTH), "2 3");
+        assert_eq!(dotted_dash(EDGE_WIDTH_THICK), "3.5 5.3");
+        // The advance writer draws the same dots.
+        let adv = crate::advance::render_advance_text_svg("lane l \"L\"\na[A]\nb[B]\na -.-> b\n")
+            .unwrap();
+        assert!(adv.contains("stroke-dasharray=\"2 3\""), "{adv}");
+    }
+
+    #[test]
     fn link_style_dash_and_width_override_the_kind() {
         let svg = svg_src(
             "flowchart LR\nA -.-> B\nC ==> D\nE --> F\nlinkStyle 0 stroke-dasharray:0\n\
@@ -11460,7 +11495,7 @@ mod tests {
         );
         let p = edge_paths(&svg);
         assert!(
-            p[0].contains("stroke-dasharray=\"0\"") && !p[0].contains("stroke-dasharray=\"5 4\"")
+            p[0].contains("stroke-dasharray=\"0\"") && !p[0].contains("stroke-dasharray=\"2 3\"")
         );
         assert!(p[1].contains("stroke-width=\"1\"") && p[1].contains("url(#arrow)"));
         assert!(p[2].contains("stroke-dasharray=\"5 5\""));
@@ -14269,7 +14304,7 @@ mod tests {
         // a thick edge shares `#arrow`, sized in user space).
         let svg = svg_src("flowchart LR\nA --> B\nC -.-> D\nE ==> F\nG x--x H\n");
         assert!(!svg.contains("_"), "{svg}");
-        assert!(svg.contains("stroke-dasharray=\"5 4\""));
+        assert!(svg.contains("stroke-dasharray=\"2 3\""));
         assert!(svg.contains("stroke-width=\"3.5\" marker-end=\"url(#arrow)\""));
         assert!(svg.contains("stroke-width=\"2\" marker-end=\"url(#arrow)\""));
         assert_eq!(svg.matches("<marker id=\"arrow\"").count(), 1, "{svg}");

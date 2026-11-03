@@ -5824,18 +5824,18 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
             continue;
         }
         let color = crate::scene::style_attr(e.style.color.as_deref(), &sc.style.edge_color);
-        // An explicit style dash wins over the kind-based dashed style;
-        // otherwise Thick stays solid, Dotted stays dashed.
+        // An explicit style dash wins over the kind-based dotted style
+        // (the flowchart writer's dots, scaled with the stroke);
+        // otherwise Thick stays solid.
+        let sw = advance_edge_width(e);
         let styled_dash = e.style.dash.as_deref().map(escape);
-        let dash = styled_dash.as_deref().or(match e.kind {
-            EdgeKind::Dotted | EdgeKind::DottedOpen => Some("5 4"),
-            _ => None,
-        });
+        let dotted = matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen)
+            .then(|| crate::scene::dotted_dash(sw));
+        let dash = styled_dash.as_deref().or(dotted.as_deref());
         let dash_attr = match dash {
             Some(d) => format!(" stroke-dasharray=\"{}\"", d),
             None => String::new(),
         };
-        let sw = advance_edge_width(e);
         let head_trim = crate::scene::arrow_trim(sw);
         let marker = if e.kind.has_arrow() {
             markers

@@ -110,6 +110,14 @@ Minor, not patch: several class structs gain public fields (see
   values (`DEFECT_BASELINE`, `INK_MEAN_MIN`), to be lowered as the
   defects are fixed. No rendering change.
 
+- **`classDef default …` styles every flowchart node**, as in mermaid
+  (report Q9). It used to be an ordinary class nobody carried, so the
+  standard way to give a diagram a neutral look did nothing. It is now the
+  bottom layer of every node's style: a node's own classes (`class`,
+  `:::`) and `style` lines still win property by property, as mermaid
+  compiles `default`, then the node's classes. A borderless shape (`text`,
+  braces) takes only its text colour and keeps no box.
+
 ### Changed
 
 - **Back-edges run in orthogonal lanes, as in mermaid** (report §2.2,
@@ -467,6 +475,13 @@ Minor, not patch: several class structs gain public fields (see
 - **Tooltips for choices and bars name the state.** A `<<choice>>` now has
   a `<title>` (its id, where it had none), and fork/join bars are titled by
   id (`forked`, `joined`) instead of "fork/join".
+- **Dotted edges read as dotted** (report Q9). `-.->` and `-.-` were drawn
+  with `5 4` dashes, which read as dashed; they are now dots one stroke
+  long a stroke and a half apart — `stroke-dasharray="2 3"` at the 2 px
+  edge (mermaid draws `2 2`). The pattern scales with the stroke, so a
+  `linkStyle … stroke-width:4px` dotted edge keeps the look (`4 6`) instead
+  of turning into stripes; a `linkStyle` / `classDef` `stroke-dasharray`
+  still wins. The advance writer draws the same dots.
 - **Breaking** (needs a **minor** bump). Nothing public is removed or
   renamed, and every function keeps its signature. What breaks, and how to
   migrate:

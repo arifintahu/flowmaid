@@ -734,6 +734,8 @@ const LINK_STYLE_KW: &str = "linkStyle";
 const LINK_STYLE_DEFAULT: &str = "default";
 /// The optional curve clause of a `linkStyle` statement.
 const LINK_STYLE_INTERPOLATE: &str = "interpolate";
+/// The `classDef` name mermaid layers under every node's own classes.
+const DEFAULT_CLASS: &str = "default";
 
 /// One `linkStyle` statement (`rest` follows the keyword):
 /// `default` or `N[,N…]` (no spaces), an optional `interpolate
@@ -1994,6 +1996,22 @@ fn parse_flowchart(source: &str) -> Result<Graph, ParseError> {
         let st = &mut g.nodes[n].style;
         st.fill = Some(BORDERLESS_PAINT.to_string());
         st.stroke = Some(BORDERLESS_PAINT.to_string());
+    }
+    // `classDef default …` is the bottom layer for EVERY node, as in
+    // mermaid (its nodes compile `["default", "node", ...classes]`): a
+    // node's own classes and `style` lines still win per property. A
+    // borderless shape is bare text by definition, so it takes only
+    // the default's text colour, never a box.
+    if let Some(def) = class_defs.get(DEFAULT_CLASS) {
+        for (n, node) in g.nodes.iter_mut().enumerate() {
+            if fm.borderless.contains(&n) {
+                if def.color.is_some() {
+                    node.style.color.clone_from(&def.color);
+                }
+            } else {
+                node.style.apply_over(def);
+            }
+        }
     }
     for (n, name) in assigns {
         if let Some(def) = class_defs.get(&name) {
@@ -7092,6 +7110,46 @@ mod tests {
             .style
             .fill
             .is_some());
+    }
+
+    #[test]
+    fn classdef_default_styles_every_node_under_its_own_classes() {
+        // Mermaid's own example: `classDef default` reaches every node,
+        // including ones declared after it.
+        let g = parse(
+            "flowchart LR\n\
+             classDef default fill:#fff,stroke:#333,stroke-width:2px,color:#111\n\
+             classDef hot fill:#ffe3e3\n\
+             A --> B:::hot\n\
+             B --> C\n\
+             style C stroke:#f00\n\
+             T@{ shape: text, label: \"note\" }\n",
+        )
+        .unwrap();
+        let st = |id: &str| g.nodes[g.node_index(id).unwrap()].style.clone();
+        let a = st("A");
+        assert_eq!(a.fill.as_deref(), Some("#fff"));
+        assert_eq!(a.stroke.as_deref(), Some("#333"));
+        assert_eq!(a.stroke_width, Some(2.0));
+        assert_eq!(a.color.as_deref(), Some("#111"));
+        // A node's own class wins where it says something, the default
+        // fills in the rest (mermaid compiles default, then classes).
+        let b = st("B");
+        assert_eq!(b.fill.as_deref(), Some("#ffe3e3"));
+        assert_eq!(b.stroke.as_deref(), Some("#333"));
+        // A `style` line wins over the default.
+        let c = st("C");
+        assert_eq!(c.stroke.as_deref(), Some("#f00"));
+        assert_eq!(c.fill.as_deref(), Some("#fff"));
+        // Bare text keeps no box, only the default's ink.
+        let t = st("T");
+        assert_eq!(t.fill.as_deref(), Some(BORDERLESS_PAINT));
+        assert_eq!(t.stroke.as_deref(), Some(BORDERLESS_PAINT));
+        assert_eq!(t.color.as_deref(), Some("#111"));
+        // Without a default class nothing changes: unstyled nodes keep
+        // the shape theme.
+        let g = parse("flowchart LR\nA --> B\n").unwrap();
+        assert_eq!(g.nodes[0].style, NodeStyle::default());
     }
 
     /// (kind, start glyph, resolved end glyph, label) of the one
