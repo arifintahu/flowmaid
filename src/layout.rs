@@ -864,6 +864,26 @@ pub fn intrinsic_size(node: &Node) -> (f64, f64) {
     intrinsic_size_with(node, text_width)
 }
 
+/// Height (px) a cylinder adds over its text for its caps.
+const CYLINDER_CAPS_H: f64 = 16.0;
+/// Deepest (px) a cylinder's cap ellipse gets ([`cylinder_cap_ry`]): 2 px
+/// past the old fixed 8. Mermaid's lid keeps deepening (15 px on a
+/// 200 px drum), but here a deeper lid curves the flanks in so far that
+/// an over-full side's corner ports (met as the box's) float off them:
+/// dense-lr's 12-edge hub, 6.8 px at 13.5.
+const CYLINDER_RY_MAX: f64 = 10.0;
+
+/// Half height (px) of a cylinder's cap ellipse on a node `w` px wide:
+/// mermaid's `rx / (2.5 + w / 50)` (`rx = w / 2`), so a narrow drum
+/// gets a shallower lid (7.5 px on the narrowest node), up to
+/// [`CYLINDER_RY_MAX`] from about 80 px wide. The node keeps its size
+/// ([`intrinsic_size_with`]: [`CYLINDER_CAPS_H`] over its text), and the
+/// painters take at most a quarter of a host-sized node's height.
+pub(crate) fn cylinder_cap_ry(w: f64) -> f64 {
+    let w = w.max(0.0);
+    ((w / 2.0) / (2.5 + w / 50.0)).min(CYLINDER_RY_MAX)
+}
+
 /// [`intrinsic_size`] with an injectable text measurer: `measure`
 /// receives one raw label LINE (may contain `<b>`/`<i>` tags — strip
 /// or style them via [`spans`]) and returns its rendered width in px
@@ -886,8 +906,10 @@ pub fn intrinsic_size_with(node: &Node, measure: impl Fn(&str) -> f64) -> (f64, 
         }
         // Hexagon points eat horizontal space.
         Shape::Hexagon => ((tw + 2.0 * PAD_X + 28.0).max(MIN_W + 28.0), base_h),
-        // Cylinder caps add vertical room.
-        Shape::Cylinder => ((tw + 2.0 * PAD_X).max(MIN_W), base_h + 16.0),
+        // Cylinder caps add vertical room (two of the narrowest caps: a
+        // wider drum's deeper lid takes from its body, and its label
+        // drops below the lid, see `scene::CYLINDER_LABEL_DROP`).
+        Shape::Cylinder => ((tw + 2.0 * PAD_X).max(MIN_W), base_h + CYLINDER_CAPS_H),
         // A diamond with nothing to say is a branch point (a state
         // `<<choice>>`, or a flowchart `A{ }`): compact, mermaid-style.
         Shape::Diamond if is_branch_point(node.shape, &node.label) => (CHOICE_SIZE, CHOICE_SIZE),
@@ -1869,6 +1891,9 @@ fn place(
     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
     // Per original edge: dummy chain in the edge's own from→to order.
     let mut edge_chain: Vec<Vec<usize>> = vec![Vec::new(); g.edges.len()];
+    // Adjacent pairs linked so far only by a 2-cycle's return edge,
+    // which stands in for the first forward edge of the pair.
+    let mut return_only: std::collections::HashSet<(usize, usize)> = Default::default();
     for (ei, e) in g.edges.iter().enumerate() {
         if e.from == e.to {
             continue; // self-loop — no layered path
@@ -1883,10 +1908,27 @@ fn place(
         let (llo, lhi) = (alayer[lo], alayer[hi]);
         if lhi <= llo + 1 {
             // A 2-cycle's return edge runs beside its twin across the
-            // gap: one link between the pair, not a second pull.
-            if llo < lhi && !(back[ei] && succs[lo].contains(&hi)) {
-                succs[lo].push(hi);
-                preds[hi].push(lo);
+            // gap: one link between the pair, not a second pull —
+            // whichever of the two is written first. A doubled link
+            // made BK's median land on the pair and pulled the node off
+            // the middle of its fan: lr's Service Layer sat level with
+            // Redis Cache instead of centred on Database / Redis when
+            // `CACHE --> SVC` came first (report Q8). Parallel FORWARD
+            // edges keep one link each: a twin pair then runs straight
+            // down its own column, which the twin curves and their
+            // labels are drawn for (deduplicated, a choice's
+            // `low`/`medium` twins slanted across the fan).
+            if llo < lhi {
+                if back[ei] {
+                    if !succs[lo].contains(&hi) {
+                        succs[lo].push(hi);
+                        preds[hi].push(lo);
+                        return_only.insert((lo, hi));
+                    }
+                } else if !return_only.remove(&(lo, hi)) {
+                    succs[lo].push(hi);
+                    preds[hi].push(lo);
+                }
             }
             continue; // same or adjacent layer — no dummies
         }
@@ -2593,6 +2635,10 @@ fn place(
     // the labels then slide along their own (slanted) curves to reach
     // a row, which never lands them exactly side by side. One row =
     // nothing overlaps = no requirement, so only colliding gaps grow.
+    // (Siblings that would read as one phrase are kept apart where the
+    // labels are placed, `labels::label_siblings`: the midpoint spans
+    // here are not where a hub's labels end up, and reserving sibling
+    // rows from them only grew a busy hub's gap.)
     let gap_need: Vec<f64> = short_across
         .iter_mut()
         .map(|spans| {
@@ -3382,7 +3428,9 @@ fn coordinates_bk(
     }
 
     // Adjacent-layer neighbour sets (back/invisible links that skip a
-    // layer are excluded — BK only reasons about layer±1 segments).
+    // layer are excluded — BK only reasons about layer±1 segments). A
+    // 2-cycle lists its pair once (see the layering above); parallel
+    // forward edges are listed once per edge on purpose (report Q8).
     let mut up: Vec<Vec<usize>> = vec![Vec::new(); na];
     let mut down: Vec<Vec<usize>> = vec![Vec::new(); na];
     for v in 0..na {

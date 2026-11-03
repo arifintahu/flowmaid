@@ -383,6 +383,61 @@ impl ObstacleGrid {
     }
 }
 
+/// Per edge: the labelled edges that are its label's siblings (`labelled`
+/// says which edges carry a drawn label): drawn out of the node it
+/// leaves, or into the node it enters, from or to a node side by side
+/// with its own other end across their flow — the axis nearest the way
+/// from the shared node's centre to the middle of the two other ends,
+/// as [`stack_fans`] reads a fan's flow — so both lines cross the same
+/// gap, a fan's row. Siblings keep [`FAN_SIBLING_GAP`] apart (see
+/// [`LabelGrid::keep`]).
+fn label_siblings(
+    nodes: &[SceneNode],
+    edges: &[SceneEdge],
+    labelled: impl Fn(usize) -> bool,
+) -> Vec<Vec<usize>> {
+    let mut sibs = vec![Vec::new(); edges.len()];
+    let with: Vec<usize> = (0..edges.len())
+        .filter(|&i| labelled(i) && edges[i].from != edges[i].to)
+        .collect();
+    if with.len() < 2 {
+        return sibs;
+    }
+    let boxes: HashMap<&str, &SceneNode> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    for (k, &i) in with.iter().enumerate() {
+        for &j in &with[k + 1..] {
+            let (a, b) = (&edges[i], &edges[j]);
+            let (hub, far) = if a.from == b.from {
+                (&a.from, (&a.to, &b.to))
+            } else if a.to == b.to {
+                (&a.to, (&a.from, &b.from))
+            } else {
+                continue;
+            };
+            let at = |id: &String| boxes.get(id.as_str()).copied();
+            let (Some(c), Some(f0), Some(f1)) = (at(hub), at(far.0), at(far.1)) else {
+                continue;
+            };
+            let mid = ((f0.x + f1.x) / 2.0, (f0.y + f1.y) / 2.0);
+            let flow_y = (mid.1 - c.y).abs() >= (mid.0 - c.x).abs();
+            // Both far ends side by side across the flow (their boxes
+            // overlap along it). A longer edge beside a short one
+            // carries its label in another gap, not in the fan's row.
+            let (a0, h0, a1, h1) = if flow_y {
+                (f0.y, f0.h, f1.y, f1.h)
+            } else {
+                (f0.x, f0.w, f1.x, f1.w)
+            };
+            if (a0 - a1).abs() >= (h0 + h1) / 2.0 {
+                continue;
+            }
+            sibs[i].push(j);
+            sibs[j].push(i);
+        }
+    }
+    sibs
+}
+
 /// The edge labels as currently placed (index-parallel with the
 /// edges), bucketed on an [`OBSTACLE_CELL`] grid so a spot only checks
 /// the labels near it, and a label can move.
@@ -392,6 +447,8 @@ struct LabelGrid {
     /// Labels looked at by queries so far (the stage's work, see
     /// [`LABEL_ROUTE_WORK`]).
     visits: Cell<usize>,
+    /// Per label: its siblings' labels (see [`label_siblings`]).
+    sibs: Vec<Vec<usize>>,
 }
 
 impl LabelGrid {
@@ -400,6 +457,7 @@ impl LabelGrid {
             rects: Vec::new(),
             cells: HashMap::default(),
             visits: Cell::new(0),
+            sibs: Vec::new(),
         };
         g.rects = vec![None; rects.len()];
         for (i, r) in rects.into_iter().enumerate() {
@@ -434,11 +492,42 @@ impl LabelGrid {
         }
     }
 
-    /// Calls `f` once on every label other than `own` that may overlap
-    /// `a` grown by `gap`, without collecting them (see [`first_cell`]).
-    fn each(&self, own: usize, a: Rect, gap: f64, mut f: impl FnMut(&Rect)) {
-        let Some((x0, y0, x1, y1)) =
-            cell_span((a.0 - gap, a.1 - gap, a.2 + gap, a.3 + gap), OBSTACLE_CELL)
+    /// The grid with `sibs` (see [`label_siblings`]) marking which
+    /// labels keep [`FAN_SIBLING_GAP`] apart.
+    fn with_siblings(mut self, sibs: Vec<Vec<usize>>) -> Self {
+        self.sibs = sibs;
+        self
+    }
+
+    /// `a` grown by the keep-out label `own` keeps from label `j`:
+    /// `gap` all round, but at least [`FAN_SIBLING_GAP`] from a sibling
+    /// (see [`label_siblings`]) — two pills of one fan nearer than that
+    /// read as one phrase ("valid invalid", report Q14), side by side
+    /// or stacked as two lines of one label. Only a keep-out query
+    /// (`gap > 0`) widens: an overlap test stays an overlap test.
+    fn keep(&self, own: usize, j: usize, a: Rect, gap: f64) -> Rect {
+        let sib = gap > 0.0 && self.sibs.get(own).is_some_and(|s| s.contains(&j));
+        let g = if sib { gap.max(FAN_SIBLING_GAP) } else { gap };
+        (a.0 - g, a.1 - g, a.2 + g, a.3 + g)
+    }
+
+    /// How far round `own`'s box a keep-out query of `gap` looks: past
+    /// `gap` only for a label with siblings.
+    fn reach(&self, own: usize, gap: f64) -> f64 {
+        if gap > 0.0 && self.sibs.get(own).is_some_and(|s| !s.is_empty()) {
+            gap.max(FAN_SIBLING_GAP)
+        } else {
+            gap
+        }
+    }
+
+    /// Calls `f` once on every label other than `own` that may lie
+    /// within the keep-out `gap` of `a` (see [`LabelGrid::keep`]), with
+    /// `a` grown by that keep-out, without collecting them (see
+    /// [`first_cell`]).
+    fn each(&self, own: usize, a: Rect, gap: f64, mut f: impl FnMut(Rect, &Rect)) {
+        let g = self.reach(own, gap);
+        let Some((x0, y0, x1, y1)) = cell_span((a.0 - g, a.1 - g, a.2 + g, a.3 + g), OBSTACLE_CELL)
         else {
             return;
         };
@@ -451,7 +540,7 @@ impl LabelGrid {
                 for &j in v {
                     if let Some(r) = &self.rects[j] {
                         if j != own && first_cell(r, (x0, y0), (cx, cy)) {
-                            f(r);
+                            f(self.keep(own, j, a, gap), r);
                         }
                     }
                 }
@@ -462,8 +551,8 @@ impl LabelGrid {
     /// Summed overlap of `a` (grown by `gap`) with the other labels.
     fn cover(&self, own: usize, a: Rect, gap: f64) -> f64 {
         let mut sum = 0.0;
-        self.each(own, a, gap, |r| {
-            sum += covered(a, gap, std::slice::from_ref(r));
+        self.each(own, a, gap, |k, r| {
+            sum += covered(k, 0.0, std::slice::from_ref(r));
         });
         sum
     }
@@ -471,8 +560,8 @@ impl LabelGrid {
     /// How many other labels `a` (grown by `gap`) overlaps.
     fn hits(&self, own: usize, a: Rect, gap: f64) -> usize {
         let mut n = 0;
-        self.each(own, a, gap, |r| {
-            n += usize::from(covered(a, gap, std::slice::from_ref(r)) > 0.0);
+        self.each(own, a, gap, |k, r| {
+            n += usize::from(covered(k, 0.0, std::slice::from_ref(r)) > 0.0);
         });
         n
     }
@@ -480,8 +569,8 @@ impl LabelGrid {
     /// Does no label other than `own` overlap `a` grown by `gap`? Walks
     /// the cells in place: it is asked for every candidate spot.
     fn clear(&self, own: usize, a: Rect, gap: f64) -> bool {
-        let Some((x0, y0, x1, y1)) =
-            cell_span((a.0 - gap, a.1 - gap, a.2 + gap, a.3 + gap), OBSTACLE_CELL)
+        let g = self.reach(own, gap);
+        let Some((x0, y0, x1, y1)) = cell_span((a.0 - g, a.1 - g, a.2 + g, a.3 + g), OBSTACLE_CELL)
         else {
             return true;
         };
@@ -490,7 +579,10 @@ impl LabelGrid {
                 self.cells.get(&(cx, cy)).map_or(true, |v| {
                     self.visits.set(self.visits.get() + v.len());
                     v.iter().all(|&j| {
-                        j == own || self.rects[j].map_or(true, |r| covered(a, gap, &[r]) == 0.0)
+                        j == own
+                            || self.rects[j].map_or(true, |r| {
+                                covered(self.keep(own, j, a, gap), 0.0, &[r]) == 0.0
+                            })
                     })
                 })
             })
@@ -1367,7 +1459,7 @@ struct Track {
 }
 
 impl Track {
-    fn new(pts: &[(f64, f64)], prefer: f64, w: f64, field: &Field) -> Self {
+    fn new(pts: &[(f64, f64)], prefer: f64, w: f64, keep: f64, field: &Field) -> Self {
         let spots = densify(pts);
         let mut arc = Vec::with_capacity(spots.len());
         let mut s = 0.0;
@@ -1404,10 +1496,11 @@ impl Track {
         }
         let (x0, x1, y0, y1) = bb.finish();
         // Half the box, the farthest step beside the line, and the
-        // keep-out it is checked with, around the whole curve (a
-        // self-loop's spots past its apex stay within a box height).
-        let gx = w / 2.0 + LABEL_SIDE_MAX + LABEL_KEEP + LABEL_BOX_H;
-        let gy = LABEL_BOX_H / 2.0 + LABEL_SIDE_MAX + LABEL_KEEP + w;
+        // keep-out it is checked with (`keep`: wider from a sibling),
+        // around the whole curve (a self-loop's spots past its apex
+        // stay within a box height).
+        let gx = w / 2.0 + LABEL_SIDE_MAX + keep + LABEL_BOX_H;
+        let gy = LABEL_BOX_H / 2.0 + LABEL_SIDE_MAX + keep + w;
         let reach = (x0 - gx, y0 - gy, x1 + gx, y1 + gy);
         let mut t = Track {
             spots,
@@ -1627,6 +1720,26 @@ fn place(
             }
         })
         .collect();
+    // Sibling labels (see `label_siblings`), and the keep-out each
+    // label's box is checked with: wider for one with siblings. A
+    // compact branch point's fan keeps its own rows (`stack_fans`).
+    let sibs = label_siblings(nodes, edges, |i| {
+        let e = &edges[i];
+        lines[i].is_some()
+            && e.label.is_some()
+            && !branch.contains(e.from.as_str())
+            && !branch.contains(e.to.as_str())
+    });
+    let keep: Vec<f64> = sibs
+        .iter()
+        .map(|s| {
+            if s.is_empty() {
+                LABEL_KEEP
+            } else {
+                FAN_SIBLING_GAP
+            }
+        })
+        .collect();
     // (preferred spot, fan-out of a hub end or 0) per edge.
     let hub: Vec<(f64, usize)> = edges
         .iter()
@@ -1656,7 +1769,8 @@ fn place(
         let (Some(from_point), Some(pts)) = (fan[ei], &lines[ei]) else {
             return false;
         };
-        let track = tracks[ei].get_or_insert_with(|| Track::new(pts, hub[ei].0, w, &field));
+        let track =
+            tracks[ei].get_or_insert_with(|| Track::new(pts, hub[ei].0, w, keep[ei], &field));
         let f = track.share_at(at);
         (if from_point { f } else { 1.0 - f }) < FAN_FAR
     };
@@ -1698,7 +1812,7 @@ fn place(
             let up = restack.contains(if from_point { &e.from } else { &e.to });
             if up {
                 let w = e.label.as_ref().map_or(0.0, |l| l.2);
-                tracks[ei].get_or_insert_with(|| Track::new(pts, hub[ei].0, w, &field));
+                tracks[ei].get_or_insert_with(|| Track::new(pts, hub[ei].0, w, keep[ei], &field));
             }
             up
         })
@@ -1720,7 +1834,8 @@ fn place(
                 e.label.as_ref().map(|(_, c, w)| label_rect(*c, *w))
             })
             .collect(),
-    );
+    )
+    .with_siblings(sibs);
 
     // Labels already searched, and the boxes labels left or took in the
     // last round (by mover): a searched label is tried again only when
@@ -1744,12 +1859,10 @@ fn place(
             if round > 0 {
                 let reach = match &tracks[ei] {
                     Some(t) if tried[ei] => t.reach,
-                    _ => (
-                        r.0 - LABEL_KEEP,
-                        r.1 - LABEL_KEEP,
-                        r.2 + LABEL_KEEP,
-                        r.3 + LABEL_KEEP,
-                    ),
+                    _ => {
+                        let k = placed.reach(ei, LABEL_KEEP);
+                        (r.0 - k, r.1 - k, r.2 + k, r.3 + k)
+                    }
                 };
                 if !changes
                     .iter()
@@ -1792,7 +1905,7 @@ fn place(
                 continue;
             }
             if tracks[ei].is_none() {
-                tracks[ei] = Some(Track::new(pts, hub[ei].0, *w, &field));
+                tracks[ei] = Some(Track::new(pts, hub[ei].0, *w, keep[ei], &field));
             }
             todo.push((ei, off_line));
         }
@@ -2640,6 +2753,58 @@ mod tests {
             *c = a;
         }
         assert_eq!(label_clashes(&sc.nodes, &edges), vec![true, false]);
+    }
+
+    #[test]
+    fn sibling_labels_of_a_fan_keep_apart_so_each_reads_on_its_own() {
+        // Report Q14: 'valid' and 'invalid' out of one decision sat 4 px
+        // apart side by side and read as one phrase. Labels of edges
+        // out of one node (or into one) whose other ends sit side by
+        // side now keep FAN_SIBLING_GAP apart, in scene() and route()
+        // alike, in every direction.
+        let gap = |a: Rect, b: Rect| (b.0 - a.2).max(a.0 - b.2).max((b.1 - a.3).max(a.1 - b.3));
+        for src in [
+            "flowchart TD\n  A{Valid?} -->|valid| B[Accept]\n  A -->|invalid| C[Reject]\n",
+            "flowchart BT\n  A{Valid?} -->|valid| B[Accept]\n  A -->|invalid| C[Reject]\n",
+            "flowchart TD\n  A[Start] -->|valid| B[Accept]\n  A -->|invalid| C[Reject]\n",
+            "flowchart TD\n  A --> X{check}\n  X -->|ok| B\n  X -->|not ok| C\n",
+            "flowchart TD\n  B -->|valid| A[Accept]\n  C -->|invalid| A\n",
+            "flowchart TD\n  A[Start] -->|yes| B\n  A -->|no| C\n  A -->|maybe| D\n  A -->|later| E\n",
+            "flowchart LR\n  A{Valid?} -->|valid| B[Accept]\n  A -->|invalid| C[Reject]\n  \
+             A -->|unknown| D[Hold]\n",
+        ] {
+            let g = crate::parser::parse(src).unwrap();
+            let sc = crate::scene::scene(&g);
+            let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+            let routed = crate::scene::route(&g, &at);
+            for (mode, sc) in [("scene", &sc), ("route", &routed)] {
+                let boxes: Vec<(&SceneEdge, Rect)> = sc
+                    .edges
+                    .iter()
+                    .filter_map(|e| e.label.as_ref().map(|(_, c, w)| (e, label_rect(*c, *w))))
+                    .collect();
+                for (i, (a, ra)) in boxes.iter().enumerate() {
+                    for (b, rb) in &boxes[i + 1..] {
+                        if a.from == b.from || a.to == b.to {
+                            let d = gap(*ra, *rb);
+                            assert!(
+                                d >= FAN_SIBLING_GAP - TOUCH_EPS,
+                                "{mode}: {:?} and {:?} {d:.1} px apart\n{src}",
+                                a.label,
+                                b.label
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Labels of a longer edge beside a short one are no fan's row:
+        // they keep the ordinary LABEL_KEEP (wide-labels' health probe).
+        let g = crate::parser::parse("flowchart LR\n  A -->|one| B\n  B --> C\n  A -->|two| C\n")
+            .unwrap();
+        let sc = crate::scene::scene(&g);
+        let sibs = label_siblings(&sc.nodes, &sc.edges, |i| sc.edges[i].label.is_some());
+        assert!(sibs.iter().all(Vec::is_empty), "{sibs:?}");
     }
 
     #[test]

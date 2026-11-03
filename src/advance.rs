@@ -5588,12 +5588,15 @@ fn render_node(s: &mut String, n: &AdvanceSceneNode, text_color: &str) {
             }
         }
         Shape::Cylinder => {
+            // As the flowchart writer draws it (`scene::to_svg`): the
+            // whole drum filled over the lid's back arc, then the lid's
+            // front arc on top.
             let (l, r, t, b) = (cx - w / 2.0, cx + w / 2.0, cy - h / 2.0, cy + h / 2.0);
-            let ry = 8.0_f64.min(h / 4.0);
+            let ry = crate::scene::cylinder_ry(w, h);
             s.push_str(&format!(
-                "<path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 0 {r:.1} {ty:.1} \
+                "<path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 1 {r:.1} {ty:.1} \
                  L {r:.1} {by:.1} A {rx:.1} {ry:.1} 0 0 1 {l:.1} {by:.1} Z\" {style}/>\n\
-                 <path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 1 {r:.1} {ty:.1}\" \
+                 <path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 0 {r:.1} {ty:.1}\" \
                  fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{sw:.1}\"/>\n",
                 l = l,
                 r = r,
@@ -5670,10 +5673,13 @@ fn render_node(s: &mut String, n: &AdvanceSceneNode, text_color: &str) {
     let lines: Vec<&str> = n.label.split('\n').collect();
     let line_count = lines.len();
     let band_h = label_band_h(&n.label);
-    let label_cy = if n.elements.is_empty() {
-        cy
-    } else {
+    let label_cy = if !n.elements.is_empty() {
         cy - h / 2.0 + band_h / 2.0
+    } else if n.shape == Shape::Cylinder {
+        // In the drum's body, under the lid (as `scene::to_svg`).
+        cy + crate::scene::CYLINDER_LABEL_DROP * crate::scene::cylinder_ry(w, h)
+    } else {
+        cy
     };
     let start_y = if line_count == 1 {
         label_cy
@@ -5824,18 +5830,18 @@ pub fn to_svg_with(sc: &AdvanceScene, opts: &SvgOptions) -> String {
             continue;
         }
         let color = crate::scene::style_attr(e.style.color.as_deref(), &sc.style.edge_color);
-        // An explicit style dash wins over the kind-based dashed style;
-        // otherwise Thick stays solid, Dotted stays dashed.
+        // An explicit style dash wins over the kind-based dotted style
+        // (the flowchart writer's dots, scaled with the stroke);
+        // otherwise Thick stays solid.
+        let sw = advance_edge_width(e);
         let styled_dash = e.style.dash.as_deref().map(escape);
-        let dash = styled_dash.as_deref().or(match e.kind {
-            EdgeKind::Dotted | EdgeKind::DottedOpen => Some("5 4"),
-            _ => None,
-        });
+        let dotted = matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen)
+            .then(|| crate::scene::dotted_dash(sw));
+        let dash = styled_dash.as_deref().or(dotted.as_deref());
         let dash_attr = match dash {
             Some(d) => format!(" stroke-dasharray=\"{}\"", d),
             None => String::new(),
         };
-        let sw = advance_edge_width(e);
         let head_trim = crate::scene::arrow_trim(sw);
         let marker = if e.kind.has_arrow() {
             markers

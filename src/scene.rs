@@ -5118,8 +5118,19 @@ pub(crate) const EDGE_WIDTH_THICK: f64 = 3.5;
 /// Default stroke width of a node's outline — and of the strokes drawn
 /// with it: a cylinder's lid, a subroutine's bars, a final state's ring.
 const NODE_STROKE_WIDTH: f64 = 1.8;
-/// Dash pattern of a dotted (`-.->`) edge.
-const EDGE_DOTTED_DASH: &str = "5 4";
+/// Dash pattern of a dotted (`-.->`) edge stroked `width` px wide:
+/// square dots one stroke width long, a stroke and a half apart — `2 3`
+/// at [`EDGE_WIDTH`]. Mermaid draws `2 2` at its 2 px edge; the slightly
+/// wider gap keeps the line reading as dots rather than as a fainter
+/// solid line, and long dashes (the old `5 4`) read as dashed, which is
+/// what `linkStyle stroke-dasharray` is for. The pattern scales with the
+/// stroke, so a `linkStyle stroke-width` dotted edge stays dotted (a
+/// fixed `2 3` under a 6 px stroke reads as stripes). Shared with the
+/// advance writer.
+pub(crate) fn dotted_dash(width: f64) -> String {
+    let r = |v: f64| (v * 10.0).round() / 10.0;
+    format!("{} {}", r(width), r(width * 1.5))
+}
 /// Size of an end glyph in default edge strokes.
 const ARROW_MARKER_UNITS: f64 = 5.5;
 /// Length and width (px, user space) of every edge end glyph — the
@@ -5156,9 +5167,17 @@ const ROUNDED_RX: f64 = 9.0;
 /// Most inset (px) of a hexagon's side points and of a parallelogram's
 /// slant; a quarter of the width on a narrower node.
 pub(crate) const SLANT_MAX: f64 = 14.0;
-/// Most half height (px) of a cylinder's cap ellipse; a quarter of the
-/// node's height on a shorter one.
-const CYLINDER_RY_MAX: f64 = 8.0;
+/// Half height (px) of a cylinder's cap ellipse as drawn (and picked):
+/// [`crate::layout::cylinder_cap_ry`] for its width, which the layout
+/// sized it for, and at most a quarter of its height (a host-sized node).
+pub(crate) fn cylinder_ry(w: f64, h: f64) -> f64 {
+    crate::layout::cylinder_cap_ry(w).min(h / 4.0)
+}
+/// How far (in cap radii) below the box centre a cylinder's label sits:
+/// in the middle of the body under the lid, where mermaid sets it, not
+/// up against the lid's front rim (the box centre is a cap radius above
+/// the body's).
+pub(crate) const CYLINDER_LABEL_DROP: f64 = 0.75;
 /// How far (px) a flattened arc of [`node_outline`] may bow off its
 /// chords: well under a pixel, so a distance to the polygon is a
 /// distance to the painted curve.
@@ -5227,7 +5246,7 @@ pub(crate) fn node_outline(n: &SceneNode) -> Vec<(f64, f64)> {
         Shape::Cylinder => {
             // The top cap's upper half, the right side, the bottom
             // cap's lower half; the left side closes the polygon.
-            let ry = CYLINDER_RY_MAX.min(h / 4.0);
+            let ry = cylinder_ry(w, h);
             let mut out = Vec::new();
             arc(&mut out, (cx, t + ry), w / 2.0, ry, PI, 2.0 * PI);
             arc(&mut out, (cx, b - ry), w / 2.0, ry, 0.0, PI);
@@ -5699,18 +5718,21 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
     // passing the header strip never strike through the text — each
     // gets a translucent chip, mermaid-style.
     let mut cluster_titles = String::new();
+    // Each nesting depth a step deeper (style::cluster_style), its
+    // border readable on the canvas and on the frame round it (Q6).
     for (ci, c) in sc.clusters.iter().enumerate() {
         let (x, y) = t((c.x, c.y));
+        let cs = crate::style::cluster_style(c.depth);
         s.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"8\" \
-             fill=\"#f7f8fd\" stroke=\"#c9cfe8\" stroke-width=\"1.4\"/>\n",
-            x, y, c.w, c.h
+             fill=\"{}\" stroke=\"{}\" stroke-width=\"1.4\"/>\n",
+            x, y, c.w, c.h, cs.fill, cs.stroke
         ));
         let title = fit_cluster_title(&sc.clusters, ci, maxx + MARGIN);
         let tw = text_width(&title) * TITLE_SCALE;
         cluster_titles.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{}\" rx=\"4\" \
-             fill=\"#f7f8fd\" fill-opacity=\"0.9\"/>\n",
+             fill=\"{}\" fill-opacity=\"0.9\"/>\n",
             x + 6.0,
             y + 5.0,
             tw + 8.0,
@@ -5722,15 +5744,17 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
                 } else {
                     format!("{h:.1}")
                 }
-            }
+            },
+            cs.fill
         ));
         for (k, line) in title.split('\n').enumerate() {
             cluster_titles.push_str(&format!(
                 "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"{}\" font-weight=\"bold\" \
-                 fill=\"#6a7086\">{}</text>\n",
+                 fill=\"{}\">{}</text>\n",
                 x + 10.0,
                 y + 17.0 + k as f64 * TITLE_LINE_H,
                 crate::layout::TITLE_FONT,
+                crate::style::CLUSTER_TITLE,
                 rich(line)
             ));
         }
@@ -5741,15 +5765,15 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
         if !edge_drawn(e) {
             continue; // layout-only link — never drawn
         }
-        let dash =
-            matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen).then_some(EDGE_DOTTED_DASH);
         // `linkStyle` paint overrides the kind's look per property.
         let st = &e.meta.style;
         let sw = edge_stroke_width(e);
+        let dotted =
+            matches!(e.kind, EdgeKind::Dotted | EdgeKind::DottedOpen).then(|| dotted_dash(sw));
         let dash = st
             .stroke_dasharray
             .as_deref()
-            .or(dash)
+            .or(dotted.as_deref())
             .map_or(String::new(), |d| {
                 format!(" stroke-dasharray=\"{}\"", escape(d))
             });
@@ -5842,12 +5866,15 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
             s.push_str(&format!("<g><title>{}</title>\n", escape(&node_title)));
         }
         // Shape theme, overridden by any custom style/classDef colors.
+        // The width applies to the strokes drawn with the outline too:
+        // a cylinder's lid, a subroutine's bars, a final state's ring.
         let ss = crate::style::shape_style(n.shape);
+        let sw = n.style.stroke_width.unwrap_or(NODE_STROKE_WIDTH);
         let style = format!(
             "fill=\"{}\" stroke=\"{}\" stroke-width=\"{}\"",
             style_attr(n.style.fill.as_deref(), ss.fill),
             style_attr(n.style.stroke.as_deref(), ss.stroke),
-            n.style.stroke_width.unwrap_or(NODE_STROKE_WIDTH)
+            sw
         );
         match n.shape {
             Shape::Rect | Shape::Rounded | Shape::Stadium => {
@@ -5899,13 +5926,17 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
             }
             Shape::Cylinder => {
                 let (l, r, t, b) = (cx - w / 2.0, cx + w / 2.0, cy - h / 2.0, cy + h / 2.0);
-                let ry = CYLINDER_RY_MAX.min(h / 4.0); // cap ellipse radius
-                                                       // Body + bottom arc, then the top ellipse on top.
+                let ry = cylinder_ry(w, h); // cap ellipse radius
+                                            // The whole drum, over the lid's back arc, filled and
+                                            // stroked, so the lid is filled like the body (the old
+                                            // body ran under the front arc and left the lid hollow);
+                                            // then the lid's front arc on top, in the node's own
+                                            // stroke and width.
                 s.push_str(&format!(
-                    "<path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 0 {r:.1} {ty:.1} \
+                    "<path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 1 {r:.1} {ty:.1} \
                      L {r:.1} {by:.1} A {rx:.1} {ry:.1} 0 0 1 {l:.1} {by:.1} Z\" {style}/>\n\
-                     <path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 1 {r:.1} {ty:.1}\" \
-                     fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{NODE_STROKE_WIDTH}\"/>\n",
+                     <path d=\"M {l:.1} {ty:.1} A {rx:.1} {ry:.1} 0 0 0 {r:.1} {ty:.1}\" \
+                     fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{sw}\"/>\n",
                     l = l,
                     r = r,
                     ty = t + ry,
@@ -5920,8 +5951,8 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
                 let (l, t) = (cx - w / 2.0, cy - h / 2.0);
                 s.push_str(&format!(
                     "<rect x=\"{l:.1}\" y=\"{t:.1}\" width=\"{w:.1}\" height=\"{h:.1}\" rx=\"3\" {style}/>\n\
-                     <line x1=\"{l1:.1}\" y1=\"{t:.1}\" x2=\"{l1:.1}\" y2=\"{b:.1}\" stroke=\"{stroke}\" stroke-width=\"{NODE_STROKE_WIDTH}\"/>\n\
-                     <line x1=\"{r1:.1}\" y1=\"{t:.1}\" x2=\"{r1:.1}\" y2=\"{b:.1}\" stroke=\"{stroke}\" stroke-width=\"{NODE_STROKE_WIDTH}\"/>\n",
+                     <line x1=\"{l1:.1}\" y1=\"{t:.1}\" x2=\"{l1:.1}\" y2=\"{b:.1}\" stroke=\"{stroke}\" stroke-width=\"{sw}\"/>\n\
+                     <line x1=\"{r1:.1}\" y1=\"{t:.1}\" x2=\"{r1:.1}\" y2=\"{b:.1}\" stroke=\"{stroke}\" stroke-width=\"{sw}\"/>\n",
                     l = l, t = t, w = w, h = h, b = t + h, l1 = l + 8.0, r1 = l + w - 8.0,
                     stroke = style_attr(n.style.stroke.as_deref(), ss.stroke), style = style,
                 ));
@@ -5979,7 +6010,7 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
                 // Outer ring + filled core (UML final-state notation).
                 s.push_str(&format!(
                     "<circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{r:.1}\" fill=\"#ffffff\" \
-                     stroke=\"{stroke}\" stroke-width=\"{NODE_STROKE_WIDTH}\"/>\n\
+                     stroke=\"{stroke}\" stroke-width=\"{sw}\"/>\n\
                      <circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{ri:.1}\" {style}/>\n",
                     r = w / 2.0,
                     ri = w / 2.0 - 4.0,
@@ -5997,10 +6028,16 @@ pub fn to_svg_a11y_with(sc: &Scene, default_title: &str, a11y: &A11y, opts: &Svg
                 ));
             }
         }
+        // A cylinder's label sits in its body, under the lid.
+        let ly = if n.shape == Shape::Cylinder {
+            cy + CYLINDER_LABEL_DROP * cylinder_ry(w, h)
+        } else {
+            cy
+        };
         svg_text_multiline(
             &mut s,
             cx,
-            cy,
+            ly,
             &style_attr(n.style.color.as_deref(), TEXT_COLOR),
             &n.label,
         );
@@ -8822,7 +8859,7 @@ mod tests {
         assert!(p[0].contains("class=\"edge-animation-fast\""), "{svg}");
         assert!(p[1].contains("class=\"edge-animation-slow\""));
         assert!(
-            p[1].contains("stroke-dasharray=\"5 4\""),
+            p[1].contains("stroke-dasharray=\"2 3\""),
             "dotted dash stays"
         );
         assert!(!p[2].contains("class="));
@@ -9125,7 +9162,7 @@ mod tests {
                 Shape::Diamond => n.w * n.h / 2.0,
                 Shape::Hexagon | Shape::Parallelogram | Shape::ParallelogramAlt => (n.w - k) * n.h,
                 Shape::Cylinder => {
-                    let ry = CYLINDER_RY_MAX.min(n.h / 4.0);
+                    let ry = cylinder_ry(n.w, n.h);
                     n.w * (n.h - 2.0 * ry) + pi * (n.w / 2.0) * ry
                 }
                 _ => unreachable!("not in this chart"),
@@ -9169,6 +9206,128 @@ mod tests {
         let dom = root_id(&svg).unwrap();
         assert!(svg.contains(&format!("id=\"{dom}-e1\"")), "{svg}");
         assert!(svg.contains("class=\"edge-animation-fast\""));
+    }
+
+    #[test]
+    fn cylinders_fill_their_lid_centre_their_label_and_take_their_stroke() {
+        // Report Q7. A narrow and a wide drum, one with a style width.
+        let src = "flowchart TD\n  A[(DB)] --> B[(A rather wide database name)]\n  \
+                   C[[Sub]]\n  style B stroke-width:4px\n  style C stroke-width:3px\n";
+        let g = parse(src).unwrap();
+        let sc = scene(&g);
+        let svg = to_svg(&sc);
+        let node = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+        let (a, b) = (node("A"), node("B"));
+        // The lid deepens with the width (mermaid's rx / (2.5 + w / 50),
+        // capped), within the drum's unchanged size.
+        let (ra, rb) = (cylinder_ry(a.w, a.h), cylinder_ry(b.w, b.h));
+        assert!(ra < rb && ra >= 7.0 && rb <= 10.0, "{ra} {rb}");
+        assert_eq!((a.h, b.h), (54.0, 54.0));
+        for (n, ry, sw) in [(a, ra, NODE_STROKE_WIDTH), (b, rb, 4.0)] {
+            let (l, r) = (n.x - n.w / 2.0, n.x + n.w / 2.0);
+            let ty = n.y - n.h / 2.0 + ry;
+            // The drum runs over the lid's back arc (sweep 1), so the lid
+            // is filled; the front arc is stroked on top in the node's
+            // own width (a style width reaches it).
+            let body = format!(
+                "<path d=\"M {l:.1} {ty:.1} A {:.1} {ry:.1} 0 0 1 {r:.1} {ty:.1} ",
+                n.w / 2.0
+            );
+            assert!(svg.contains(&body), "{body}\n{svg}");
+            let lid = format!(
+                "<path d=\"M {l:.1} {ty:.1} A {:.1} {ry:.1} 0 0 0 {r:.1} {ty:.1}\" fill=\"none\" \
+                 stroke=\"{}\" stroke-width=\"{sw}\"/>",
+                n.w / 2.0,
+                crate::style::shape_style(Shape::Cylinder).stroke
+            );
+            assert!(svg.contains(&lid), "{lid}\n{svg}");
+            // The label sits in the body under the lid.
+            let ly = n.y + CYLINDER_LABEL_DROP * ry;
+            assert!(svg.contains(&format!("y=\"{ly:.1}\"")), "{ly}\n{svg}");
+        }
+        // A subroutine's bars take its style width too.
+        let bars = svg
+            .lines()
+            .filter(|l| l.starts_with("<line ") && l.ends_with("stroke-width=\"3\"/>"))
+            .count();
+        assert_eq!(bars, 2, "{svg}");
+        // The advance writer draws the same drum.
+        let adv = crate::advance::render_advance_text_svg("lane l \"L\"\na[(DB)]\n").unwrap();
+        assert!(adv.contains(" 0 0 1 ") && adv.contains(" 0 0 0 "), "{adv}");
+    }
+
+    #[test]
+    fn ends_on_a_cylinders_cap_sit_on_its_arc() {
+        // Report Q7 / §2.5: an end off the middle of a drum's top floated
+        // above the lid's back arc, one under its bottom below the
+        // bottom arc. Fan in and out of a wide drum, both modes.
+        let src = "flowchart TD\n  A --> D[(A rather wide database)]\n  B --> D\n  C --> D\n  \
+                   D --> E\n  D --> F\n  D --> G\n";
+        let g = parse(src).unwrap();
+        let sc = scene(&g);
+        let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let routed = route(&g, &at);
+        for sc in [&sc, &routed] {
+            let d = sc.nodes.iter().find(|n| n.id == "D").unwrap();
+            let outline = node_outline(d);
+            let dist = |p: (f64, f64)| {
+                outline
+                    .windows(2)
+                    .map(|w| point_seg_dist(p.0, p.1, w[0], w[1]))
+                    .fold(f64::INFINITY, f64::min)
+            };
+            let mut off_centre = 0;
+            for e in &sc.edges {
+                let ends = edge_polyline(e);
+                let p = if e.to == "D" {
+                    ends[ends.len() - 1]
+                } else if e.from == "D" {
+                    ends[0]
+                } else {
+                    continue;
+                };
+                assert!(
+                    dist(p) < 0.5,
+                    "{} -> {} ends {:.1} px off D's outline",
+                    e.from,
+                    e.to,
+                    dist(p)
+                );
+                off_centre += usize::from((p.0 - d.x).abs() > 10.0);
+            }
+            assert!(off_centre >= 4, "the fans spread over the caps");
+        }
+    }
+
+    #[test]
+    fn nested_frames_step_by_depth_and_title_chips_take_their_fill() {
+        // Report Q6: every frame looked the same at any depth, its border
+        // 1.55:1 on white. Each depth now takes its own fill and a border
+        // readable on the frame round it; a title's chip takes its
+        // frame's fill, and titles still paint last (never struck).
+        let svg = svg_src(
+            "flowchart TD\n  subgraph A [Outer]\n    subgraph B [Middle]\n      subgraph C [Inner]\n        \
+             x --> y\n      end\n    end\n  end\n  q --> x\n",
+        );
+        for d in 0..3 {
+            let c = crate::style::cluster_style(d);
+            let frame = format!(
+                "rx=\"8\" fill=\"{}\" stroke=\"{}\" stroke-width=\"1.4\"/>",
+                c.fill, c.stroke
+            );
+            assert_eq!(svg.matches(&frame).count(), 1, "depth {d}\n{svg}");
+            let chip = format!("rx=\"4\" fill=\"{}\" fill-opacity=\"0.9\"/>", c.fill);
+            assert_eq!(svg.matches(&chip).count(), 1, "depth {d} chip\n{svg}");
+        }
+        let title = svg.find(">Inner</text>").unwrap();
+        assert!(
+            svg[title..].find("<path").is_none(),
+            "titles paint after the edges"
+        );
+        assert!(svg.contains(&format!(
+            "fill=\"{}\">Outer</text>",
+            crate::style::CLUSTER_TITLE
+        )));
     }
 
     #[test]
@@ -11453,6 +11612,30 @@ mod tests {
     }
 
     #[test]
+    fn dotted_edges_draw_dots_that_scale_with_their_stroke() {
+        // Report Q9: `-.->` reads as dotted — dots one stroke long, a
+        // stroke and a half apart (mermaid: `2 2` at 2 px), not the
+        // long `5 4` dashes that read as dashed.
+        let svg = svg_src(
+            "flowchart LR\nA -.-> B\nC -.- D\nE -.-> F\nG -.-> H\n\
+             linkStyle 2 stroke-width:4px\nlinkStyle 3 stroke-dasharray: 5 5\n",
+        );
+        let p = edge_paths(&svg);
+        assert!(p[0].contains("stroke-dasharray=\"2 3\""), "{svg}");
+        assert!(p[1].contains("stroke-dasharray=\"2 3\""), "{svg}");
+        // A wider stroke keeps the same look, not stripes.
+        assert!(p[2].contains("stroke-dasharray=\"4 6\""), "{svg}");
+        // A user dash still wins.
+        assert!(p[3].contains("stroke-dasharray=\"5 5\""), "{svg}");
+        assert_eq!(dotted_dash(EDGE_WIDTH), "2 3");
+        assert_eq!(dotted_dash(EDGE_WIDTH_THICK), "3.5 5.3");
+        // The advance writer draws the same dots.
+        let adv = crate::advance::render_advance_text_svg("lane l \"L\"\na[A]\nb[B]\na -.-> b\n")
+            .unwrap();
+        assert!(adv.contains("stroke-dasharray=\"2 3\""), "{adv}");
+    }
+
+    #[test]
     fn link_style_dash_and_width_override_the_kind() {
         let svg = svg_src(
             "flowchart LR\nA -.-> B\nC ==> D\nE --> F\nlinkStyle 0 stroke-dasharray:0\n\
@@ -11460,7 +11643,7 @@ mod tests {
         );
         let p = edge_paths(&svg);
         assert!(
-            p[0].contains("stroke-dasharray=\"0\"") && !p[0].contains("stroke-dasharray=\"5 4\"")
+            p[0].contains("stroke-dasharray=\"0\"") && !p[0].contains("stroke-dasharray=\"2 3\"")
         );
         assert!(p[1].contains("stroke-width=\"1\"") && p[1].contains("url(#arrow)"));
         assert!(p[2].contains("stroke-dasharray=\"5 5\""));
@@ -13481,6 +13664,39 @@ mod tests {
     }
 
     #[test]
+    fn a_two_cycle_pulls_its_pair_once_whichever_edge_comes_first() {
+        // Report Q8: a 2-cycle listed its pair twice in Brandes-Köpf's
+        // neighbours when the return edge was written first, so the
+        // median landed on the pair and Service Layer sat level with
+        // Redis Cache instead of on the middle of its fan. Either order
+        // now gives lr's symmetric fans.
+        let lr = include_str!("../examples/lr.mmd");
+        let swapped = "flowchart LR\n  U[User] --> FE(Frontend) --> API{Auth?}\n  \
+                       API -->|ok| SVC[Service Layer]\n  API -.->|denied| ERR[401 Response]\n  \
+                       CACHE([Redis Cache]) --> SVC\n  SVC ==> DB[Database]\n  SVC --> CACHE\n";
+        for src in [lr, swapped] {
+            let sc = scene(&parse(src).unwrap());
+            let y = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap().y;
+            assert!(
+                (y("API") - (y("SVC") + y("ERR")) / 2.0).abs() < 0.5,
+                "Auth? off the middle of its ok/denied fan: {src}"
+            );
+            assert!(
+                (y("SVC") - (y("DB") + y("CACHE")) / 2.0).abs() < 0.5,
+                "Service Layer off the middle of its fan: {src}"
+            );
+            assert!((y("U") - y("API")).abs() < 0.5, "the spine stays straight");
+        }
+        // Parallel forward edges keep their weight: a twin pair runs
+        // straight down its own column (the twin curves are drawn for
+        // that), the third branch beside it.
+        let sc =
+            scene(&parse("flowchart TD\n  A --> B\n  B --> C\n  B --> C\n  B --> D\n").unwrap());
+        let x = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap().x;
+        assert!((x("B") - x("C")).abs() < 0.5);
+    }
+
+    #[test]
     fn a_parallel_label_and_a_loop_keep_off_the_other_lines() {
         // stress (report P0 #13): the `parallel` label clears the
         // unlabelled twin, and the thick A ==> D keeps clear of B's loop.
@@ -14269,7 +14485,7 @@ mod tests {
         // a thick edge shares `#arrow`, sized in user space).
         let svg = svg_src("flowchart LR\nA --> B\nC -.-> D\nE ==> F\nG x--x H\n");
         assert!(!svg.contains("_"), "{svg}");
-        assert!(svg.contains("stroke-dasharray=\"5 4\""));
+        assert!(svg.contains("stroke-dasharray=\"2 3\""));
         assert!(svg.contains("stroke-width=\"3.5\" marker-end=\"url(#arrow)\""));
         assert!(svg.contains("stroke-width=\"2\" marker-end=\"url(#arrow)\""));
         assert_eq!(svg.matches("<marker id=\"arrow\"").count(), 1, "{svg}");
@@ -14433,13 +14649,13 @@ mod tests {
         let svg = svg_src("flowchart LR\n  subgraph s1 [\"`*Italic* title`\"]\n    A\n  end\n");
         assert!(
             svg.contains(
-                "fill=\"#6a7086\"><tspan font-style=\"italic\">Italic</tspan> title</text>"
+                "fill=\"#4a5070\"><tspan font-style=\"italic\">Italic</tspan> title</text>"
             ),
             "{svg}"
         );
         // Plain titles are byte-identical to the old escape().
         let svg = svg_src("flowchart LR\n  subgraph s1 [a & b]\n    A\n  end\n");
-        assert!(svg.contains("fill=\"#6a7086\">a &amp; b</text>"));
+        assert!(svg.contains("fill=\"#4a5070\">a &amp; b</text>"));
     }
 
     // --- issue #61: edge labels must not cover node boxes or each other ---

@@ -676,9 +676,28 @@ fn box_side_in(c: Pt, half: Pt, tip: Pt) -> Pt {
 
 /// Inward unit normal of the side of node `n` that `tip` lands on: the
 /// radius on a round node or state (an end aims at its centre), else
-/// the box side ([`box_side_in`]). `(0, 0)` at a circle's very centre.
-fn side_in(n: &SceneNode, tip: Pt) -> Pt {
+/// the box side ([`box_side_in`]). On a cylinder's curved corner (within
+/// a cap's height of its top or bottom, where an end on the cap or on
+/// the flank is put onto the arc) either adjacent side counts, whichever
+/// `head` (the end's heading into the node) is squarer to. `(0, 0)` at
+/// a circle's very centre.
+fn side_in(n: &SceneNode, tip: Pt, head: Pt) -> Pt {
     match n.shape {
+        Shape::Cylinder => {
+            let ry = crate::scene::cylinder_ry(n.w, n.h);
+            let dy = tip.1 - n.y;
+            if dy.abs() <= n.h / 2.0 - ry {
+                return box_side_in((n.x, n.y), (n.w / 2.0, n.h / 2.0), tip);
+            }
+            let cap = (0.0, -dy.signum());
+            let flank = (-(tip.0 - n.x).signum(), 0.0);
+            let dot = |u: Pt| u.0 * head.0 + u.1 * head.1;
+            if dot(flank) > dot(cap) {
+                flank
+            } else {
+                cap
+            }
+        }
         Shape::Circle | Shape::DoubleCircle | Shape::StateStart | Shape::StateEnd => {
             let (dx, dy) = (n.x - tip.0, n.y - tip.1);
             let l = dx.hypot(dy);
@@ -1622,7 +1641,10 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
             let Some(end) = end else { continue };
             let (tip, head) = edge_end_tangent(me.e, at_start);
             let (gap, normal) = match end {
-                End::Node(v) => (poly_dist(&outlines[v], tip), side_in(&sc.nodes[v], tip)),
+                End::Node(v) => (
+                    poly_dist(&outlines[v], tip),
+                    side_in(&sc.nodes[v], tip, head),
+                ),
                 End::Frame(f) => {
                     let r = frame_rect[f];
                     let poly = [(r.0, r.1), (r.2, r.1), (r.2, r.3), (r.0, r.3)];

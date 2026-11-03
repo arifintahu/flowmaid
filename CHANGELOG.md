@@ -109,6 +109,16 @@ Minor, not patch: several class structs gain public fields (see
   `dense-td` static). `tests/quality.rs` gates them at today's fixture
   values (`DEFECT_BASELINE`, `INK_MEAN_MIN`), to be lowered as the
   defects are fixed. No rendering change.
+- **`classDef default …` styles every flowchart node**, as in mermaid
+  (report Q9). It used to be an ordinary class nobody carried, so the
+  standard way to give a diagram a neutral look did nothing. It is now the
+  bottom layer of every node's style: a node's own classes (`class`,
+  `:::`) and `style` lines still win property by property, as mermaid
+  compiles `default`, then the node's classes. A borderless shape (`text`,
+  braces) takes only its text colour and keeps no box.
+- **`style::cluster_style(depth)`, `style::CLUSTER_STYLES` and
+  `style::CLUSTER_TITLE`**: the subgraph frame colours the SVG uses, for
+  hosts that paint frames from the scene (`SceneCluster::depth`).
 
 ### Changed
 
@@ -467,6 +477,64 @@ Minor, not patch: several class structs gain public fields (see
 - **Tooltips for choices and bars name the state.** A `<<choice>>` now has
   a `<title>` (its id, where it had none), and fork/join bars are titled by
   id (`forked`, `joined`) instead of "fork/join".
+- **Dotted edges read as dotted** (report Q9). `-.->` and `-.-` were drawn
+  with `5 4` dashes, which read as dashed; they are now dots one stroke
+  long a stroke and a half apart — `stroke-dasharray="2 3"` at the 2 px
+  edge (mermaid draws `2 2`). The pattern scales with the stroke, so a
+  `linkStyle … stroke-width:4px` dotted edge keeps the look (`4 6`) instead
+  of turning into stripes; a `linkStyle` / `classDef` `stroke-dasharray`
+  still wins. The advance writer draws the same dots.
+- **Sibling edge labels keep 20 px apart** (report Q14). The labels of
+  edges out of one node (or into one) whose other ends sit side by side —
+  a decision's `valid` / `invalid` — could sit 4 px apart and read as one
+  phrase ("valid invalid"). The label stage now keeps such siblings
+  20 px apart, side by side or stacked, as a `<<choice>>`'s fan already
+  kept them, in
+  `scene()`, `route()` and `route_partial()` alike, sliding a label along
+  its line or stepping it just beside it as for any other obstacle; the
+  layout is unchanged. A `<<choice>>`'s fan keeps its own rows, and in a
+  busy hub this ranks with the other soft obstacles (a label still never
+  covers a node, a head or another label to get it), so a dozen labels
+  out of one node can still sit closer.
+- **Cylinders read as drums** (report Q7). The lid is filled like the
+  body (the drum used to run under the lid's front arc, so the canvas
+  showed through the lid), its depth follows the width as in mermaid
+  (`rx / (2.5 + w / 50)`: 7.5 px on the narrowest drum, up to 10 px from
+  about 80 px wide; it was a fixed 8 px) and the label sits in the body
+  under the lid (0.75 of the lid's depth below the box centre) instead
+  of up against its rim. Node sizes are unchanged. A `style` /
+  `classDef` `stroke-width` now reaches the lid's front arc and a
+  subroutine's bars (and a final state's ring), which kept the default
+  width. An edge end on a cylinder's top or bottom now meets the drum's
+  arc instead of the box side, in `scene()`, `route()` and every drag
+  frame (it floated up to 4 px above the lid's back arc, or below the
+  bottom arc, off the middle). The advance writer draws the same drum.
+- **Nested subgraph frames read apart, and their borders read at all**
+  (report Q6). Every frame used to be the same `#f7f8fd` with a `#c9cfe8`
+  border, 1.55:1 on the white canvas, so nesting was hard to see and edges
+  ended on barely visible lines. Each nesting depth now takes a cool grey a
+  step deeper (four steps, then the deepest), with a border at least 3:1
+  on the canvas, on the frame round it and on its own fill; a title's chip
+  takes its frame's fill and the title ink is `#4a5070` (5.7:1 or better
+  on every depth; `#6a7086` fell under 4.5:1 on a nested frame). State
+  diagram composites draw the same way. Layout and titles' placement are
+  unchanged; titles still paint after the edges, never struck.
+- **Crossing gaps no longer make a line look broken** (report Q15,
+  §2.10). Which line of a crossing goes under was chosen crossing by
+  crossing to keep gaps sparse, so a line crossing two others a few px
+  apart could go under the first and over the second — a gap, a stroke
+  and the other line's gap in a row, which reads as a break (fanout's
+  loop-back did, 14 px apart). Crossings on one line closer than 25 px
+  are now one cluster, and the line takes one role across it — the role
+  most of them already gave it (a tie: under for a back-edge, else over,
+  so the line stays whole) — wherever that chains no gaps into a dashed
+  look and piles no line with more gaps than the busiest already had
+  (quality fixtures: 109 | 138 such flips static | routed -> 76 | 99,
+  dense-lr 6 -> 1, dense-td 13 -> 2; the rest sit on bench-75's busiest
+  bands). A line shorter than three dash periods (180 px) now also hands
+  its extra gaps to the longer lines crossing it where that dashes
+  nothing, so a short edge under two long sweeps is cut once, not twice
+  (a back-edge keeps its gaps, going under by preference).
 - **Breaking** (needs a **minor** bump). Nothing public is removed or
   renamed, and every function keeps its signature. What breaks, and how to
   migrate:
@@ -682,6 +750,14 @@ Minor, not patch: several class structs gain public fields (see
   sizes tags, which are a size smaller. `pie::slice_color` matches
   `style::accent(i)` for slices 0–7 and again for 16–23, not only for the
   first eight as its doc (and the 0.33.0 notes) said.
+- **A 2-cycle no longer pulls its node off the middle of its fan** (report
+  Q8). With the return edge written first (`CACHE --> SVC` before
+  `SVC --> CACHE`), the pair was linked twice in Brandes-Köpf's neighbour
+  lists, so the median landed on it and `lr`'s Service Layer sat level with
+  Redis Cache instead of centred on Database / Redis. A 2-cycle now counts
+  once whichever edge comes first, so either order draws the same
+  symmetric fans. Parallel forward edges still count once each: a twin
+  pair runs straight down its own column, as its curves are drawn for.
 
 ## [0.33.0] - 2026-10-31
 

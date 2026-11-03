@@ -322,6 +322,7 @@ pub(crate) fn finish_fixed(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool]
     // side's ends in the order their paths now head (G9).
     crate::router::nudge(g, sc, &cx, mode, &mut moved);
     glyph_stubs(sc, &cx, &mut moved);
+    cap_ends(sc, &cx);
     let budget = match mode {
         Mode::Static => crate::labels::LABEL_STATIC_WORK,
         Mode::Routed => crate::labels::LABEL_ROUTE_WORK,
@@ -427,6 +428,95 @@ fn glyph_stubs(sc: &mut Scene, cx: &Ctx, moved: &mut [bool]) {
         }
     }
 }
+
+/// Put every end on a cylinder onto its outline as painted (report Q7,
+/// §2.5). The stages above meet a cylinder as its box: an end off the
+/// middle of its top floats above the lid's back arc, one under its
+/// bottom hangs below the bottom arc, by `ry (1 − √(1 − (dx / rx)²))`,
+/// and one on a flank within a cap's height of the top or bottom floats
+/// beside the arc where the side curves in — up to 4 px under the old
+/// fixed 8 px lid, more under a wide drum's deeper one
+/// ([`crate::scene::cylinder_ry`]). Such an end moves onto the arc (a
+/// cap end along its side's normal, a flank end to the arc's nearest
+/// point), the stroke coming in with it: a waypoint path's
+/// end point (the stub into the side stays straight, [`glyph_stubs`]
+/// runs first), a single curve's end along its tangent, and the chord's
+/// end in `bezier`. Geometry, not paint, so hosts drawing the
+/// scene, picking and the SVG agree, in `scene()`, `route()` and every
+/// drag frame alike. Idempotent: an end on the arc is off the box side
+/// (or, at the arc's middle, on both).
+fn cap_ends(sc: &mut Scene, cx: &Ctx) {
+    for i in 0..sc.edges.len() {
+        let (Some((from, to)), true) = (cx.ends[i], cx.drawn[i]) else {
+            continue;
+        };
+        for (end, at_start) in [(from, true), (to, false)] {
+            let EndRef::Node(v) = end else { continue };
+            let n = &sc.nodes[v];
+            if n.shape != crate::model::Shape::Cylinder {
+                continue;
+            }
+            let e = &sc.edges[i];
+            let p = match (e.waypoints.is_empty(), at_start) {
+                (false, true) => e.waypoints[0],
+                (false, false) => e.waypoints[e.waypoints.len() - 1],
+                (true, true) => e.bezier[0],
+                (true, false) => e.bezier[3],
+            };
+            let Some(d) = cap_shift(n, p) else { continue };
+            let e = &mut sc.edges[i];
+            let shift = |q: &mut Pt| *q = (q.0 + d.0, q.1 + d.1);
+            if e.waypoints.is_empty() {
+                // The end slides along its tangent (the side's normal),
+                // so its control stays: the curve keeps its course, only
+                // its end lengthens or shortens. A control on the end
+                // itself (a straight chord) goes with it.
+                let (a, b) = if at_start { (0, 1) } else { (3, 2) };
+                if e.bezier[b] == e.bezier[a] {
+                    shift(&mut e.bezier[b]);
+                }
+                shift(&mut e.bezier[a]);
+            } else {
+                let k = if at_start { 0 } else { e.waypoints.len() - 1 };
+                shift(&mut e.waypoints[k]);
+                let a = if at_start { 0 } else { 3 };
+                e.bezier[a] = e.waypoints[k];
+            }
+            // Not `moved`: the end slides a few px along its own line,
+            // which leaves the label stage nothing to re-place (and a
+            // drag frame no label search per drum end).
+        }
+    }
+}
+
+/// How far (px) end point `p` on cylinder `n`'s box moves to reach the
+/// drum's outline: down (or up) onto the lid (or the bottom arc) from
+/// the box top (or bottom), onto the nearest point of the arc from a
+/// flank within a cap's height of the top or bottom. `None` for an end
+/// off the box ([`CAP_ON_SIDE`]), on a flank's straight run, or on the
+/// outline already.
+fn cap_shift(n: &crate::scene::SceneNode, p: Pt) -> Option<Pt> {
+    let (rx, ry) = (n.w / 2.0, crate::scene::cylinder_ry(n.w, n.h));
+    if !(rx > 0.0 && ry > 0.0) {
+        return None;
+    }
+    let (dx, (top, bottom)) = (p.0 - n.x, (n.y - n.h / 2.0, n.y + n.h / 2.0));
+    // Inset of an ellipse quadrant `k` (0 at its axis, 1 at its rim)
+    // across its radius `r`.
+    let inset = |k: f64, r: f64| r * (1.0 - (1.0 - k * k).max(0.0).sqrt());
+    let d: Pt = if dx.abs() < rx && (p.1 - top).abs() <= CAP_ON_SIDE {
+        (0.0, top + inset(dx / rx, ry) - p.1)
+    } else if dx.abs() < rx && (p.1 - bottom).abs() <= CAP_ON_SIDE {
+        (0.0, bottom - inset(dx / rx, ry) - p.1)
+    } else {
+        return None;
+    };
+    (d.0.abs() + d.1.abs() > 1e-9).then_some(d)
+}
+
+/// How near (px) a cylinder's box side an end must lie for [`cap_ends`]
+/// to put it on the outline: the stages put an end exactly on the side.
+const CAP_ON_SIDE: f64 = 0.5;
 
 /// Whether edge `i` drawn through the stubbed waypoints `new`
 /// ([`glyph_stubs`]) stays as clear of the scene as it was: where its

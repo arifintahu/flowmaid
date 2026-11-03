@@ -275,8 +275,13 @@ mod tests {
             "the nested box's title"
         );
         // One frame per subgraph, the nested one inside its parent.
-        let frames = svg.matches("fill=\"#f7f8fd\" stroke=\"#c9cfe8\"").count();
-        assert_eq!(frames, 3, "3 cluster rects for 3 subgraphs");
+        let frame = |d: usize| {
+            let c = crate::style::cluster_style(d);
+            svg.matches(&format!("fill=\"{}\" stroke=\"{}\"", c.fill, c.stroke))
+                .count()
+        };
+        assert_eq!(frame(0) + frame(1), 3, "3 cluster rects for 3 subgraphs");
+        assert_eq!(frame(1), 1, "the nested one a step deeper");
 
         // Interactive path stays consistent: route() over the auto
         // positions yields the same node/edge/cluster counts.
