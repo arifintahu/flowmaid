@@ -225,10 +225,15 @@ Minor, not patch: several class structs gain public fields (see
   drag). `route()` draws a loop on the side `scene()` does — in LR / RL
   below its node, not on the screen's right, where its node's edges
   leave (x6: a loop hidden under three parallel edges) — and a drag that
-  crowds that side moves it to the free one.
+  crowds that side moves it to the free one. A node's loops stack 16 px
+  apart along its side, labelled or not (their labels sit past their
+  apexes), each starting and ending on the border: a stack longer than
+  the side (three loops on a 38 px box overhung it by 5 px) is squeezed
+  evenly onto it, in order, short of its corners.
 - **A labelled parallel edge keeps its label off its twin** (report
   P0 #13): in TD / BT, parallel edges next to a labelled one leave
-  half the label's width plus 15 px between their lines (a 16 px gap put
+  half the label's width plus 15 px between their lines (self-loops
+  excepted: they stack along their node's side; a 16 px gap put
   stress's `parallel` label on the unlabelled edge), and a label both
   lines touch counts as the one whose line runs nearer its centre — an
   unlabelled line only: a labelled one carries its own label, so a
@@ -237,6 +242,22 @@ Minor, not patch: several class structs gain public fields (see
   In LR / RL a gap holding a label on an edge of a node a lane leaves
   or enters by a leg across that gap widens to keep the legs clear
   (x6-rl-loops: `forward` and `parallel` lay over two lanes' legs).
+- **Class and ER diagrams follow the same back-edge, 2-cycle, parallel
+  label and loop rules**, as they ride the flowchart layout and scene:
+  a relation against the flow of a cyclic diagram comes as a lane the
+  class layout keeps orthogonal, a 2-cycle's two lines and labels stand
+  apart (ER `works in` / `employs` no longer read as one band), a TB / BT
+  class's labelled parallel relations leave room for their labels
+  between their lines, a class's self-relations keep their room beside
+  it (nine self-relations on one class ran into both its neighbours), and fewer
+  relations are left on their curves (399 -> 346 over the class test
+  inputs, 456 -> 385 in `route()`). A dense cyclic diagram can grow:
+  seven classes each related both ways to every other are 1473 px wide
+  (was 1027). There, a routed relation whose end moved used to slide a
+  leg along the square exit of another class's last end on that face,
+  which then had no way out and kept its curve — a sweep across the
+  drawing's orthogonal lines; such a slide is now refused and the relation
+  stays as routed.
 
 - **One arrowhead size for every flowchart edge, sharper and square onto
   the node** (report §2.3, Q1 + M1). Every end glyph — the arrowhead at

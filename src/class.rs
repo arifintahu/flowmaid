@@ -1530,8 +1530,32 @@ fn ortho_pass(
     let mut moved = spread_faces(&faces, &rects, decos, soft);
     // A routed edge whose end moved slides its final leg along with it
     // (the leg before stretches to meet it) — unless a leg would then
-    // cross a box or run along another routed edge: such an edge stays
-    // as routed, and its faces spread again around it.
+    // cross a box, run along another routed edge or along the square
+    // exit of a free end spread on a shared face (`exits`): such an
+    // edge stays as routed, and its faces spread again around it. (A
+    // slid leg beside an end's exit leaves that end no way out: in
+    // a10_k7, N4 -> N1's leg slid up under N2's last bottom end, and
+    // N2 -> N6 kept its curve, a sweep across the drawing.)
+    // Each such free end: (edge, at start), where it sat before the
+    // spread, and its face's outward normal.
+    type FreeEnd = ((usize, bool), (f64, f64), (f64, f64));
+    let mut free_ends: Vec<FreeEnd> = Vec::new();
+    for (&(_, key), ends) in faces.iter().filter(|(_, ends)| ends.len() >= 2) {
+        let n = (f64::from(key.0), f64::from(key.1));
+        for &(j, start, _, _) in ends.iter().filter(|end| free(&edges[end.0])) {
+            let (a, b) = edge_ends(&edges[j]);
+            free_ends.push(((j, start), if start { a } else { b }, n));
+        }
+    }
+    let exits = |moved: &Moved| -> Vec<Run> {
+        free_ends
+            .iter()
+            .map(|&(end, p, n)| {
+                let p = moved.get(&end).copied().unwrap_or(p);
+                Run::of(p, (p.0 + n.0 * ORTHO_STUB, p.1 + n.1 * ORTHO_STUB))
+            })
+            .collect()
+    };
     let routed_runs: Vec<(usize, Run)> = edges
         .iter()
         .enumerate()
@@ -1556,6 +1580,13 @@ fn ortho_pass(
             }
         }
         let n = c.len();
+        let exits = exits(moved);
+        let apart = |q: &Run, r: &Run| {
+            q.vertical != r.vertical
+                || (q.c - r.c).abs() >= ORTHO_SEP
+                || q.h <= r.l + 2.0
+                || r.h <= q.l + 2.0
+        };
         let clear = c.windows(2).enumerate().all(|(k, s)| {
             let off_boxes = rects.iter().enumerate().all(|(b, &r)| {
                 let r = if b == ia || b == ib {
@@ -1570,13 +1601,8 @@ fn ortho_pass(
             let r = Run::of(s[0], s[1]);
             off_boxes
                 && (!moved_leg
-                    || routed_runs.iter().all(|&(o, q)| {
-                        o == j
-                            || q.vertical != r.vertical
-                            || (q.c - r.c).abs() >= ORTHO_SEP
-                            || q.h <= r.l + 2.0
-                            || r.h <= q.l + 2.0
-                    }))
+                    || (routed_runs.iter().all(|(o, q)| *o == j || apart(q, &r))
+                        && exits.iter().all(|q| apart(q, &r))))
         });
         clear.then_some(c)
     };
@@ -4561,6 +4587,35 @@ mod tests {
                     assert!(!rects_meet(*ra, *rb), "labels {a} and {b} overlap");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_slid_leg_never_runs_along_a_free_ends_exit() {
+        // B3 review r5 #2 (a10_k7_TB, seven classes each related to
+        // every other): N4 -> N1's routed leg slid with its moved end up
+        // under N2's last bottom end, a px beside its square exit, so
+        // N2 -> N6 found no way out and kept its curve — a sweep across
+        // the drawing's orthogonal lines. The slide is now refused there
+        // (the routed edge stays as routed), and every relation is
+        // orthogonal.
+        const RELS: [&str; 7] = ["<|--", "*--", "o--", "-->", "..>", "..|>", "--"];
+        let mut src = String::from("classDiagram\ndirection TB\n");
+        let mut k = 0;
+        for i in 0..7 {
+            for j in (0..7).filter(|&j| j != i) {
+                let rel = RELS[k % 7];
+                src.push_str(&format!("N{i} \"{i}\" {rel} \"{j}\" N{j} : e{k}\n"));
+                k += 1;
+            }
+        }
+        let cs = scene(&cd(&src));
+        for e in &cs.scene.edges {
+            let square = e.waypoints.len() >= 2
+                && e.waypoints
+                    .windows(2)
+                    .all(|w| (w[0].0 - w[1].0).abs() < 0.5 || (w[0].1 - w[1].1).abs() < 0.5);
+            assert!(square, "{} -> {} keeps its curve", e.from, e.to);
         }
     }
 
