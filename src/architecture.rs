@@ -2946,13 +2946,15 @@ pub(crate) fn to_svg_a11y_with(as_: &ArchScene, a11y: &A11y, opts: &SvgOptions) 
                 crate::scene::style_attr(n.style.stroke.as_deref(), EDGE_COLOR),
             )
         };
+        // The corner `Scene::hit_test` picks a `Rounded` node by.
         s.push_str(&format!(
             "<rect x='{:.1}' y='{:.1}' width='{:.1}' height='{:.1}' \
-             rx='8' fill='{}' stroke='{}' stroke-width='{:.1}'/>\n",
+             rx='{}' fill='{}' stroke='{}' stroke-width='{:.1}'/>\n",
             n.x - n.w / 2.0,
             n.y - n.h / 2.0,
             n.w,
             n.h,
+            crate::scene::ROUNDED_RX,
             fill,
             stroke,
             n.style.stroke_width.unwrap_or(2.0)
@@ -4150,6 +4152,18 @@ mod tests {
             sc.hit_test(svc.x, svc.y, 4.0),
             Some(crate::scene::Hit::Node(3))
         ));
+        // A card picks by the corner it is painted with: just inside its
+        // corner arc is the card, just outside is not (it was painted
+        // with an 8 px corner, picked by a 9 px one).
+        let svg = to_svg(&scene(&arch(CORPUS)));
+        let rx = crate::scene::ROUNDED_RX;
+        assert!(svg.contains(&format!("rx='{rx}' fill='#ffffff'")), "{svg}");
+        let (cx, cy) = (svc.x - svc.w / 2.0 + rx, svc.y - svc.h / 2.0 + rx);
+        let d = std::f64::consts::FRAC_1_SQRT_2;
+        for (r, picked) in [(rx - 0.2, true), (rx + 0.2, false)] {
+            let (x, y) = (cx - r * d, cy - r * d);
+            assert_eq!(sc.node_at(x, y).is_some(), picked, "{r}");
+        }
     }
 
     #[test]

@@ -5240,8 +5240,9 @@ pub(crate) const GLYPH_STUB: f64 = ARROW_MARKER_PX;
 /// Corner radius (px) `to_svg` paints a plain box with: `Rect`,
 /// `Subroutine` and a fork/join bar.
 const BOX_RX: f64 = 3.0;
-/// Corner radius (px) of a `Rounded` node.
-const ROUNDED_RX: f64 = 9.0;
+/// Corner radius (px) of a `Rounded` node, as every painter draws it
+/// (an architecture service card too) and [`Scene::hit_test`] picks it.
+pub(crate) const ROUNDED_RX: f64 = 9.0;
 /// Most inset (px) of a hexagon's side points and of a parallelogram's
 /// slant; a quarter of the width on a narrower node.
 pub(crate) const SLANT_MAX: f64 = 14.0;

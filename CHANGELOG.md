@@ -678,6 +678,8 @@ Minor, not patch: several class structs gain public fields (see
   `hit_test` now pick hexagons, parallelograms, cylinders, stadiums and
   rounded boxes by the outline those ends sit on (their empty box
   corners are no longer the node); plain boxes still pick by their box.
+  Architecture service cards, picked as rounded boxes, are painted with
+  the same 9 px corner (it was 8 px).
   `quality::Metrics::end_gaps` counts self-loop ends too. The advance
   writer is unchanged.
 - **A `%%{ … }%%` directive written over several lines parses.** Its inner
