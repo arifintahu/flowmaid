@@ -11,11 +11,11 @@ A small Mermaid-like diagram engine written in pure std Rust with zero external 
 
 ## flowmaid next to mermaid
 
-The same `.mmd` source rendered by mermaid 12.2.0 (left, in headless Chromium) and by flowmaid 0.34.0 (right, `flowmaid file.mmd`). flowmaid keeps its own semantic palette by default; mermaid's look is one `--theme default` away (see [Themes](#themes)).
+The same `.mmd` source rendered by mermaid 12.2.0 (left, in headless Chromium) and by flowmaid 0.35.0 (right, `flowmaid file.mmd`). flowmaid keeps its own semantic palette by default; mermaid's look is one `--theme default` away (see [Themes](#themes)).
 
 **Flowchart with subgraphs, a decision and a back-edge**
 
-![advanced flowchart: mermaid 12.2.0 vs flowmaid 0.34.0](docs/img/compare/advanced.png)
+![advanced flowchart: mermaid 12.2.0 vs flowmaid 0.35.0](docs/img/compare/advanced.png)
 
 **Loop back to an earlier step**
 
@@ -106,7 +106,7 @@ Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-flowmaid = "0.34"
+flowmaid = "0.35"
 ```
 
 ## Usage
@@ -522,9 +522,9 @@ flowmaid spends its time on drawing quality — crossing-aware routing, back-edg
 
 | nodes | edges | parse | layout | render* | SVG |
 |------:|------:|------:|-------:|--------:|----:|
-| 49 | 100 | 0.15 ms | 1.3 ms | 26 ms | 82 KB |
-| 200 | 400 | 0.57 ms | 26 ms | 0.20 s | 659 KB |
-| 1,000 | 2,010 | 3.9 ms | 2.0 s | 3.3 s | 7.7 MB |
+| 49 | 100 | 0.15 ms | 1.5 ms | 35 ms | 82 KB |
+| 200 | 400 | 1.1 ms | 32 ms | 0.21 s | 659 KB |
+| 1,000 | 2,010 | 2.9 ms | 1.0 s | 2.5 s | 6.6 MB |
 
 \* render includes layout and routing.
 
