@@ -7,10 +7,113 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Class and state diagrams were reworked to read at least as well as
-mermaid's, keeping flowmaid's interactive scene API and portable SVG.
-Minor, not patch: several class structs gain public fields (see
-**Breaking** under Changed).
+### Changed
+
+- **A subgraph's edge-less members sit in its first row** (report §2.9,
+  B8 review r1). A member with no edges (or a chain only the subgraph's
+  own members join) used to land on the drawing's first layer, beside
+  whatever feeds the drawing: a hub that reaches a subgraph through one
+  of its members sat level with that subgraph's other members, and its
+  edges to the next layer struck through the frame. Such a member now
+  starts on the subgraph's first row — the top layer of its members that
+  link out of it — as mermaid draws it; inside a nested subgraph it keeps
+  its place when its outermost subgraph already starts on that row. A
+  subgraph nothing links out of keeps its place. Over 600 generated
+  hub-and-subgraphs drawings, edges cutting through frames fall 71 % and
+  defects 64 %; the corpus and fixture drawings are unchanged.
+- **Narrowing a broad flowchart never grows it** (report M11). A drawing
+  broader than 2.5 : 1 (it was 4 : 1; class diagrams ride the same
+  layout) is narrowed by stacking a subgraph below its sibling, folding
+  three or more siblings that share a layer into two runs, pulling
+  sources down beside their targets, or staggering leaves into two rows
+  — but every step is now kept only when it adds at
+  most 2 % to the drawing's area and 10 % to its total edge length, and a
+  stacking or fold at most 15 % to the edge length along the flow (the
+  detour past the sibling). Leaf staggering and source pulling are held
+  to the area and length limits too, so some leaf fans now stay one row
+  where a staggered second row would have grown them (a random leaf
+  fan keeps 2 052 x 276 px where it was staggered to 1 283 x 459, its
+  crossings 14 -> 8; over 120 random fans defects and crossings fall
+  slightly). A step may cut more edges across boxes than before only
+  where it saves more crossings than that. A hub feeding six frames of
+  different heights (`fanout-frames`) keeps them in one column, as
+  mermaid draws it (its third frame used to step into a second column,
+  9.7 % more area). A fold rarely passes: its later run's edges thread
+  past the earlier run's frames, which the flow limit refuses for frames
+  deep along the flow (3 of some 1 800 generated and corpus flowcharts
+  fold); it wins for a TB row of shallow frames and leaves under one hub,
+  a 4.9 : 1 ribbon folded into two rows.
+- **Moving a node's declaration line barely moves the drawing** (report
+  §2.9, P1). Moving `n45`'s line in the dense TD fixture to any other
+  top-level line used to swing its width 4 155 – 5 740 px, a third either
+  way of the old 4 : 1 entry to narrowing and of a stacking refused for
+  its node hits; it now stays within 4 249 – 4 492 px (+5.7 %). The
+  cycle breakers no longer follow the order the edge lines happen to be
+  written in alone: of a walk in source order and one in the order the
+  targets were declared, the one reversing fewer edges wins (source
+  order on a tie). Shuffling bench-75's edge lines used to lay it out
+  1 772 – 2 129 px along the flow with 56 – 68 of its 75 edges pointing
+  along it; now 1 772 – 1 906 px with 66 – 68. No corpus drawing
+  changes; the 13 of some 1 800 generated flowcharts that do lose most
+  of their defects, and 15 of 964 generated state diagrams change (the
+  nested composites of the `nested-composite` note fixture now read
+  left to right, in the order their transitions run).
+
+### Fixed
+
+- **`route()` scores candidate paths faster** (drag speed): a path
+  segment whose bounding box misses a node, frame, title chip or label is
+  skipped before the clipping arithmetic. The routes are byte-identical;
+  a full `route()` of the dense fixtures runs 6-9 % fewer instructions
+  (dense-td, dense-lr), bench-75 2 %.
+
+## [0.34.0] - 2026-11-04
+
+### Highlights
+
+A large visual release for flowcharts, plus reworked class and state
+diagrams, keeping flowmaid's interactive scene API and portable SVG.
+Nothing public is removed or renamed and every function keeps its
+signature, but a few structs gain fields (see **Breaking** under Changed),
+so this is a minor bump. The detailed notes follow the highlights.
+
+- **Arrowheads.** One 11 px head for every flowchart edge, thick `==>`
+  included. The tip sits exactly on the node border, square to the side,
+  and very wide `linkStyle` strokes grow their head.
+- **Back-edges run in orthogonal lanes** beside the drawing, as in
+  mermaid, and the same in `scene()` and while dragging. 2-cycles,
+  self-loops (several labelled loops too) and edges inside their own
+  subgraph are handled.
+- **Subgraphs and canvas.** Nested subgraphs keep their nodes, frames are
+  tinted by depth with borders of at least 3:1, the canvas fits the
+  drawing with even margins, and nothing drawn is cut off.
+- **Labels and ports.** A labelled gap leaves room for the label and both
+  heads. A lone end is centred on its side, a fan spreads as an even comb,
+  sibling labels keep 20 px apart, and there is no dead strip under a
+  subgraph's first row.
+- **Shapes.** Edge ends touch every shape's real outline (hexagon,
+  cylinder, parallelogram, circle and the rest). Cylinders read as drums.
+  Long node labels wrap (200 px by default, `wrappingWidth`), and diamonds
+  stay no flatter than 1.6:1.
+- **Themes.** mermaid's `default`, `neutral`, `dark` and `forest` are
+  options through `%%{init}%%`, frontmatter, `SvgOptions::theme` or
+  `--theme`. The semantic palette stays the default, byte for byte.
+- **Styling.** `classDef default` styles every node, dotted edges are drawn
+  as dots, and a `%%{ … }%%` directive written over several lines parses.
+- **Class diagrams.** Notes, stereotypes, generics, `direction`, static and
+  abstract members, two-way relations and lollipop interfaces; top-down
+  hierarchies with orthogonal, rounded edges.
+- **State diagrams.** Notes, a compact `<<choice>>` diamond, and fork/join
+  bars that span their branches.
+- **Interactive API kept, and faster.** Picking follows the painted stroke
+  and `hit_test` is about 4.5× faster. A 1 px drag leaves unrelated fans
+  alone, and routing stays finite for any node size. `scene`, `route`,
+  `route_partial`, `hit_test` and `to_mermaid` keep their signatures.
+- **Deeply nested JSON is an error, not a crash.** Advance JSON nested
+  deeper than 128 levels returns an error instead of overflowing the
+  stack (#77, #78).
+- **Quality and tooling.** New defect metrics in the quality harness with
+  ratchets, and a per-file benchmark (`bench -- files`).
 
 ### Added
 
@@ -165,55 +268,6 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Changed
 
-- **A subgraph's edge-less members sit in its first row** (report §2.9,
-  B8 review r1). A member with no edges (or a chain only the subgraph's
-  own members join) used to land on the drawing's first layer, beside
-  whatever feeds the drawing: a hub that reaches a subgraph through one
-  of its members sat level with that subgraph's other members, and its
-  edges to the next layer struck through the frame. Such a member now
-  starts on the subgraph's first row — the top layer of its members that
-  link out of it — as mermaid draws it; inside a nested subgraph it keeps
-  its place when its outermost subgraph already starts on that row. A
-  subgraph nothing links out of keeps its place. Over 600 generated
-  hub-and-subgraphs drawings, edges cutting through frames fall 71 % and
-  defects 64 %; the corpus and fixture drawings are unchanged.
-- **Narrowing a broad flowchart never grows it** (report M11). A drawing
-  broader than 2.5 : 1 (it was 4 : 1; class diagrams ride the same
-  layout) is narrowed by stacking a subgraph below its sibling, folding
-  three or more siblings that share a layer into two runs, pulling
-  sources down beside their targets, or staggering leaves into two rows
-  — but every step is now kept only when it adds at
-  most 2 % to the drawing's area and 10 % to its total edge length, and a
-  stacking or fold at most 15 % to the edge length along the flow (the
-  detour past the sibling). Leaf staggering and source pulling are held
-  to the area and length limits too, so some leaf fans now stay one row
-  where a staggered second row would have grown them (a random leaf
-  fan keeps 2 052 x 276 px where it was staggered to 1 283 x 459, its
-  crossings 14 -> 8; over 120 random fans defects and crossings fall
-  slightly). A step may cut more edges across boxes than before only
-  where it saves more crossings than that. A hub feeding six frames of
-  different heights (`fanout-frames`) keeps them in one column, as
-  mermaid draws it (its third frame used to step into a second column,
-  9.7 % more area). A fold rarely passes: its later run's edges thread
-  past the earlier run's frames, which the flow limit refuses for frames
-  deep along the flow (3 of some 1 800 generated and corpus flowcharts
-  fold); it wins for a TB row of shallow frames and leaves under one hub,
-  a 4.9 : 1 ribbon folded into two rows.
-- **Moving a node's declaration line barely moves the drawing** (report
-  §2.9, P1). Moving `n45`'s line in the dense TD fixture to any other
-  top-level line used to swing its width 4 155 – 5 740 px, a third either
-  way of the old 4 : 1 entry to narrowing and of a stacking refused for
-  its node hits; it now stays within 4 249 – 4 492 px (+5.7 %). The
-  cycle breakers no longer follow the order the edge lines happen to be
-  written in alone: of a walk in source order and one in the order the
-  targets were declared, the one reversing fewer edges wins (source
-  order on a tie). Shuffling bench-75's edge lines used to lay it out
-  1 772 – 2 129 px along the flow with 56 – 68 of its 75 edges pointing
-  along it; now 1 772 – 1 906 px with 66 – 68. No corpus drawing
-  changes; the 13 of some 1 800 generated flowcharts that do lose most
-  of their defects, and 15 of 964 generated state diagrams change (the
-  nested composites of the `nested-composite` note fixture now read
-  left to right, in the order their transitions run).
 - **Labelled gaps keep their labels off the arrowhead; ends meet their
   sides in the middle** (report M3, §2.4, §2.6). In a flowchart or state
   diagram a gap between adjacent layers that carries an edge label grows
@@ -840,11 +894,15 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Fixed
 
-- **`route()` scores candidate paths faster** (drag speed): a path
-  segment whose bounding box misses a node, frame, title chip or label is
-  skipped before the clipping arithmetic. The routes are byte-identical;
-  a full `route()` of the dense fixtures runs 6-9 % fewer instructions
-  (dense-td, dense-lr), bench-75 2 %.
+- **Deeply nested advance JSON no longer crashes the process** (#77, #78,
+  contributed by arifintahu). The JSON reader recursed once per array or
+  object level with no limit, so about 40 KB of nested brackets overflowed
+  the stack and aborted the process (in wasm the module traps); a stack
+  overflow cannot be caught, so any host feeding untrusted JSON to the
+  advance renderer could be crashed. Nesting deeper than 128 levels now
+  returns `advance error — JSON nested too deeply (more than 128 levels)`,
+  in line with the mermaid parser (500 levels) and the advance text DSL
+  (16).
 
 - **Edge ends touch every shape's outline** (report M6, P0 #9). The edge
   stages met a parallelogram, a trapezoid (drawn as one), a hexagon and a
