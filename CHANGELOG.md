@@ -49,6 +49,9 @@ so this is a minor bump. The detailed notes follow the highlights.
   and `hit_test` is about 4.5× faster. A 1 px drag leaves unrelated fans
   alone, and routing stays finite for any node size. `scene`, `route`,
   `route_partial`, `hit_test` and `to_mermaid` keep their signatures.
+- **Deeply nested JSON is an error, not a crash.** Advance JSON nested
+  deeper than 128 levels returns an error instead of overflowing the
+  stack (#77, #78).
 - **Quality and tooling.** New defect metrics in the quality harness with
   ratchets, and a per-file benchmark (`bench -- files`).
 
@@ -830,6 +833,16 @@ so this is a minor bump. The detailed notes follow the highlights.
     `Metrics::default()` and assign them. New columns no longer break it.
 
 ### Fixed
+
+- **Deeply nested advance JSON no longer crashes the process** (#77, #78,
+  contributed by arifintahu). The JSON reader recursed once per array or
+  object level with no limit, so about 40 KB of nested brackets overflowed
+  the stack and aborted the process (in wasm the module traps); a stack
+  overflow cannot be caught, so any host feeding untrusted JSON to the
+  advance renderer could be crashed. Nesting deeper than 128 levels now
+  returns `advance error — JSON nested too deeply (more than 128 levels)`,
+  in line with the mermaid parser (500 levels) and the advance text DSL
+  (16).
 
 - **Edge ends touch every shape's outline** (report M6, P0 #9). The edge
   stages met a parallelogram, a trapezoid (drawn as one), a hexagon and a
