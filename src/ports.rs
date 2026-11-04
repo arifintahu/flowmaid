@@ -795,7 +795,13 @@ fn place_ports(
     }
     // Sides a self-loop starts and ends on: its two ends are no part of
     // the group, so an end there is not alone and keeps its place.
-    let looped = if shaping {
+    // `respace` draws a nearly straight pair straight again: the plain
+    // rule re-spacing a side the router changed slides a straight
+    // edge's end along it too (advanced: `Gate --> Auth` 2.9 px off
+    // straight, Gate's side respaced after the router moved `Gate ==>
+    // Job Queue`'s end).
+    let resnap = flow && !spill_over && judge.is_none();
+    let looped = if shaping || resnap {
         looped_sides(sc, cx)
     } else {
         Vec::new()
@@ -1052,7 +1058,7 @@ fn place_ports(
             }
         }
     }
-    if shaping {
+    if shaping || resnap {
         snap_straight_pairs(sc, cx, &looped, &mut deltas, moved);
     }
     // A single-curve edge's label rides the curve's midpoint, which
@@ -2169,6 +2175,19 @@ mod tests {
                 straight,
                 "shift {shift}: {p0:?} {p3:?}"
             );
+        }
+        // B7 review r2 (#6): a pair straightened before routing stays so
+        // when the respacing after the router slides its end along a
+        // side the router changed (advanced: Gate's bottom, re-spaced
+        // for `Gate ==> Job Queue`, left `Gate --> Auth` 2.9 px off).
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/advanced.mmd"
+        ))
+        .unwrap();
+        for sc in both(&src) {
+            let (p0, p3) = ends(edge(&sc, "Gate", "Auth"));
+            assert!((p0.0 - p3.0).abs() < 1e-6, "{p0:?} {p3:?}");
         }
     }
 

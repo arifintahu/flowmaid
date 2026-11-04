@@ -191,7 +191,9 @@ Minor, not patch: several class structs gain public fields (see
   a comb of arrowheads keeps a clear gap between its heads; when
   ends must make room, the ends of straight edges keep their place and a
   back-edge's give way; and a 1:1 pair on facing sides a few px apart
-  along them is drawn straight. Parallel edges keep their own spacing.
+  along them is drawn straight, also after the router re-spaced a side
+  it changed (advanced's `Gate --> Auth` was left 2.9 px off straight).
+  Parallel edges keep their own spacing.
   In a drag (`route_partial`) the ends of the edges the drag keeps hold
   their places: a side whose every end the drag keeps is left exactly as
   drawn, a side is combed only round its kept ends, and a redrawn end
