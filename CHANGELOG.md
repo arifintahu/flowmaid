@@ -188,7 +188,9 @@ Minor, not patch: several class structs gain public fields (see
   head's room took the whole line), and `route()` keeps such a label on
   its line where `scene()` does (its straight curve's sparse samples
   near the ends made the head 21 px long, so a 1 px drag moved the
-  label 20 px). A decision's branch label sits in
+  label 20 px); class and ER relations, whose painters draw their own
+  end glyphs, keep their labels' distance from those glyphs as before
+  (their output is unchanged). A decision's branch label sits in
   the middle of its curve, where the S runs straight, instead of in the
   half that turns into its target. So does a hub's (a node with more
   ends) where the drawing runs down the page: the gap grows (by up to

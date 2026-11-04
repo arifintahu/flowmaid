@@ -1060,6 +1060,15 @@ pub(crate) fn runs_straight_across(pts: &[(f64, f64)]) -> bool {
         })
 }
 
+/// Whether edge `e`, drawn along `pts`, gets the short head box of a
+/// line that [`runs_straight_across`]: only an edge the flowchart
+/// painter draws (no `paint_width`). A class or ER scene paints its own
+/// glyphs at the ends and keeps its label boxes as they were (B7 review
+/// r4 #1: its output stays byte-identical).
+pub(crate) fn straight_head_line(e: &SceneEdge, pts: &[(f64, f64)]) -> bool {
+    e.paint_width.is_none() && runs_straight_across(pts)
+}
+
 /// Most (px) an arrowhead's box reaches back from its tip along a line
 /// that [`runs_straight_across`]: a head and half a [`LABEL_CLEAR`], so a label
 /// stays a few px off it, and one the label stage centres on the run
@@ -1067,7 +1076,8 @@ pub(crate) fn runs_straight_across(pts: &[(f64, f64)]) -> bool {
 const STRAIGHT_HEAD_BOX: f64 = ARROW_MARKER_PX + LABEL_CLEAR / 2.0;
 
 /// [`arrow_box`] at either end of polyline `pts` (the tip `at_end` or at
-/// its start), on a line that [`runs_straight_across`] no longer than
+/// its start), on a line that `straight` (a flowchart edge that
+/// [`runs_straight_across`], see [`straight_head_line`]) no longer than
 /// [`STRAIGHT_HEAD_BOX`] (B7 review r3 #4). The box reaches back to the
 /// first sample a head's length off the tip — on a coarsely sampled
 /// curve past the head, the chord the eye follows there — but on a
@@ -1719,7 +1729,7 @@ fn place(
     // one by LABEL_GAP no longer fits the gap the layout sized for it.
     for (e, pts) in edges.iter().zip(&lines) {
         let Some(pts) = pts else { continue };
-        let straight = runs_straight_across(pts);
+        let straight = straight_head_line(e, pts);
         if e.ends.end_marker(e.kind).is_some() {
             if let Some(r) = end_arrow_box(pts, true, straight) {
                 fixed.push(r, Kind::Arrow);
@@ -3020,7 +3030,7 @@ pub(crate) fn label_clashes(nodes: &[SceneNode], edges: &[SceneEdge]) -> Vec<boo
     let mut heads: Vec<(usize, Rect)> = Vec::new();
     for (j, (e, pts)) in edges.iter().zip(&lines).enumerate() {
         let Some(pts) = pts else { continue };
-        let straight = runs_straight_across(pts);
+        let straight = straight_head_line(e, pts);
         if e.ends.end_marker(e.kind).is_some() {
             heads.extend(end_arrow_box(pts, true, straight).map(|r| (j, r)));
         }
@@ -3220,6 +3230,61 @@ mod tests {
                 assert!(head.2 - head.0 <= STRAIGHT_HEAD_BOX + 1e-6, "{mode} {text}");
             }
         }
+    }
+
+    #[test]
+    fn a_class_relation_keeps_its_full_head_box() {
+        // B7 review r4 #1: the short head box of a straight flowchart
+        // line (`straight_head_line`) is the flowchart painter's alone. A
+        // class scene paints its own glyphs (`paint_width`), and its
+        // labels keep their old distance from the head: a08's long
+        // relation label sat 6 px off its head base with the short box,
+        // 17 px without (its output byte-identical to before B7).
+        let src = "classDiagram
+direction LR
+class List~T~ {
+<<interface>>
++add(T item) void
++get(int i) T
+}
+class Map~K,V~
+class VeryVeryVeryVeryLongClassNameThatKeepsGoingAndGoingForeverAndEver
+List~T~ <|.. ArrayList~T~
+Map~K,V~ <|.. HashMap~K,V~
+VeryVeryVeryVeryLongClassNameThatKeepsGoingAndGoingForeverAndEver --> List~T~ : a very very long relation label that goes on and on
+HashMap~K,V~ --> HashMap~K,V~ : rehash
+note for Map~K,V~ \"generic\"
+";
+        let crate::model::Document::Class(d) = crate::parser::parse_document(src).unwrap() else {
+            panic!("not a class diagram");
+        };
+        let cs = crate::class::scene(&d);
+        let mut checked = 0;
+        for e in &cs.scene.edges {
+            let Some((text, c, w)) = &e.label else {
+                continue;
+            };
+            if !text.starts_with("a very") {
+                continue;
+            }
+            let pts = edge_polyline(e);
+            assert!(e.paint_width.is_some());
+            assert!(!straight_head_line(e, &pts), "{pts:?}");
+            // A flowchart edge along the same line would get the short box.
+            let mut flow = e.clone();
+            flow.paint_width = None;
+            assert_eq!(straight_head_line(&flow, &pts), runs_straight_across(&pts));
+            let r = label_rect(*c, *w);
+            let tip = *pts.last().unwrap();
+            let base = tip.0 + (pts[0].0 - tip.0).signum() * ARROW_MARKER_PX;
+            let off = (r.0 - base).max(base - r.2);
+            assert!(
+                off >= 12.0,
+                "label {r:?} {off:.1} px off the head base at {base:.1}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 1);
     }
 
     #[test]

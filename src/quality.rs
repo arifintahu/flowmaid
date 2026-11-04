@@ -1489,9 +1489,10 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
                     .copied()
                     .unwrap_or(me.pts[0]);
                 // On a straight line the head is a head long however
-                // far apart its samples (as the label stage's box).
+                // far apart its samples (as the label stage's box, and
+                // like it only for the flowchart painter's edges).
                 let d = dist(back, tip);
-                if d > ARROW_LEN && crate::labels::runs_straight_across(&me.pts) {
+                if d > ARROW_LEN && crate::labels::straight_head_line(me.e, &me.pts) {
                     let k = ARROW_LEN / d;
                     back = (tip.0 + (back.0 - tip.0) * k, tip.1 + (back.1 - tip.1) * k);
                 }
