@@ -165,6 +165,18 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Changed
 
+- **Narrowing a broad flowchart never grows it** (report M11). A drawing
+  far broader than deep (a hub feeding a column of subgraphs, a fan of
+  leaves) is still narrowed by stacking a subgraph below its sibling or
+  staggering leaves, but a step is now kept only when it also adds at
+  most 2 % to the drawing's area and 10 % to its total edge length, and a
+  stacking at most 15 % to the edge length along the flow (the detour
+  past the sibling). A column of three or more sibling subgraphs sharing
+  a layer is also tried folded into two runs of even breadth. A hub
+  feeding six frames of different heights (`fanout-frames`) now keeps
+  them in one column, as mermaid draws it: its third frame used to step
+  into a second column beside the first (9.7 % more area), its edge
+  squeezed between two frames. Leaf staggering is unchanged.
 - **Labelled gaps keep their labels off the arrowhead; ends meet their
   sides in the middle** (report M3, §2.4, §2.6). In a flowchart or state
   diagram a gap between adjacent layers that carries an edge label grows

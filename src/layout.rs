@@ -105,6 +105,25 @@ const ASPECT_TARGET: f64 = 2.5;
 /// the longer edges and channel detours of a stacked or staggered
 /// drawing outweigh the breadth saved on a moderately wide one.
 const RIBBON_ENTRY: f64 = 4.0;
+/// Share of drawing area (breadth x depth, as the search judges them) a
+/// narrowing step may add (report M11): narrowing is meant to fill the
+/// drawing, not to grow it. fanout-frames' third frame stacked under
+/// its first, beside the column of frames the hub feeds, grew it 9.7 %
+/// (and pushed the frame's edge into the gap between two others); the
+/// column now stays one column, as mermaid draws it.
+const NARROW_AREA_SLACK: f64 = 0.02;
+/// Share of total edge length (node centre to centre, both axes) a
+/// narrowing step may add (report M11).
+const NARROW_LEN_SLACK: f64 = 0.1;
+/// Share of edge length along the flow a sibling stacking or wrap may
+/// add (report M11): a box stacked under its sibling lengthens every
+/// edge into it by the sibling's depth, a detour past it. Folding
+/// fanout-frames' column of frames into two cut its area 12 % and its
+/// total edge length 25 % (the fan's spread shrank) but grew the length
+/// along the flow 60 %: every edge into the second column threading the
+/// first. (A staggered leaf only steps one layer out beside its row:
+/// leaf staggering is not held to it.)
+const NARROW_FLOW_SLACK: f64 = 0.15;
 /// Fewest real nodes a layer needs before its leaves are staggered.
 const STAGGER_MIN_NODES: usize = 6;
 /// Most staggering proposals laid out per diagram (each one is a full
@@ -1579,34 +1598,69 @@ fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, 
     // over the packed drawing the re-layering steps start from, so
     // several steps cannot pile up re-threadings.
     let hit_cap = st.best.hits + NARROW_HIT_SLACK;
+    // A step must give back breadth without adding area or edge length
+    // past their slack (report M11), crossings or node hits.
+    let area = |p: &Placement| p.lo.total_b * p.depth;
     let better = |cand: &Placement, cur: &Placement| {
         cand.lo.total_b <= cur.lo.total_b * (1.0 - STAGGER_MIN_GAIN)
+            && area(cand) <= area(cur) * (1.0 + NARROW_AREA_SLACK)
+            && edge_length(g, &cand.lo, false)
+                <= edge_length(g, &cur.lo, false) * (1.0 + NARROW_LEN_SLACK)
             && cand.crossings <= cap
             && cand.hits <= hit_cap.min(cur.hits + NARROW_HIT_SLACK)
     };
+    // A stacked box's in-edges thread past its sibling; a staggered leaf
+    // only steps one layer out beside its row.
+    let no_detour = |cand: &Placement, cur: &Placement| {
+        edge_length(g, &cand.lo, true) <= edge_length(g, &cur.lo, true) * (1.0 + NARROW_FLOW_SLACK)
+    };
+
     // 1. Sibling stacking: two sibling subgraphs that share layers sit
     // side by side, so their parent is as broad as both. The pairs that
     // would give back the most breadth are tried ranked one below the
     // other (a rank-only group, never drawn), unless an edge path runs
-    // the other way; the narrowest result wins the round.
+    // the other way; so is a wrap of three or more siblings sharing a
+    // layer into two runs, the later run below the earlier
+    // ([`wrap_candidates`], report M11). The smallest result wins the
+    // round.
     if let Some(nc) = node_cluster {
         let mut tried: Vec<(usize, usize)> = Vec::new();
+        let mut wraps_tried: Vec<RankGroup> = Vec::new();
         for _ in 0..STACK_MAX_ROUNDS {
             if !ribbon(&st.best) {
                 break;
             }
             let pairs = stack_candidates(g, nc, &st.groups, &st.rk, &st.layer, &st.best.lo, &tried);
-            if pairs.is_empty() {
+            let wraps: Vec<RankGroup> =
+                wrap_candidates(g, nc, &st.groups, &st.rk, &st.layer, &st.best.lo)
+                    .into_iter()
+                    .filter(|w| !wraps_tried.contains(w))
+                    .collect();
+            if pairs.is_empty() && wraps.is_empty() {
                 break;
             }
+            let groups_to_try: Vec<(Option<(usize, usize)>, RankGroup)> = wraps
+                .into_iter()
+                .take(1)
+                .map(|w| (None, w))
+                .chain(
+                    pairs
+                        .iter()
+                        .take(STACK_BEAM)
+                        .map(|&(a, b)| (Some((a, b)), stack_group(nc, a, b))),
+                )
+                .collect();
             let mut won: Option<(Vec<RankGroup>, Ranking, Placement)> = None;
-            for &(above, below) in pairs.iter().take(STACK_BEAM) {
+            for (pair, group) in groups_to_try {
                 if !st.afford(g) {
                     break;
                 }
-                tried.push((above, below));
+                match pair {
+                    Some(p) => tried.push(p),
+                    None => wraps_tried.push(group.clone()),
+                }
                 let mut cand_groups = st.groups.clone();
-                cand_groups.push(stack_group(nc, above, below));
+                cand_groups.push(group);
                 let crk = rank(g, &cand_groups);
                 let cand = place(
                     g,
@@ -1618,7 +1672,11 @@ fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, 
                     packed_opts,
                 );
                 let cur = won.as_ref().map_or(&st.best, |w| &w.2);
-                if better(&cand, &st.best) && cand.lo.total_b < cur.lo.total_b {
+                let smaller = (area(&cand), cand.lo.total_b) < (area(cur), cur.lo.total_b);
+                if better(&cand, &st.best)
+                    && no_detour(&cand, &st.best)
+                    && (won.is_none() || smaller)
+                {
                     won = Some((cand_groups, crk, cand));
                 }
             }
@@ -1860,6 +1918,144 @@ fn members_of(nc: &[Vec<usize>], id: usize) -> Vec<usize> {
 /// The rank-only group that ranks all of `below` under all of `above`.
 fn stack_group(nc: &[Vec<usize>], above: usize, below: usize) -> RankGroup {
     (members_of(nc, above), members_of(nc, below))
+}
+
+/// Total edge length of a placement, node centre to centre along both
+/// axes, or along the flow only (`flow`; self-loops left out): what a
+/// narrowing step must not grow past [`NARROW_LEN_SLACK`] /
+/// [`NARROW_FLOW_SLACK`].
+fn edge_length(g: &Graph, lo: &LayoutResult, flow: bool) -> f64 {
+    g.edges
+        .iter()
+        .filter(|e| e.from != e.to)
+        .map(|e| {
+            let (a, b) = (&lo.nodes[e.from], &lo.nodes[e.to]);
+            let along = (a.l - b.l).abs();
+            if flow {
+                along
+            } else {
+                (a.b - b.b).abs() + along
+            }
+        })
+        .sum()
+}
+
+/// Wrap candidates (report M11): per parent box (or the top level), the
+/// three or more child boxes that share its most shared layer, in drawn
+/// order, split into two runs of about equal breadth — the later run
+/// ranked below the earlier one (one rank-only group), so a column of
+/// boxes fed from one side folds into two instead of moving a single
+/// box past its sibling. Skipped when an edge path (or rank-only link)
+/// leads from the later run back into the earlier one.
+fn wrap_candidates(
+    g: &Graph,
+    nc: &[Vec<usize>],
+    groups: &[RankGroup],
+    rk: &Ranking,
+    layer: &[usize],
+    lo: &LayoutResult,
+) -> Vec<RankGroup> {
+    let n = layer.len();
+    // Per box: parent, layer span, breadth span.
+    let mut info: BTreeMap<usize, (Option<usize>, usize, usize, f64, f64)> = BTreeMap::new();
+    for v in 0..n {
+        let p = &lo.nodes[v];
+        for (i, &c) in nc[v].iter().enumerate() {
+            let parent = i.checked_sub(1).map(|k| nc[v][k]);
+            let e = info.entry(c).or_insert((
+                parent,
+                layer[v],
+                layer[v],
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ));
+            e.1 = e.1.min(layer[v]);
+            e.2 = e.2.max(layer[v]);
+            e.3 = e.3.min(p.b - p.bsize / 2.0);
+            e.4 = e.4.max(p.b + p.bsize / 2.0);
+        }
+    }
+    let mut next: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (ei, e) in g.edges.iter().enumerate() {
+        if !rk.back[ei] && e.from != e.to {
+            next[e.from].push(e.to);
+        }
+    }
+    for (from, to) in groups {
+        for &a in from {
+            next[a].extend(to.iter().copied());
+        }
+    }
+    let mut parents: Vec<Option<usize>> = info.values().map(|i| i.0).collect();
+    parents.sort_unstable();
+    parents.dedup();
+    let mut out: Vec<(f64, RankGroup)> = Vec::new();
+    for parent in parents {
+        let kids: Vec<usize> = info
+            .iter()
+            .filter(|(_, i)| i.0 == parent)
+            .map(|(&c, _)| c)
+            .collect();
+        if kids.len() < 3 {
+            continue;
+        }
+        // The layer most of them share (the first on a tie).
+        let (lmin, lmax) = (
+            kids.iter().map(|c| info[c].1).min().unwrap_or(0),
+            kids.iter().map(|c| info[c].2).max().unwrap_or(0),
+        );
+        let at = |l: usize| {
+            kids.iter()
+                .filter(|c| info[c].1 <= l && l <= info[c].2)
+                .count()
+        };
+        let Some(l) = (lmin..=lmax).max_by(|&a, &b| at(a).cmp(&at(b)).then(b.cmp(&a))) else {
+            continue;
+        };
+        let mut row: Vec<usize> = kids
+            .iter()
+            .copied()
+            .filter(|c| info[c].1 <= l && l <= info[c].2)
+            .collect();
+        if row.len() < 3 {
+            continue;
+        }
+        row.sort_by(|a, b| info[a].3.total_cmp(&info[b].3).then(a.cmp(b)));
+        let width = |c: &usize| info[c].4 - info[c].3;
+        let total: f64 = row.iter().map(width).sum();
+        let mut acc = 0.0;
+        let mut split = 1;
+        let mut best = f64::INFINITY;
+        for k in 1..row.len() {
+            acc += width(&row[k - 1]);
+            let worse = acc.max(total - acc);
+            if worse < best {
+                best = worse;
+                split = k;
+            }
+        }
+        let members = |cs: &[usize]| -> Vec<usize> {
+            (0..n)
+                .filter(|&v| cs.iter().any(|c| nc[v].contains(c)))
+                .collect()
+        };
+        let (first, then) = (members(&row[..split]), members(&row[split..]));
+        // No path from the later run back into the earlier.
+        let mut seen = vec![false; n];
+        let mut stack = then.clone();
+        while let Some(u) = stack.pop() {
+            if std::mem::replace(&mut seen[u], true) {
+                continue;
+            }
+            stack.extend(next[u].iter().copied());
+        }
+        if first.iter().any(|&v| seen[v]) {
+            continue;
+        }
+        out.push((total, (first, then)));
+    }
+    out.sort_by(|a, b| b.0.total_cmp(&a.0));
+    out.into_iter().map(|c| c.1).collect()
 }
 
 /// Sibling pairs `(above, below)` worth stacking, not yet in `tried`:
@@ -4836,6 +5032,118 @@ fn arrange(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fanout-frames' shape (report M11): a hub feeding a column of
+    /// frames of very different heights is a ribbon, but stacking one
+    /// frame under another (beside the column) grew the drawing's area
+    /// and threaded that frame's edge past its sibling. Every frame now
+    /// keeps the hub's next layer: one column, as mermaid draws it.
+    #[test]
+    fn a_hub_fed_column_of_frames_stays_one_column() {
+        let mut src = String::from("flowchart LR\nhub[\"hub node with a long label\"]\n");
+        for (k, n) in [5usize, 3, 6, 2, 1, 3].into_iter().enumerate() {
+            src += &format!("subgraph g{k}[\"frame {k}\"]\ndirection TB\n");
+            for i in 0..n {
+                src += &format!("m{k}_{i}[\"member {i} of frame {k}<br/>second line\"]\n");
+            }
+            src += "end\n";
+        }
+        for k in 0..6 {
+            src += &format!("hub --> g{k}\n");
+        }
+        let g = crate::parser::parse(&src).unwrap();
+        let sc = crate::scene::scene(&g);
+        let left: Vec<f64> = sc.clusters.iter().map(|c| c.x).collect();
+        let hub = &sc.nodes[0];
+        assert!(
+            left.iter().all(|&x| x > hub.x + hub.w / 2.0),
+            "every frame right of the hub: {left:?}"
+        );
+        let (lo, hi) = left
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |a, &x| {
+                (a.0.min(x), a.1.max(x))
+            });
+        let widest = sc.clusters.iter().map(|c| c.w).fold(0.0, f64::max);
+        assert!(
+            hi - lo < widest / 2.0,
+            "a frame stepped out of the column: lefts {left:?}"
+        );
+    }
+
+    /// The narrowing guards (report M11) read edge length both ways:
+    /// node centre to centre on both axes, or along the flow only.
+    #[test]
+    fn edge_length_reads_both_axes_or_the_flow() {
+        let mut g = Graph::default();
+        let a = g.ensure_node("A", None, None);
+        let b = g.ensure_node("B", None, None);
+        g.add_edge(a, b, None, EdgeKind::Arrow);
+        g.add_edge(a, a, None, EdgeKind::Arrow);
+        let placed = |b: f64, l: f64| Placed {
+            b,
+            l,
+            bsize: 10.0,
+            lsize: 10.0,
+            layer: 0,
+        };
+        let lo = LayoutResult {
+            nodes: vec![placed(0.0, 0.0), placed(30.0, 40.0)],
+            total_b: 0.0,
+            total_l: 0.0,
+            edge_paths: vec![Vec::new(), Vec::new()],
+        };
+        assert_eq!(
+            edge_length(&g, &lo, false),
+            70.0,
+            "the self-loop counts nothing"
+        );
+        assert_eq!(edge_length(&g, &lo, true), 40.0);
+    }
+
+    /// A wrap candidate (report M11) splits the siblings sharing their
+    /// parent's most shared layer into two runs of about equal breadth,
+    /// in drawn order, and is skipped when a path leads back from the
+    /// later run into the earlier.
+    #[test]
+    fn wrap_candidates_split_a_shared_layer_into_two_even_runs() {
+        let src = "flowchart LR\nhub\nsubgraph a\na1\nend\nsubgraph b\nb1\nend\nsubgraph c\nc1\nend\nsubgraph d\nd1\nend\nhub --> a1\nhub --> b1\nhub --> c1\nhub --> d1\n";
+        let g = crate::parser::parse(src).unwrap();
+        let nc: Vec<Vec<usize>> = (0..g.nodes.len())
+            .map(|v| {
+                g.subgraphs
+                    .iter()
+                    .position(|s| s.nodes.contains(&v))
+                    .map_or(Vec::new(), |s| vec![s])
+            })
+            .collect();
+        let sizes: Vec<(f64, f64)> = vec![(60.0, 40.0); g.nodes.len()];
+        let rk = rank(&g, &[]);
+        let (lo, _) = layout_core(&g, &sizes, Some(&nc), &[]);
+        let wraps = wrap_candidates(&g, &nc, &[], &rk, &rk.layer, &lo);
+        assert_eq!(wraps.len(), 1, "{wraps:?}");
+        let (first, then) = &wraps[0];
+        assert_eq!((first.len(), then.len()), (2, 2), "{wraps:?}");
+        // Drawn order: the first run lies before the second.
+        let b = |v: &usize| lo.nodes[*v].b;
+        assert!(
+            first.iter().map(b).fold(f64::MIN, f64::max)
+                < then.iter().map(b).fold(f64::MAX, f64::min)
+        );
+        // A link from the later run back into the earlier one forbids it.
+        let mut back = src.to_string();
+        let (x, y) = (&g.nodes[then[0]].id, &g.nodes[first[0]].id);
+        back += &format!("{x} --> {y}\n");
+        let g2 = crate::parser::parse(&back).unwrap();
+        let rk2 = rank(&g2, &[]);
+        let wraps2 = wrap_candidates(&g2, &nc, &[], &rk2, &rk2.layer, &lo);
+        assert!(
+            wraps2
+                .iter()
+                .all(|(f, t)| !(t.contains(&then[0]) && f.contains(&first[0]))),
+            "{wraps2:?}"
+        );
+    }
 
     /// `Edge::end_room` (ER crow's feet) widens a gap between adjacent
     /// layers by just enough for the room, the label and LABEL_CLEAR
