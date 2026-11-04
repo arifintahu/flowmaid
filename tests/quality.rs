@@ -890,3 +890,53 @@ fn a_one_px_drag_leaves_unrelated_edges_put() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// Most a shuffle of a fixture's edge lines may change its canvas
+/// width (share of the source order's): the layout's output depends on
+/// declaration order only through its documented tie-breaks (report
+/// §2.9, B8: "permuting the edge lines of dense-td must not change width
+/// by more than ~10 %"). Measured over eleven shuffles: dense-td 4 249
+/// px, its shuffles 4 249 or 4 392 (+3.4 %); dense-lr always 2 299.
+const SHUFFLE_WIDTH_MAX: f64 = 0.10;
+
+/// Shuffling the edge lines of the generated dense fixtures (nodes all
+/// declared up front, in their subgraphs) keeps their width within
+/// [`SHUFFLE_WIDTH_MAX`].
+#[test]
+fn edge_line_order_barely_moves_the_dense_layouts() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/quality");
+    for name in ["dense-td", "dense-lr"] {
+        let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");
+        let lines: Vec<&str> = src.lines().collect();
+        let is_edge = |l: &str| ["-->", "-.->", "==>"].iter().any(|a| l.contains(a));
+        let at: Vec<usize> = (0..lines.len()).filter(|&i| is_edge(lines[i])).collect();
+        let width = |s: &str| {
+            let g = match flowmaid::parser::parse_document(s).expect("parses") {
+                flowmaid::Document::Flowchart(g) => g,
+                _ => unreachable!("a flowchart fixture"),
+            };
+            flowmaid::scene::scene(&g).width
+        };
+        let w0 = width(&src);
+        // Deterministic shuffles (xorshift), a few seeds.
+        for seed in 1..=3u64 {
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut order: Vec<&str> = at.iter().map(|&i| lines[i]).collect();
+            for i in (1..order.len()).rev() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                order.swap(i, (x % (i as u64 + 1)) as usize);
+            }
+            let mut out: Vec<&str> = lines.clone();
+            for (&i, l) in at.iter().zip(order) {
+                out[i] = l;
+            }
+            let w = width(&out.join("\n"));
+            assert!(
+                (w - w0).abs() <= SHUFFLE_WIDTH_MAX * w0,
+                "{name} shuffle {seed}: width {w:.0} against {w0:.0}"
+            );
+        }
+    }
+}
