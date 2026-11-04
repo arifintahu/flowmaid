@@ -358,6 +358,9 @@ const HUB_LABEL_GROW_MAX: f64 = 48.0;
 /// Step (px) [`hub_label_room`] grows a trial gap by.
 const HUB_LABEL_STEP: f64 = 2.0;
 
+/// A fan's curves in [`hub_label_room`]: `(port, far end, edge)`.
+type FanCurves = Vec<(f64, f64, usize)>;
+
 /// Per lower layer: `(upper end, lower end, gap)` — the least border to
 /// border gap at which a labelled edge across one gap, drawn as the
 /// builder draws it (an S whose controls sit mid-gap), keeps its label
@@ -397,13 +400,78 @@ fn hub_label_room(
             && !matches!(e.kind, EdgeKind::Invisible)
             && alayer[e.from].abs_diff(alayer[e.to]) == 1
     };
-    // Parallel twins stack their own labels.
+    // Parallel twins stack their own labels. Edges per unordered pair of
+    // ends, counted once: a hub's whole fan is asked about, so a scan of
+    // every edge per edge would be quadratic.
+    let mut pairs: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+    for f in &g.edges {
+        *pairs
+            .entry((f.from.min(f.to), f.from.max(f.to)))
+            .or_insert(0) += 1;
+    }
     let twin = |ei: usize| {
         let e = &g.edges[ei];
-        g.edges.iter().enumerate().any(|(j, f)| {
-            j != ei && ((f.from == e.from && f.to == e.to) || (f.from == e.to && f.to == e.from))
-        })
+        pairs[&(e.from.min(e.to), e.from.max(e.to))] > 1
     };
+    // The fan on one side of node `v` (facing down the flow or up it):
+    // its curves `(port, far end, edge)` as the ports stage spreads them,
+    // or `None` when the side holds fewer than two ends or parallel twins.
+    // It depends on the side alone, so it is built once per side and
+    // shared by all the side's labelled edges (a 1000-edge hub asked it a
+    // thousand times).
+    let fan = |v: usize, down: bool| -> Option<FanCurves> {
+        // Every end on v's side facing the gap, by its far end.
+        let mut side: Vec<(f64, usize)> = g
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(j, f)| {
+                let far = if f.from == v { f.to } else { f.from };
+                (f.from == v || f.to == v)
+                    && f.from != f.to
+                    && far < n
+                    && !back[*j]
+                    && (alayer[far] > alayer[v]) == down
+                    && alayer[far] != alayer[v]
+            })
+            .map(|(j, f)| (bpos[if f.from == v { f.to } else { f.from }], j))
+            .collect();
+        if side.len() < 2 {
+            return None;
+        }
+        // Parallel twins leave their ports a twin offset apart and
+        // stack their own labels: the even comb is not their model.
+        let mut fars: Vec<usize> = side
+            .iter()
+            .map(|&(_, j)| {
+                let f = &g.edges[j];
+                if f.from == v {
+                    f.to
+                } else {
+                    f.from
+                }
+            })
+            .collect();
+        fars.sort_unstable();
+        if fars.windows(2).any(|w| w[0] == w[1]) {
+            return None;
+        }
+        side.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let k = side.len();
+        let pitch = ((absize[v] - 2.0 * PORT_INSET) / (k + 1) as f64)
+            .clamp(crate::ports::PORT_SPACING, crate::ports::PORT_EVEN_MAX);
+        let port = |i: usize| bpos[v] + (i as f64 - (k - 1) as f64 / 2.0) * pitch;
+        Some(
+            side.iter()
+                .enumerate()
+                .filter(|(_, &(_, j))| short(j))
+                .map(|(i, &(far, j))| (port(i), far, j))
+                .collect(),
+        )
+    };
+    let mut fans: std::collections::HashMap<(usize, bool), Option<FanCurves>> =
+        std::collections::HashMap::new();
     for (ei, e) in g.edges.iter().enumerate() {
         let Some(lbl) = &e.label else { continue };
         // A curve the user picked (`curve:` / `interpolate`) is not the
@@ -418,66 +486,34 @@ fn hub_label_room(
         for v in [e.from, e.to] {
             let other = if v == e.from { e.to } else { e.from };
             let down = alayer[other] > alayer[v];
-            // Every end on v's side facing the gap, by its far end.
-            let mut side: Vec<(f64, usize)> = g
-                .edges
-                .iter()
-                .enumerate()
-                .filter(|(j, f)| {
-                    let far = if f.from == v { f.to } else { f.from };
-                    (f.from == v || f.to == v)
-                        && f.from != f.to
-                        && far < n
-                        && !back[*j]
-                        && (alayer[far] > alayer[v]) == down
-                        && alayer[far] != alayer[v]
-                })
-                .map(|(j, f)| (bpos[if f.from == v { f.to } else { f.from }], j))
-                .collect();
-            if side.len() < 2 {
+            let curves = fans.entry((v, down)).or_insert_with(|| fan(v, down));
+            let Some(curves) = curves.as_ref() else {
                 continue;
-            }
-            // Parallel twins leave their ports a twin offset apart and
-            // stack their own labels: the even comb is not their model.
-            let far = |j: usize| {
-                let f = &g.edges[j];
-                if f.from == v {
-                    f.to
-                } else {
-                    f.from
-                }
             };
-            if side
-                .iter()
-                .enumerate()
-                .any(|(a, x)| side[a + 1..].iter().any(|y| far(x.1) == far(y.1)))
-            {
-                continue;
-            }
-            side.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            let k = side.len();
-            let pitch = ((absize[v] - 2.0 * PORT_INSET) / (k + 1) as f64)
-                .clamp(crate::ports::PORT_SPACING, crate::ports::PORT_EVEN_MAX);
-            let port = |i: usize| bpos[v] + (i as f64 - (k - 1) as f64 / 2.0) * pitch;
-            let curves: Vec<(f64, f64, usize)> = side
-                .iter()
-                .enumerate()
-                .filter(|(_, &(_, j))| short(j))
-                .map(|(i, &(far, j))| (port(i), far, j))
-                .collect();
             let Some(&(p, b, _)) = curves.iter().find(|c| c.2 == ei) else {
                 continue;
             };
+            // The label's box at its curve's middle, grown by the stroke
+            // pad, across the flow.
+            let (x0, x1) = (
+                (p + b) / 2.0 - ha - STROKE_PAD,
+                (p + b) / 2.0 + ha + STROKE_PAD,
+            );
+            // An S runs between its two ends across the flow, so only a
+            // curve whose ends straddle or meet the box's span can cross
+            // it (the margin keeps rounding from deciding a near miss).
+            let near: Vec<(f64, f64)> = curves
+                .iter()
+                .filter(|&&(q, f, j)| j != ei && q.max(f) + 1e-6 >= x0 && q.min(f) - 1e-6 <= x1)
+                .map(|&(q, f, _)| (q, f))
+                .collect();
             let clear = |gap: f64| {
-                // The label's box at its curve's middle, grown by the
-                // stroke pad: no other curve of the fan crosses it.
+                // No other curve of the fan crosses the box at its
+                // curve's middle.
                 let (y0, y1) = (gap / 2.0 - hl - STROKE_PAD, gap / 2.0 + hl + STROKE_PAD);
-                let (x0, x1) = (
-                    (p + b) / 2.0 - ha - STROKE_PAD,
-                    (p + b) / 2.0 + ha + STROKE_PAD,
-                );
-                curves.iter().filter(|c| c.2 != ei).all(|&(q, f, _)| {
-                    let (a, c) = (s_curve_at(q, f, gap, y0), s_curve_at(q, f, gap, y1));
+                let (s0, s1) = (s_curve_blend(gap, y0), s_curve_blend(gap, y1));
+                near.iter().all(|&(q, f)| {
+                    let (a, c) = (q + (f - q) * s0, q + (f - q) * s1);
                     a.max(c) < x0 || a.min(c) > x1
                 })
             };
@@ -501,9 +537,11 @@ fn hub_label_room(
     out
 }
 
-/// Where across the flow the S the builder draws from `p` (at depth 0)
-/// to `f` (at depth `gap`), its controls mid-gap, runs at depth `y`.
-fn s_curve_at(p: f64, f: f64, gap: f64, y: f64) -> f64 {
+/// How far (0 at its start, 1 at its end) across the flow the S the
+/// builder draws across a gap `gap` deep, its controls mid-gap, has run
+/// at depth `y`. It depends on the depths alone, so a fan's curves share
+/// it: the S from `p` to `f` runs at `p + (f - p) * s_curve_blend(..)`.
+fn s_curve_blend(gap: f64, y: f64) -> f64 {
     let depth = |t: f64| gap * (1.5 * t * (1.0 - t) + t * t * t);
     let (mut lo, mut hi) = (0.0f64, 1.0f64);
     let y = y.clamp(0.0, gap);
@@ -516,7 +554,7 @@ fn s_curve_at(p: f64, f: f64, gap: f64, y: f64) -> f64 {
         }
     }
     let t = (lo + hi) / 2.0;
-    p + (f - p) * (3.0 * t * t - 2.0 * t * t * t)
+    3.0 * t * t - 2.0 * t * t * t
 }
 
 /// Least gap (px, at least `need`) between two TD/BT layers that lets
