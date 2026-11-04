@@ -7,6 +7,30 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-11-04
+
+### Highlights
+
+Flowchart parity phase B, package B8 (layering), on top of 0.34.0. Drawings
+change where layering matters: subgraphs fed by a hub, broad flowcharts, and
+diagrams whose lines are written in a different order. Of the corpus
+diagrams only `fanout-frames` changes. No public API changes.
+
+- **Subgraphs fed by a hub read cleanly.** A subgraph's edge-less members
+  start on its first row instead of beside the node that feeds it, so the
+  hub's edges no longer cut through the frame (over 600 generated drawings,
+  edges through frames fall 71 % and defects 64 %).
+- **Narrowing never makes a drawing worse.** A broad flowchart (from 2.5 : 1)
+  is narrowed only by steps that keep its area and edge length in check, and
+  a hub feeding a column of subgraphs keeps them in one column, as mermaid
+  draws it.
+- **Stable when lines move.** Moving a declaration line or shuffling the edge
+  lines barely moves the drawing (the dense TD fixture stays within 5.7 % of
+  its width, where it used to swing by a third either way).
+- **Faster interactive routing.** `route()` skips the segments that miss
+  every obstacle before clipping them: the routes are byte-identical, with
+  6–9 % fewer instructions on dense diagrams.
+
 ### Changed
 
 - **A subgraph's edge-less members sit in its first row** (report §2.9,
