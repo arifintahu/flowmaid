@@ -190,10 +190,13 @@ Minor, not patch: several class structs gain public fields (see
   back-edge's give way; and a 1:1 pair on facing sides a few px apart
   along them is drawn straight. Parallel edges keep their own spacing.
   In a drag (`route_partial`) the ends of the edges the drag keeps hold
-  their places: a side is combed only round them, and a redrawn end that
-  would throw a kept one more than half a port spacing takes the nearest
-  free spot beside the kept fan instead, so a 1 px drag never re-spaces
-  the fan of a node it does not touch. A
+  their places: a side whose every end the drag keeps is left exactly as
+  drawn, a side is combed only round its kept ends, and a redrawn end
+  that would throw a kept one more than half a port spacing takes the
+  nearest free spot beside the kept fan instead, so a 1 px drag never
+  re-spaces the fan of a node it does not touch (a state choice's
+  labelled twins, whose slant asks for more than the port spacing, used
+  to swap across their sibling on every drag of any node). A
   state note card's link holds its end whatever else shares its node's
   side (an even spread never pushes it aside), and keeps the router's
   corners, so `scene()` and `route()` draw an elbow or straight link

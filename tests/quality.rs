@@ -791,7 +791,22 @@ fn long_labels_wrap_and_dense_labels_do_not_tower() {
 /// B7. A comb now takes its centre from the ends a drag keeps and is
 /// not used when it would move one, and a side holding kept and redrawn
 /// ends places the redrawn ones round the kept ones.
-const DRAG_JUMPS_MAX: &[(&str, usize)] = &[("dense-lr", 1), ("dense-td", 93), ("bench-75", 28)];
+///
+/// B7 review r2 (#1, #2): a side whose every end the drag keeps was
+/// still re-placed when the plain rule found the base's ends unsettled
+/// (a parallel pair's slant asks for more than the port spacing): a
+/// state choice's labelled twins on such a side swapped across their
+/// sibling on every drag of any node (`notes/spread-face` 0 -> 68,
+/// `notes/fork-twins` (= verify g92) 0 -> 75 over B7). Such a side is
+/// now left as drawn, which also leaves dense-lr / dense-td / bench-75
+/// at 0 / 17 / 18 (from 1 / 93 / 28). Paths are under `tests/fixtures`.
+const DRAG_JUMPS_MAX: &[(&str, usize)] = &[
+    ("quality/dense-lr", 0),
+    ("quality/dense-td", 17),
+    ("quality/bench-75", 18),
+    ("notes/spread-face", 0),
+    ("notes/fork-twins", 0),
+];
 
 /// How far (px) an unrelated edge's end may move under a 1 px drag
 /// before [`DRAG_JUMPS_MAX`] counts it.
@@ -810,7 +825,7 @@ fn a_one_px_drag_leaves_unrelated_edges_put() {
             _ => (e.bezier[0], e.bezier[3]),
         }
     };
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/quality");
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     let mut bad = Vec::new();
     for &(name, max) in DRAG_JUMPS_MAX {
         let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");

@@ -815,6 +815,21 @@ fn place_ports(
         let Some(mut ports) = groups.remove(&key) else {
             continue;
         };
+        // A side every end of which a drag keeps ([`Ctx::fixed`], in
+        // `route_partial`) is left as the base scene drew it: no changed
+        // edge crowds it, and the base's ends there came out of the
+        // router, the respacing and the nudge, so the plain rule may
+        // find them unsettled (a parallel pair's slant asks for more
+        // than the port spacing) and re-place them in heading order. A
+        // 1 px drag of any node threw a choice's twins on such a side
+        // 15-35 px across each other (verify spread-face, g1, g92: 68-75
+        // unrelated ends over 20 px per diagram).
+        if ports
+            .iter()
+            .all(|p| p.spilled.is_none() && cx.fixed.get(p.edge).copied().unwrap_or(false))
+        {
+            continue;
+        }
         // Weighed on the ends as they are now: a lone end placed above
         // is where a comb's straight edge must meet it.
         for p in ports.iter_mut() {
@@ -2309,6 +2324,38 @@ mod tests {
         // the side by the plain rule): the centre is theirs all the same.
         let x = even_comb(&comb, kept, 0.0, 14.0, 30.0, 60.0, 160.0);
         assert!((x[1] - 119.5).abs() < 1e-9, "{x:?}");
+    }
+
+    #[test]
+    fn a_side_whose_every_end_a_drag_keeps_is_left_as_drawn() {
+        // B7 review r2 (#1): the base scene's ends on a side the drag
+        // does not touch may be closer than the plain rule's spacing
+        // (the nudge and the respacing ran after it); every end kept,
+        // the side is left exactly as drawn, never re-placed.
+        let g = parse("flowchart TD\nA --> B\nA --> C\nA --> D").unwrap();
+        let mut sc = scene(&g);
+        let (b, c) = (ends(edge(&sc, "A", "B")).0, ends(edge(&sc, "A", "C")).0);
+        let i = sc.edges.iter().position(|e| e.to == "B").unwrap();
+        // Squeeze A -> B's start to 3 px off A -> C's.
+        let dx = c.0 - 3.0 - b.0;
+        let e = &mut sc.edges[i];
+        e.bezier[0].0 += dx;
+        e.bezier[1].0 += dx;
+        let was: Vec<(Pt, Pt)> = sc.edges.iter().map(ends).collect();
+        let mut kept = sc.clone();
+        crate::edgepass::finish_fixed(&g, &mut kept, Mode::Routed, &vec![true; sc.edges.len()]);
+        let now: Vec<(Pt, Pt)> = kept.edges.iter().map(ends).collect();
+        assert_eq!(was, now);
+        // With the squeezed edge redrawn the side is spaced again.
+        let mut fixed = vec![true; sc.edges.len()];
+        fixed[i] = false;
+        let mut redrawn = sc.clone();
+        crate::edgepass::finish_fixed(&g, &mut redrawn, Mode::Routed, &fixed);
+        let (b, c) = (
+            ends(edge(&redrawn, "A", "B")).0,
+            ends(edge(&redrawn, "A", "C")).0,
+        );
+        assert!(dist(b, c) >= PORT_SPACING - 1e-6, "{b:?} {c:?}");
     }
 
     #[test]
