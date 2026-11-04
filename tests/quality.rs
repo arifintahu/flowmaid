@@ -804,12 +804,20 @@ fn long_labels_wrap_and_dense_labels_do_not_tower() {
 /// `notes/fork-twins` (= verify g92) 0 -> 75 over B7). Such a side is
 /// now left as drawn, which also leaves dense-lr / dense-td / bench-75
 /// at 0 / 17 / 18 (from 1 / 93 / 28). Paths are under `tests/fixtures`.
+///
+/// B7 review r3 (#7): an edge kept from the base because it merely
+/// passes near the drag had its ends re-placed by `route()`'s rules (and
+/// was searched again for spacing alone): a 1 px drag of a note card
+/// beside it threw it 22 px (`notes/near-drag` = verify g44, 1 -> 0).
+/// Such an edge now holds its ends (`Ctx::held`) and is rerouted only
+/// for what it hits: dense-td 17 -> 3, bench-75 18 -> 15.
 const DRAG_JUMPS_MAX: &[(&str, usize)] = &[
     ("quality/dense-lr", 0),
-    ("quality/dense-td", 17),
-    ("quality/bench-75", 18),
+    ("quality/dense-td", 3),
+    ("quality/bench-75", 15),
     ("notes/spread-face", 0),
     ("notes/fork-twins", 0),
+    ("notes/near-drag", 0),
 ];
 
 /// How far (px) an unrelated edge's end may move under a 1 px drag

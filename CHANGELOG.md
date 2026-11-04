@@ -214,7 +214,13 @@ Minor, not patch: several class structs gain public fields (see
   nearest free spot beside the kept fan instead, so a 1 px drag never
   re-spaces the fan of a node it does not touch (a state choice's
   labelled twins, whose slant asks for more than the port spacing, used
-  to swap across their sibling on every drag of any node). A drag that
+  to swap across their sibling on every drag of any node). An edge the
+  drag keeps because it merely passes near the dragged node holds its
+  ends too, and is rerouted only for a node, frame or title it now hits,
+  never for spacing alone (its ends used to be re-spaced by `route()`'s
+  rules: a 1 px drag of a note card beside one threw it 22 px; over
+  dense-td's and bench-75's drags 17 and 18 such jumps, now 3 and 15).
+  A drag that
   falls back to a full `route()` (a composite state drawn wider than its
   members sends every drag there) draws the fans as `route()` does. A
   state note card's link holds its end whatever else shares its node's

@@ -87,7 +87,7 @@ const STRAIGHT_WEIGHT: f64 = 8.0;
 /// the two, a router path spread past them in one and not the other).
 const NOTE_WEIGHT: f64 = 1.0e6;
 /// How far (px) spacing a side afresh may slide the end of an edge a
-/// drag keeps ([`Ctx::fixed`]) before the side's redrawn ends are
+/// drag holds ([`Ctx::held`]) before the side's redrawn ends are
 /// placed round the kept ones instead ([`around_kept`]): half a port
 /// spacing, a nudge the eye does not follow.
 const KEPT_NUDGE: f64 = PORT_SPACING / 2.0;
@@ -821,7 +821,7 @@ fn place_ports(
         let Some(mut ports) = groups.remove(&key) else {
             continue;
         };
-        // A side every end of which a drag keeps ([`Ctx::fixed`], in
+        // A side every end of which a drag holds ([`Ctx::held`], in
         // `route_partial`) is left as the base scene drew it: no changed
         // edge crowds it, and the base's ends there came out of the
         // router, the respacing and the nudge, so the plain rule may
@@ -832,7 +832,7 @@ fn place_ports(
         // unrelated ends over 20 px per diagram).
         if ports
             .iter()
-            .all(|p| p.spilled.is_none() && cx.fixed.get(p.edge).copied().unwrap_or(false))
+            .all(|p| p.spilled.is_none() && cx.held.get(p.edge).copied().unwrap_or(false))
         {
             continue;
         }
@@ -921,7 +921,7 @@ fn place_ports(
         // the wrong order is re-placed in order (G9): before routing,
         // and after the nudge.
         let crossed = |a: &PortEnd, b: &PortEnd| uncross && legs_cross(sc, a, b);
-        let kept = |p: &PortEnd| cx.fixed.get(p.edge).copied().unwrap_or(false);
+        let kept = |p: &PortEnd| cx.held.get(p.edge).copied().unwrap_or(false);
         let x = if lone {
             // The middle of the side's straight run (a slanted shape's
             // top or bottom is offset from its box's middle).
@@ -960,7 +960,7 @@ fn place_ports(
             // pull one of a pair across under the other's label, or skew
             // a twin's bow into its head.)
             //
-            // In `route_partial` the ends a drag keeps ([`Ctx::fixed`])
+            // In `route_partial` the ends a drag holds ([`Ctx::held`])
             // pin the comb, and a comb that would move one — or a note
             // link's pinned end, which the span may push it off — is not
             // used: the plain rule below then leaves the side as drawn
@@ -1142,9 +1142,9 @@ pub(crate) fn note_link(sc: &Scene, cx: &Ctx, i: usize) -> bool {
 
 /// Whether the end `p`'s edge may be reshaped by the ports stage's own
 /// rules (report M3): a forward edge the stages may move (not one a
-/// drag keeps, [`Ctx::fixed`]) that links no note card.
+/// drag holds, [`Ctx::held`]) that links no note card.
 fn free_end(sc: &Scene, cx: &Ctx, p: &PortEnd) -> bool {
-    !p.back && !cx.fixed.get(p.edge).copied().unwrap_or(false) && !note_link(sc, cx, p.edge)
+    !p.back && !cx.held.get(p.edge).copied().unwrap_or(false) && !note_link(sc, cx, p.edge)
 }
 
 /// Whether sides `a` and `b` face each other (top and bottom, left and
@@ -1213,7 +1213,7 @@ fn looped_sides(sc: &Scene, cx: &Ctx) -> Vec<(EndRef, Side)> {
 }
 
 /// The ends of a side holding both ends a drag keeps (`kept`, see
-/// [`Ctx::fixed`]) and redrawn ones, placed with the kept ends where
+/// [`Ctx::held`]) and redrawn ones, placed with the kept ends where
 /// they are: each redrawn end (in [`port_order`]) at the spot nearest
 /// where it wants to be that stays `s` from every end placed so far and
 /// on the span `[lo, hi]` (or as far out as a kept end lies: a crowded

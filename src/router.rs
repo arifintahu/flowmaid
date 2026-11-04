@@ -4904,6 +4904,11 @@ pub(crate) fn repair(g: &Graph, sc: &mut Scene, cx: &Ctx, mode: Mode, moved: &mu
                 <= FRAME_OVERLAP_TRADE * (base.frame - s.frame)
     };
     for &(class, i) in &bad {
+        // An edge a drag holds ([`Ctx::held`]) is rerouted only for
+        // what it now hits, never for spacing alone.
+        if class == 1 && cx.held.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         if work.left == 0 && (class == 1 || alone[i].hard() == 0 || detour_work == 0) {
             continue; // keeps its geometry (already accepted)
         }

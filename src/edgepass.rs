@@ -92,6 +92,19 @@ pub(crate) struct Ctx {
     /// changed edge crowds it. All `false` except in
     /// [`crate::scene::route_partial`].
     pub fixed: Vec<bool>,
+    /// Index-parallel with `sc.edges`: the edge's ends hold their places
+    /// (B7 review r3 #7). Every [`Ctx::fixed`] edge, and in
+    /// [`crate::scene::route_partial`] an edge it keeps from its base
+    /// that may still be rerouted where a drag left it hitting
+    /// something (it passes near what the drag changed): the ports stage
+    /// never re-places its ends by its own rules (a drag's redrawn ends
+    /// make room round them), and the router reroutes it for a node,
+    /// frame or chip it now hits, never for spacing alone. Such an edge's
+    /// ends used to be re-placed by `route()`'s rules, which need not
+    /// agree with the base's, so a 1 px drag of a node beside it threw
+    /// them 20-45 px. All `false` (but where `fixed`) outside
+    /// `route_partial`.
+    pub held: Vec<bool>,
 }
 
 /// Build the shared context. `sc.edges` holds `g.edges` first, then the
@@ -217,6 +230,7 @@ pub(crate) fn ctx(g: &Graph, sc: &Scene) -> Ctx {
         })
         .collect();
     let fixed = vec![false; sc.edges.len()];
+    let held = fixed.clone();
     Ctx {
         ends,
         node_frames,
@@ -224,6 +238,7 @@ pub(crate) fn ctx(g: &Graph, sc: &Scene) -> Ctx {
         back,
         drawn,
         fixed,
+        held,
     }
 }
 
@@ -307,8 +322,18 @@ pub(crate) fn finish(g: &Graph, sc: &mut Scene, mode: Mode) {
 /// changed made the stage drop labels it could not improve onto worse
 /// spots, such as their own node.)
 pub(crate) fn finish_fixed(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool]) {
+    finish_held(g, sc, mode, fixed, fixed);
+}
+
+/// [`finish_fixed`] with the edges flagged in `held` (index-parallel
+/// with `sc.edges`, a superset of `fixed`; missing entries are `false`)
+/// holding their ends: see [`Ctx::held`].
+pub(crate) fn finish_held(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool], held: &[bool]) {
     let mut cx = ctx(g, sc);
     for (f, &x) in cx.fixed.iter_mut().zip(fixed) {
+        *f = x;
+    }
+    for (f, &x) in cx.held.iter_mut().zip(held) {
         *f = x;
     }
     let mut moved = vec![false; sc.edges.len()];

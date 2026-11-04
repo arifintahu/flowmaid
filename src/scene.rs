@@ -4659,8 +4659,9 @@ const PARTIAL_ROUTE_SHARE: f64 = 0.5;
 /// touches a node or an arrowhead (with the edge owning that head),
 /// are drawn afresh; those whose `base` path comes within
 /// `PARTIAL_CLEAR` of a moved node's old or new box, of the strip a
-/// frame grew by or of its moved title chip keep their `base` path but
-/// are rerouted when it now hits something. Every other edge keeps its
+/// frame grew by or of its moved title chip keep their `base` path and
+/// ends but are rerouted when it now hits a node, a frame or a title
+/// chip (never for spacing alone). Every other edge keeps its
 /// `base` geometry (channel waypoints, label slot; only a port shared
 /// with a redrawn edge is spaced again, and its label moves when it now
 /// covers something) and is an obstacle the affected edges are routed
@@ -4841,6 +4842,10 @@ pub fn route_partial(
     // like a moved node's (G11).
     let clash = crate::labels::label_clashes(&base.nodes, &base.edges);
     let mut fixed = vec![true; base.edges.len()];
+    // Every edge but the redrawn ones holds its ends (`Ctx::held`): one
+    // kept near the drag (not `fixed`) is rerouted only where it now
+    // hits something, its ends left where the base put them.
+    let mut held = vec![true; base.edges.len()];
     let mut redrawn = 0;
     for (i, e) in sc.edges.iter_mut().enumerate() {
         let b = &base.edges[i];
@@ -4853,6 +4858,7 @@ pub fn route_partial(
             *e = kept;
         } else if moved_end(&b.from) || moved_end(&b.to) || own || clash[i] {
             fixed[i] = false;
+            held[i] = false;
             redrawn += 1;
         } else {
             fixed[i] = !near(b);
@@ -4869,7 +4875,7 @@ pub fn route_partial(
     // refit grows it for whatever the drag pushed outward.
     sc.width = base.width;
     sc.height = base.height;
-    crate::edgepass::finish_fixed(g, &mut sc, crate::edgepass::Mode::Routed, &fixed);
+    crate::edgepass::finish_held(g, &mut sc, crate::edgepass::Mode::Routed, &fixed, &held);
     sc
 }
 
