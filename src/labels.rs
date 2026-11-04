@@ -35,8 +35,8 @@ use crate::layout::{
 };
 use crate::model::{EdgeKind, Graph};
 use crate::scene::{
-    basis_sample, edge_drawn, edge_polyline, fit_cluster_title, shift_scene, Bbox, Scene,
-    SceneCluster, SceneEdge, SceneNode, ARROW_MARKER_PX, MARGIN,
+    basis_sample, edge_drawn, edge_polyline, fit_cluster_title, label_stub, shift_scene, Bbox,
+    Scene, SceneCluster, SceneEdge, SceneNode, ARROW_MARKER_PX, MARGIN,
 };
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -88,6 +88,9 @@ const LABEL_PREFER: f64 = 0.5;
 /// other end): the middle of the half away from it (mirrored for an
 /// edge entering one).
 const LABEL_HUB_PREFER: f64 = 0.75;
+/// Most edge ends a node may have and still be a decision rather than
+/// a hub to [`LABEL_HUB_PREFER`]: one way in, two out (or the reverse).
+const LABEL_HUB_MIN: usize = 3;
 /// Least share of its line's length, counted from a compact branch
 /// point (see [`is_branch_point`]), at which a label of the point's fan
 /// keeps its spot: a little past the middle, so a label still at the
@@ -1043,6 +1046,74 @@ pub(crate) fn chip_rect(clusters: &[SceneCluster], ci: usize, canvas_right: f64)
     )
 }
 
+/// Whether polyline `pts` runs straight across the page (its chord more
+/// across than down, as an LR / RL label lies along its line): every
+/// sample within [`TOUCH_EPS`] of the chord between its ends.
+pub(crate) fn runs_straight_across(pts: &[(f64, f64)]) -> bool {
+    let (Some(&a), Some(&b)) = (pts.first(), pts.last()) else {
+        return false;
+    };
+    let len = (b.0 - a.0).hypot(b.1 - a.1);
+    (b.0 - a.0).abs() > (b.1 - a.1).abs()
+        && pts.iter().all(|p| {
+            ((p.0 - a.0) * (b.1 - a.1) - (p.1 - a.1) * (b.0 - a.0)).abs() / len <= TOUCH_EPS
+        })
+}
+
+/// Whether edge `e`, drawn along `pts`, gets the short head box of a
+/// line that [`runs_straight_across`]: only an edge the flowchart
+/// painter draws (no `paint_width`). A class or ER scene paints its own
+/// glyphs at the ends and keeps its label boxes as they were (B7 review
+/// r4 #1: its output stays byte-identical).
+pub(crate) fn straight_head_line(e: &SceneEdge, pts: &[(f64, f64)]) -> bool {
+    e.paint_width.is_none() && runs_straight_across(pts)
+}
+
+/// Most (px) an arrowhead's box reaches back from its tip along a line
+/// that [`runs_straight_across`]: a head and half a [`LABEL_CLEAR`], so a label
+/// stays a few px off it, and one the label stage centres on the run
+/// clear of its head (`head_clear_spot`, LABEL_CLEAR off) still fits.
+const STRAIGHT_HEAD_BOX: f64 = ARROW_MARKER_PX + LABEL_CLEAR / 2.0;
+
+/// [`arrow_box`] at either end of polyline `pts` (the tip `at_end` or at
+/// its start), on a line that `straight` (a flowchart edge that
+/// [`runs_straight_across`], see [`straight_head_line`]) no longer than
+/// [`STRAIGHT_HEAD_BOX`] (B7 review r3 #4). The box reaches back to the
+/// first sample a head's length off the tip — on a coarsely sampled
+/// curve past the head, the chord the eye follows there — but on a
+/// straight line that chord is the line itself: a `curve: linear`
+/// edge's head took its whole line, and a straight route() cubic's,
+/// whose samples thin out toward its ends, 21 px, so an LR label scene()
+/// centred on its line between tail and head (`head_clear_spot`, in a
+/// gap the layout sized for it) stepped beside it in route() and jumped
+/// 20 px under a 1 px drag. (`quality`'s `lbl_arrow` measures the head
+/// itself there, a head long.) Down the page a label is a row tall and
+/// its gap keeps a [`crate::layout::LABEL_RUN`] either side; the box
+/// there is as it was.
+fn end_arrow_box(pts: &[(f64, f64)], at_end: bool, straight: bool) -> Option<Rect> {
+    let tip = if at_end { *pts.last()? } else { *pts.first()? };
+    let back = |n: usize| -> Box<dyn Iterator<Item = (f64, f64)> + '_> {
+        if at_end {
+            Box::new(pts.iter().rev().copied().take(n))
+        } else {
+            Box::new(pts.iter().copied().take(n))
+        }
+    };
+    if straight {
+        // The sample the box would reach back to, and how far that is.
+        let far = back(pts.len())
+            .find(|p| (p.0 - tip.0).hypot(p.1 - tip.1) >= ARROW_MARKER_PX)
+            .unwrap_or(if at_end { pts[0] } else { pts[pts.len() - 1] });
+        let d = (far.0 - tip.0).hypot(far.1 - tip.1);
+        if d > STRAIGHT_HEAD_BOX {
+            let k = STRAIGHT_HEAD_BOX / d;
+            let base = (tip.0 + (far.0 - tip.0) * k, tip.1 + (far.1 - tip.1) * k);
+            return arrow_box(tip, [base].into_iter());
+        }
+    }
+    arrow_box(tip, back(pts.len()))
+}
+
 /// Box an arrowhead drawn at the end `tip` of a polyline (walked
 /// backwards by `back`) occupies: [`ARROW_MARKER_PX`] wide, from the tip
 /// back to the first sample at least that far (the far end of a shorter
@@ -1658,18 +1729,22 @@ fn place(
     // one by LABEL_GAP no longer fits the gap the layout sized for it.
     for (e, pts) in edges.iter().zip(&lines) {
         let Some(pts) = pts else { continue };
-        let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else {
-            continue;
-        };
+        let straight = straight_head_line(e, pts);
         if e.ends.end_marker(e.kind).is_some() {
-            if let Some(r) = arrow_box(last, pts.iter().rev().copied()) {
+            if let Some(r) = end_arrow_box(pts, true, straight) {
                 fixed.push(r, Kind::Arrow);
             }
         }
         if e.ends.start_marker(e.kind).is_some() {
-            if let Some(r) = arrow_box(first, pts.iter().copied()) {
+            if let Some(r) = end_arrow_box(pts, false, straight) {
                 fixed.push(r, Kind::Arrow);
             }
+        }
+        // A styled edge's label leaves a run of its stroke in sight at
+        // either end, as a head is left: on its line where the gap holds
+        // it, beside it where the gap is shorter (`stub_boxes`).
+        for r in stub_boxes(e, pts) {
+            fixed.push(r, Kind::Arrow);
         }
     }
     let field = Field {
@@ -1741,18 +1816,78 @@ fn place(
         })
         .collect();
     // (preferred spot, fan-out of a hub end or 0) per edge.
+    // Edges per node pair, either way round: a twin's label stacks
+    // along its own line (below).
+    fn pair(e: &SceneEdge) -> (&str, &str) {
+        let (a, b) = (e.from.as_str(), e.to.as_str());
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+    let mut pairs: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for e in edges.iter() {
+        *pairs.entry(pair(e)).or_insert(0) += 1;
+    }
     let hub: Vec<(f64, usize)> = edges
         .iter()
         .zip(&fan)
-        .map(|(e, &fan)| {
+        .enumerate()
+        .map(|(ei, (e, &fan))| {
             let df = degree.get(e.from.as_str()).copied().unwrap_or(0);
             let dt = degree.get(e.to.as_str()).copied().unwrap_or(0);
             // A hub end piles every label of its fan near it: prefer
             // the middle of the half away from the busier end — away
-            // from a compact branch point whatever the counts.
-            if fan == Some(true) || fan.is_none() && e.from != e.to && df > 1 && df > dt {
+            // from a compact branch point whatever the counts. Not a
+            // decision's branch (its node has [`LABEL_HUB_MIN`] ends at
+            // most) drawn as a single curve across one gap of a
+            // flowchart drawing, with no parallel twin (twins' labels
+            // stack along their own lines): the layout sized that gap
+            // for its label in the middle, clear of the head (report M3,
+            // §2.6), and the half away from the decision is where the
+            // curve turns into its target (long-labels' `incomplete` sat
+            // on that bend, against the head).
+            // So is a hub's edge across one gap with no node between its
+            // ends whose label, centred on its line's middle, no other
+            // stroke runs through (B7 review r1 #6: a hub's labels sat in
+            // the half near the head, on the bend — `express` 5.7 px off
+            // its head's base): the layout grows such a gap until each of
+            // its labels clears the fan's other curves there
+            // (`layout::hub_label_room`). Where it could not (a fan
+            // drawn as a cable of near-parallel curves), the label keeps
+            // to the far half, where the fan has spread.
+            let twin = pairs.get(&pair(e)).is_some_and(|&k| k > 1);
+            let across = e.paint_width.is_none() && e.waypoints.is_empty() && !twin;
+            let mid_clear = || {
+                let (Some(pts), Some((_, _, w))) = (&lines[ei], &e.label) else {
+                    return false;
+                };
+                let r = label_rect(line_middle(pts), *w);
+                // Nor does another label's box as built, kept as far as a
+                // sibling keeps (moving there would only push it aside).
+                let g = FAN_SIBLING_GAP;
+                let near = (r.0 - g, r.1 - g, r.2 + g, r.3 + g);
+                one_gap_down(e, nodes)
+                    && e.meta.curve.is_none()
+                    && field.strokes().count(r, ei, 1) == 0
+                    && edges.iter().enumerate().all(|(j, f)| {
+                        j == ei
+                            || lines[j].is_none()
+                            || f.label
+                                .as_ref()
+                                .map_or(true, |(_, c, w)| !boxes_touch(&label_rect(*c, *w), &near))
+                    })
+            };
+            let hub_end = |d: usize, other: usize| {
+                e.from != e.to
+                    && d > 1
+                    && d > other
+                    && !(across && (d <= LABEL_HUB_MIN || mid_clear()))
+            };
+            if fan == Some(true) || fan.is_none() && hub_end(df, dt) {
                 (LABEL_HUB_PREFER, df)
-            } else if fan == Some(false) || fan.is_none() && e.from != e.to && dt > 1 && dt > df {
+            } else if fan == Some(false) || fan.is_none() && hub_end(dt, df) {
                 (1.0 - LABEL_HUB_PREFER, dt)
             } else {
                 (LABEL_PREFER, 0)
@@ -1761,6 +1896,11 @@ fn place(
         .collect();
 
     let n = edges.len();
+    // Edges with a parallel twin (their labels stack along their lines).
+    let twinned: Vec<bool> = edges
+        .iter()
+        .map(|e| pairs.get(&pair(e)).is_some_and(|&k| k > 1))
+        .collect();
     let mut tracks: Vec<Option<Track>> = (0..n).map(|_| None).collect();
     // A fan label left in the near half of its line (the builder's
     // midpoint slot, say) is stacked into the far part first; one that
@@ -1836,6 +1976,32 @@ fn place(
             .collect(),
     )
     .with_siblings(sibs);
+
+    // In the final pass, a label lying along its line at the curve's
+    // middle moves to the middle of the run clear of its arrowhead
+    // (`head_clear_spot`), where that spot is clean and no other stroke
+    // comes within STROKE_PAD of it.
+    if matches!(pass, Pass::Changed(_)) {
+        for ei in 0..n {
+            let (Some(pts), Some((_, at, w))) = (&lines[ei], edges[ei].label.clone()) else {
+                continue;
+            };
+            let Some(to) = head_clear_spot(&edges[ei], pts, at) else {
+                continue;
+            };
+            let r = label_rect(to, w);
+            if field.hits(&placed, ei, r).none()
+                && placed.clear(ei, r, keep[ei])
+                && field.strokes().count(r, ei, 0) == 0
+            {
+                if let Some((_, m, _)) = &mut edges[ei].label {
+                    *m = to;
+                }
+                placed.set(ei, r);
+                moved.push(ei);
+            }
+        }
+    }
 
     // Labels already searched, and the boxes labels left or took in the
     // last round (by mover): a searched label is tried again only when
@@ -1957,6 +2123,64 @@ fn place(
             break;
         }
     }
+    // Last, in the final pass, a label the builders' pass moved off its
+    // preferred spot returns there once that spot is clean (B7 review r4
+    // #3): the builders place labels before the port stage spreads the
+    // ends, and a fan's labels that met at their first midpoints (v4's
+    // `thick` and `side`, 11 px apart) still stood apart after the
+    // spread had moved their curves 30 px apart — one slid toward its
+    // head, its chip 3 px off the head's base, in a gap the layout had
+    // sized for it in the middle. Every other label is final by now, so
+    // a return never pushes one aside, and only a redrawn edge's label
+    // returns (a drag leaves the others put). On a straight LR line the
+    // spot is the run clear of the head (`head_clear_spot`). Only a
+    // label whose spot is its curve's middle: not a hub's (it lies toward the
+    // head, the far half's middle), a compact branch point's fan (its
+    // rows are `stack_fans`'), a twin (twins stack along their own
+    // lines), a long edge (its slot is its dummy's), a self-loop, or a
+    // class / ER relation (its painter's labels are as they were).
+    if let Pass::Changed(changed) = pass {
+        for ei in 0..n {
+            let e = &edges[ei];
+            let (Some(pts), Some((_, at, w))) = (&lines[ei], e.label.clone()) else {
+                continue;
+            };
+            if !changed.get(ei).copied().unwrap_or(false)
+                || e.from == e.to
+                || e.paint_width.is_some()
+                || !e.waypoints.is_empty()
+                || fan[ei].is_some()
+                || hub[ei].1 > 0
+                || stacked[ei]
+                || twinned[ei]
+            {
+                continue;
+            }
+            let len: f64 = pts
+                .windows(2)
+                .map(|s| (s[1].0 - s[0].0).hypot(s[1].1 - s[0].1))
+                .sum();
+            let mid = line_at(pts, len * LABEL_PREFER);
+            let to = head_clear_spot(e, pts, mid).unwrap_or(mid);
+            if (to.0 - at.0).hypot(to.1 - at.1) <= TOUCH_EPS {
+                continue;
+            }
+            // Clean as a label kept where it is must be: no stroke, no
+            // head even touched, its keep-out clear.
+            let r = label_rect(to, w);
+            if field.hits(&placed, ei, r).none()
+                && field.untouched(r)
+                && placed.clear(ei, r, keep[ei])
+                && field.strokes().count(r, ei, 0) == 0
+            {
+                if let Some((_, m, _)) = &mut edges[ei].label {
+                    *m = to;
+                }
+                placed.set(ei, r);
+                moved.push(ei);
+            }
+        }
+    }
     moved.sort_unstable();
     moved.dedup();
     moved
@@ -1965,6 +2189,192 @@ fn place(
 /// Part of a fan line walked from its far end: (spot, depth back along
 /// the flow).
 type Walk = Vec<(Pt, f64)>;
+
+/// The point halfway along polyline `pts` (by length).
+fn line_middle(pts: &[(f64, f64)]) -> (f64, f64) {
+    let len: f64 = pts
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+        .sum();
+    line_at(pts, len / 2.0)
+}
+
+/// The point `s` px along polyline `pts` (by length; its last point
+/// past its end).
+fn line_at(pts: &[(f64, f64)], s: f64) -> (f64, f64) {
+    let mut left = s;
+    for w in pts.windows(2) {
+        let d = (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
+        if d >= left && d > 0.0 {
+            let f = left / d;
+            return (
+                w[0].0 + (w[1].0 - w[0].0) * f,
+                w[0].1 + (w[1].1 - w[0].1) * f,
+            );
+        }
+        left -= d;
+    }
+    pts.last().copied().unwrap_or((0.0, 0.0))
+}
+
+/// Report M3, B7 review r3 #1: the runs of a labelled styled edge's
+/// stroke (dotted, thick, `linkStyle`-painted) a label chip keeps clear
+/// of, as an arrowhead is kept clear: at either end of its line, past
+/// its end glyph there, [`label_stub`] long and a head wide, in short
+/// oriented boxes. Only for a free line drawn across the page (LR / RL:
+/// its chord runs more across than down), where a label lies along its
+/// line and the layout sizes the gap for those runs (`layout`'s
+/// `styled_room`): centred there, a chip clears them by
+/// [`LABEL_CLEAR`]; in a gap a drag made shorter it steps beside its
+/// line, as a label does off a head. A TD / BT label is a row tall and
+/// its gap keeps a [`crate::layout::LABEL_RUN`] either side. Before, a
+/// chip in an LR gap sized for itself and its head left about 6 px of
+/// stroke either side: one dash of a dotted edge, and a thick or
+/// coloured one that read as plain.
+fn stub_boxes(e: &SceneEdge, pts: &[(f64, f64)]) -> Vec<Rect> {
+    let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else {
+        return Vec::new();
+    };
+    if e.label.is_none()
+        || e.paint_width.is_some()
+        || e.from == e.to
+        || (last.0 - first.0).abs() <= (last.1 - first.1).abs()
+    {
+        return Vec::new();
+    }
+    let stub = label_stub(e.kind, &e.meta);
+    if stub <= 0.0 {
+        return Vec::new();
+    }
+    let len: f64 = pts
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+        .sum();
+    let mut out = Vec::new();
+    for (head, at_end) in [
+        (e.ends.start_marker(e.kind).is_some(), false),
+        (e.ends.end_marker(e.kind).is_some(), true),
+    ] {
+        let a0 = if head { ARROW_MARKER_PX } else { 0.0 };
+        let a1 = (a0 + stub).min(len);
+        // In steps of at most a head's length, so a bending run's boxes
+        // hug it.
+        let steps = ((a1 - a0) / ARROW_MARKER_PX).ceil().max(1.0) as usize;
+        for k in 0..steps {
+            let (s0, s1) = (
+                a0 + (a1 - a0) * k as f64 / steps as f64,
+                a0 + (a1 - a0) * (k + 1) as f64 / steps as f64,
+            );
+            let at = |s: f64| line_at(pts, if at_end { len - s } else { s });
+            let (p, q) = (at(s0), at(s1));
+            let d = (q.0 - p.0).hypot(q.1 - p.1);
+            if d <= f64::EPSILON {
+                continue;
+            }
+            let h = ARROW_MARKER_PX / 2.0;
+            let (nx, ny) = (-(q.1 - p.1) / d * h, (q.0 - p.0) / d * h);
+            out.push((
+                p.0.min(q.0) - nx.abs(),
+                p.1.min(q.1) - ny.abs(),
+                p.0.max(q.0) + nx.abs(),
+                p.1.max(q.1) + ny.abs(),
+            ));
+        }
+    }
+    out
+}
+
+/// Report M3 (§2.6), B7 review r2 #3: the spot a label lying along its
+/// line takes — a single free curve the flowchart painter draws across
+/// the page (LR / RL: its chord runs more across than down), with an
+/// arrowhead at one end only, whose label (`at`) sits on the line, or
+/// just beside it (where the stages stepped it off the head), between
+/// its middle and that spot: the middle of the run
+/// clear of the head, halfway between the tail and the head's base
+/// (from there up to the middle: a label the stages slid a little off
+/// the head moves the rest of the way). The
+/// layout sizes such a gap for the label, a head and [`LABEL_CLEAR`] on
+/// either side (`layout`'s LR head room), which is where the label sits
+/// only so centred: at the curve's middle it stood half a head nearer
+/// its head, 2.6-4.2 px off the head's base with 7.5-9 px of stub at
+/// the tail, and the head seemed to grow out of the chip. `None` where
+/// the rule does not apply (a TD / BT label is a row tall, and its gap
+/// keeps a [`crate::layout::LABEL_RUN`] either side).
+fn head_clear_spot(e: &SceneEdge, pts: &[(f64, f64)], at: (f64, f64)) -> Option<(f64, f64)> {
+    let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else {
+        return None;
+    };
+    let heads = (
+        e.ends.start_marker(e.kind).is_some(),
+        e.ends.end_marker(e.kind).is_some(),
+    );
+    if e.paint_width.is_some()
+        || e.from == e.to
+        || !e.waypoints.is_empty()
+        || heads.0 == heads.1
+        || (last.0 - first.0).abs() <= (last.1 - first.1).abs()
+    {
+        return None;
+    }
+    // Where along the line the label sits (arc length), and how far off.
+    let (mut off, mut s_at, mut len) = (f64::INFINITY, 0.0, 0.0);
+    for w in pts.windows(2) {
+        let d = (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
+        let f = if d > 0.0 {
+            (((at.0 - w[0].0) * (w[1].0 - w[0].0) + (at.1 - w[0].1) * (w[1].1 - w[0].1)) / (d * d))
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let q = (
+            w[0].0 + (w[1].0 - w[0].0) * f,
+            w[0].1 + (w[1].1 - w[0].1) * f,
+        );
+        let o = (at.0 - q.0).hypot(at.1 - q.1);
+        if o < off {
+            (off, s_at) = (o, len + f * d);
+        }
+        len += d;
+    }
+    if off > LABEL_BOX_H / 2.0 + LABEL_SIDE_AIR + FAN_ON_LINE || len <= 2.0 * ARROW_MARKER_PX {
+        return None;
+    }
+    // Halfway between the tail and the head's base, and how far the
+    // label lies from there toward the head (the middle at most).
+    let (s, toward) = if heads.1 {
+        let s = (len - ARROW_MARKER_PX) / 2.0;
+        (s, s_at - s)
+    } else {
+        let s = (len + ARROW_MARKER_PX) / 2.0;
+        (s, s - s_at)
+    };
+    (toward > TOUCH_EPS && toward <= ARROW_MARKER_PX / 2.0 + FAN_ON_LINE).then(|| line_at(pts, s))
+}
+
+/// Whether edge `e`, drawn as one free curve down (or up) the page,
+/// spans a single gap: no node's centre lies along the flow strictly
+/// between its two boxes. The flow runs the way its curve leaves its
+/// start (its first control's offset), as the builder draws a curve
+/// across a gap; along LR / RL a label lies along its line, and the
+/// layout sizes no hub room for it (`layout::hub_label_room`).
+fn one_gap_down(e: &SceneEdge, nodes: &[SceneNode]) -> bool {
+    let at = |id: &str| nodes.iter().find(|n| n.id == id);
+    let (Some(a), Some(b)) = (at(&e.from), at(&e.to)) else {
+        return false;
+    };
+    let [p0, p1, ..] = e.bezier;
+    if (p1.1 - p0.1).abs() <= (p1.0 - p0.0).abs() {
+        return false;
+    }
+    let (a0, a1, b0, b1) = (
+        a.y - a.h / 2.0,
+        a.y + a.h / 2.0,
+        b.y - b.h / 2.0,
+        b.y + b.h / 2.0,
+    );
+    let (lo, hi) = if a0 <= b0 { (a1, b0) } else { (b1, a0) };
+    lo < hi && nodes.iter().all(|n| n.y <= lo || n.y >= hi)
+}
 
 /// Stacks the labels of the compact branch points' fans flagged in
 /// `lift` (a fan is flagged whole) in rows across the far half of their
@@ -2683,14 +3093,12 @@ pub(crate) fn label_clashes(nodes: &[SceneNode], edges: &[SceneEdge]) -> Vec<boo
     let mut heads: Vec<(usize, Rect)> = Vec::new();
     for (j, (e, pts)) in edges.iter().zip(&lines).enumerate() {
         let Some(pts) = pts else { continue };
-        let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else {
-            continue;
-        };
+        let straight = straight_head_line(e, pts);
         if e.ends.end_marker(e.kind).is_some() {
-            heads.extend(arrow_box(last, pts.iter().rev().copied()).map(|r| (j, r)));
+            heads.extend(end_arrow_box(pts, true, straight).map(|r| (j, r)));
         }
         if e.ends.start_marker(e.kind).is_some() {
-            heads.extend(arrow_box(first, pts.iter().copied()).map(|r| (j, r)));
+            heads.extend(end_arrow_box(pts, false, straight).map(|r| (j, r)));
         }
     }
     let meets = |a: Rect, b: Rect| a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3;
@@ -2805,6 +3213,319 @@ mod tests {
         let sc = crate::scene::scene(&g);
         let sibs = label_siblings(&sc.nodes, &sc.edges, |i| sc.edges[i].label.is_some());
         assert!(sibs.iter().all(Vec::is_empty), "{sibs:?}");
+    }
+
+    /// B7 review r2 (#3, report M3): a label lying on a straight LR edge
+    /// is centred on the run clear of its arrowhead, in `scene()` and
+    /// `route()`: the chip keeps [`LABEL_CLEAR`] from the head's base
+    /// (it stopped 2.6-4.2 px short of it, the head seeming to grow out
+    /// of the chip) and as much stub at its tail. A label the stages
+    /// stepped beside its line stays there.
+    #[test]
+    fn an_lr_label_centres_on_the_run_clear_of_its_head() {
+        let g = crate::parser::parse(
+            "flowchart LR\n  A[Alpha] -->|ok| B[Beta]\n  B -->|denied| C[Gamma]\n  \
+             C -->|access denied| D[Delta]\n  D -->|a much longer label here| E[Epsilon]",
+        )
+        .unwrap();
+        let sc = crate::scene::scene(&g);
+        let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let routed = crate::scene::route(&g, &at);
+        // B7 review r3 #4: route()'s 'a much longer label here' stayed
+        // beside its line (its straight cubic's samples thin out toward
+        // the ends, and the head box ran 21 px back to the last one), so
+        // a 1 px drag of D or E moved it 20 px. Every label now lies on
+        // its line in scene() and route() alike, and holds still.
+        let mut dragged = at.clone();
+        dragged[3].0 += 1.0;
+        let partial = crate::scene::route_partial(&g, &dragged, &sc, &at);
+        for (mode, sc) in [("scene", &sc), ("route", &routed), ("drag", &partial)] {
+            for e in &sc.edges {
+                let (text, c, w) = e.label.as_ref().unwrap();
+                let (a, b) = (e.bezier[0], e.bezier[3]);
+                assert!((a.1 - b.1).abs() < 1e-6, "{mode} {text}: straight");
+                assert!(
+                    (c.1 - a.1).abs() <= FAN_ON_LINE,
+                    "{mode} {text}: on its line"
+                );
+                let tail = c.0 - w / 2.0 - a.0;
+                let head = b.0 - ARROW_MARKER_PX - (c.0 + w / 2.0);
+                assert!(
+                    head >= LABEL_CLEAR - 0.5 - 1e-6 && (tail - head).abs() < 1.0 + 1e-6,
+                    "{mode} {text}: tail {tail:.1} head {head:.1}"
+                );
+            }
+        }
+        for (e, f) in sc.edges.iter().zip(&partial.edges) {
+            let (c, d) = (e.label.as_ref().unwrap().1, f.label.as_ref().unwrap().1);
+            assert!((c.0 - d.0).hypot(c.1 - d.1) <= 1.0 + 1e-6, "{c:?} -> {d:?}");
+        }
+    }
+
+    #[test]
+    fn a_straight_linear_lr_edge_keeps_its_label_on_its_line() {
+        // B7 review r3 #4: a `curve: linear` (or step) edge is drawn as
+        // two samples, and its head's box took the whole line, so its
+        // label always stepped beside it. On a straight line across the
+        // page the box is a head (and half a LABEL_CLEAR) long.
+        let g = crate::parser::parse(
+            "flowchart LR
+  A[Alpha] e1@-->|styled red| B[Beta]
+  B -->|stepped| C[Gamma]
+               e1@{ curve: linear }
+  linkStyle 1 interpolate step
+",
+        )
+        .unwrap();
+        let sc = crate::scene::scene(&g);
+        let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let routed = crate::scene::route(&g, &at);
+        for (mode, sc) in [("scene", &sc), ("route", &routed)] {
+            for e in &sc.edges {
+                let (text, c, _) = e.label.as_ref().unwrap();
+                let pts = edge_polyline(e);
+                assert!(runs_straight_across(&pts), "{mode} {text}");
+                assert!(
+                    (c.1 - pts[0].1).abs() <= FAN_ON_LINE,
+                    "{mode} {text}: {c:?}"
+                );
+                let head = end_arrow_box(&pts, true, true).unwrap();
+                assert!(head.2 - head.0 <= STRAIGHT_HEAD_BOX + 1e-6, "{mode} {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_fan_label_moved_by_the_builders_returns_to_its_middle() {
+        // B7 review r4 #3: the builders placed `thick` and `side` at
+        // their first midpoints, 11 px apart, and slid `thick` toward its
+        // head; the port stage then spread the fan 30 px apart, but the
+        // label stayed put, its chip 3 px off the head's base in a gap
+        // sized for it in the middle. In the final pass it returns to its
+        // curve's middle once that spot is clean — in scene(), route()
+        // and a drag alike.
+        let g = crate::parser::parse(
+            "flowchart TD
+  A[Start] -.->|dotted| B[Next]
+  B ==>|thick| C[Then]
+  C -->|plain| D[End]
+  B -->|side| E[Other]
+  linkStyle 2 stroke:#d33,stroke-dasharray: 6 3
+",
+        )
+        .unwrap();
+        let sc = crate::scene::scene(&g);
+        let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let routed = crate::scene::route(&g, &at);
+        let mut moved = at.clone();
+        moved[2].0 += 1.0;
+        let drag = crate::scene::route_partial(&g, &moved, &sc, &at);
+        for (mode, sc) in [("scene", &sc), ("route", &routed), ("drag", &drag)] {
+            for e in &sc.edges {
+                let (text, c, w) = e.label.as_ref().unwrap();
+                let pts = edge_polyline(e);
+                let mid = line_middle(&pts);
+                if text == "thick" || text == "side" {
+                    assert!(
+                        (c.0 - mid.0).hypot(c.1 - mid.1) <= 1.0,
+                        "{mode} {text} at {c:?}, middle {mid:?}"
+                    );
+                }
+                // Every chip stays well off its head's base.
+                let tip = *pts.last().unwrap();
+                let base = tip.1 - ARROW_MARKER_PX;
+                let r = label_rect(*c, *w);
+                assert!(base - r.3 >= 10.0, "{mode} {text}: {r:?} vs base {base}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_class_relation_keeps_its_full_head_box() {
+        // B7 review r4 #1: the short head box of a straight flowchart
+        // line (`straight_head_line`) is the flowchart painter's alone. A
+        // class scene paints its own glyphs (`paint_width`), and its
+        // labels keep their old distance from the head: a08's long
+        // relation label sat 6 px off its head base with the short box,
+        // 17 px without (its output byte-identical to before B7).
+        let src = "classDiagram
+direction LR
+class List~T~ {
+<<interface>>
++add(T item) void
++get(int i) T
+}
+class Map~K,V~
+class VeryVeryVeryVeryLongClassNameThatKeepsGoingAndGoingForeverAndEver
+List~T~ <|.. ArrayList~T~
+Map~K,V~ <|.. HashMap~K,V~
+VeryVeryVeryVeryLongClassNameThatKeepsGoingAndGoingForeverAndEver --> List~T~ : a very very long relation label that goes on and on
+HashMap~K,V~ --> HashMap~K,V~ : rehash
+note for Map~K,V~ \"generic\"
+";
+        let crate::model::Document::Class(d) = crate::parser::parse_document(src).unwrap() else {
+            panic!("not a class diagram");
+        };
+        let cs = crate::class::scene(&d);
+        let mut checked = 0;
+        for e in &cs.scene.edges {
+            let Some((text, c, w)) = &e.label else {
+                continue;
+            };
+            if !text.starts_with("a very") {
+                continue;
+            }
+            let pts = edge_polyline(e);
+            assert!(e.paint_width.is_some());
+            assert!(!straight_head_line(e, &pts), "{pts:?}");
+            // A flowchart edge along the same line would get the short box.
+            let mut flow = e.clone();
+            flow.paint_width = None;
+            assert_eq!(straight_head_line(&flow, &pts), runs_straight_across(&pts));
+            let r = label_rect(*c, *w);
+            let tip = *pts.last().unwrap();
+            let base = tip.0 + (pts[0].0 - tip.0).signum() * ARROW_MARKER_PX;
+            let off = (r.0 - base).max(base - r.2);
+            assert!(
+                off >= 12.0,
+                "label {r:?} {off:.1} px off the head base at {base:.1}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 1);
+    }
+
+    #[test]
+    fn a_styled_lr_label_leaves_its_stroke_in_sight() {
+        // B7 review r3 #1: an LR / RL gap sized for its label and head
+        // left about 6 px of stroke either side of the chip: one dash of
+        // a dotted edge, a thick or `linkStyle`-coloured one that read
+        // as plain. Such a gap now keeps `label_stub` of stroke in sight
+        // past LABEL_CLEAR either side, in scene() and route(); a plain
+        // edge's gap is as before.
+        for (dir, edge, style) in [
+            ("LR", "-.->", ""),
+            ("LR", "==>", ""),
+            ("RL", "-.->", ""),
+            ("LR", "-->", "linkStyle 0 stroke:#3a3"),
+            ("LR", "-.->", "linkStyle 0 stroke:#3a3,stroke-width:3px"),
+            ("LR", "-->", "linkStyle 0 stroke-dasharray: 10 6"),
+            ("LR", "<-.->", ""),
+            ("LR", "-.-", ""),
+        ] {
+            let src =
+                format!("flowchart {dir}\n  C[Gamma] {edge}|dotted wide| D[Delta]\n  {style}\n");
+            let g = crate::parser::parse(&src).unwrap();
+            let sc = crate::scene::scene(&g);
+            let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+            let routed = crate::scene::route(&g, &at);
+            for (mode, sc) in [("scene", &sc), ("route", &routed)] {
+                let e = &sc.edges[0];
+                let stub = label_stub(e.kind, &e.meta);
+                assert!(stub >= 15.0, "{src}: styled");
+                let (_, c, w) = e.label.as_ref().unwrap();
+                let (a, b) = (e.bezier[0], e.bezier[3]);
+                assert!(
+                    (a.1 - b.1).abs() < 1e-6 && (c.1 - a.1).abs() < 1e-6,
+                    "{mode} {src}"
+                );
+                // Stroke in sight from either end (past its glyph) to the
+                // chip.
+                let s = (b.0 - a.0).signum();
+                let glyph = |m: bool| if m { ARROW_MARKER_PX } else { 0.0 };
+                let tail = s * (c.0 - a.0) - w / 2.0 - glyph(e.ends.start_marker(e.kind).is_some());
+                let head = s * (b.0 - c.0) - w / 2.0 - glyph(e.ends.end_marker(e.kind).is_some());
+                assert!(
+                    tail.min(head) >= stub + LABEL_CLEAR - 0.5,
+                    "{mode} {src}: tail {tail:.1} head {head:.1}, stub {stub}"
+                );
+            }
+        }
+        // A plain edge's label still fills its gap but for the head and
+        // LABEL_CLEAR either side.
+        let g = crate::parser::parse("flowchart LR\n  C[Gamma] -->|dotted wide| D[Delta]").unwrap();
+        let sc = crate::scene::scene(&g);
+        let e = &sc.edges[0];
+        let (_, _, w) = e.label.as_ref().unwrap();
+        let gap = e.bezier[3].0 - e.bezier[0].0;
+        assert!(
+            (gap - (w + 2.0 * LABEL_CLEAR + ARROW_MARKER_PX)).abs() < 0.5,
+            "plain gap {gap}"
+        );
+        assert_eq!(label_stub(e.kind, &e.meta), 0.0);
+    }
+
+    #[test]
+    fn a_styled_label_steps_beside_a_gap_too_short_for_its_stroke() {
+        // B7 review r3 #1: dragged closer than the layout spaced them, a
+        // dotted edge's ends leave no room for its chip and a run of
+        // stroke either side: the chip steps beside its line (as one does
+        // off a head) instead of hiding all but a dash of it.
+        let g = crate::parser::parse(
+            "flowchart LR\n  C[Gamma] -.->|dotted wide| D[Delta]\n  \
+             linkStyle 0 stroke:#3a3,stroke-width:3px\n",
+        )
+        .unwrap();
+        let sc = crate::scene::scene(&g);
+        let mut at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        // 20 px nearer: the chip and its head still fit (with 11 px of
+        // stroke either side), its stroke runs do not.
+        at[1].0 -= 20.0;
+        let routed = crate::scene::route(&g, &at);
+        let e = &routed.edges[0];
+        let (_, c, w) = e.label.as_ref().unwrap();
+        let r = label_rect(*c, *w);
+        assert!(
+            (c.1 - e.bezier[0].1).abs() > LABEL_BOX_H / 2.0,
+            "{r:?} on its line"
+        );
+        let pts = edge_polyline(e);
+        for s in stub_boxes(e, &pts) {
+            assert_eq!(covered(r, 0.0, &[s]), 0.0, "chip {r:?} on a stub {s:?}");
+        }
+        // Still its own label: beside its line, not across the page.
+        assert!(rect_line_dist(r, &pts) <= LABEL_DRIFT_MAX, "{r:?}");
+    }
+
+    #[test]
+    fn label_stub_reads_the_edge_style() {
+        use crate::model::{EdgeMeta, LinkStyle};
+        let plain = EdgeMeta::default();
+        assert_eq!(label_stub(EdgeKind::Arrow, &plain), 0.0);
+        assert_eq!(label_stub(EdgeKind::Open, &plain), 0.0);
+        assert_eq!(label_stub(EdgeKind::Dotted, &plain), 15.0);
+        assert_eq!(label_stub(EdgeKind::ThickOpen, &plain), 15.0);
+        let styled = |f: &dyn Fn(&mut LinkStyle)| {
+            let mut m = EdgeMeta::default();
+            f(&mut m.style);
+            m
+        };
+        // `stroke-dasharray:0` draws a dotted edge solid.
+        let solid = styled(&|s| s.stroke_dasharray = Some("0".into()));
+        assert_eq!(label_stub(EdgeKind::Dotted, &solid), 0.0);
+        // Two periods of a long dash; an odd list repeats twice.
+        let dash = styled(&|s| s.stroke_dasharray = Some("10px, 6".into()));
+        assert_eq!(label_stub(EdgeKind::Arrow, &dash), 32.0);
+        let odd = styled(&|s| s.stroke_dasharray = Some("4 2 4".into()));
+        assert_eq!(label_stub(EdgeKind::Arrow, &odd), 40.0);
+        let huge = styled(&|s| s.stroke_dasharray = Some("100 100".into()));
+        assert_eq!(label_stub(EdgeKind::Arrow, &huge), 45.0);
+        // A colour or width alone, not the label text's colour.
+        let red = styled(&|s| s.stroke = Some("#d33".into()));
+        assert_eq!(label_stub(EdgeKind::Arrow, &red), 15.0);
+        let ink = styled(&|s| s.color = Some("#d33".into()));
+        assert_eq!(label_stub(EdgeKind::Arrow, &ink), 0.0);
+        // B7 review r4 #7: a width that repeats the plain one shows no
+        // style (`linkStyle default stroke-width:2px`), nor does a `==>`
+        // set back to it (it draws plain); another width does.
+        let plain_w = styled(&|s| s.stroke_width = Some(crate::scene::EDGE_WIDTH));
+        assert_eq!(label_stub(EdgeKind::Arrow, &plain_w), 0.0);
+        assert_eq!(label_stub(EdgeKind::Thick, &plain_w), 0.0);
+        let wide = styled(&|s| s.stroke_width = Some(3.0));
+        assert_eq!(label_stub(EdgeKind::Arrow, &wide), 15.0);
+        assert_eq!(label_stub(EdgeKind::Thick, &plain), 15.0);
+        // A dotted edge at the plain width keeps its dash.
+        assert_eq!(label_stub(EdgeKind::Dotted, &plain_w), 15.0);
     }
 
     #[test]

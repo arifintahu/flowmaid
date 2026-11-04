@@ -9,13 +9,13 @@
 //! the smallest total move that keeps neighbouring ends a port spacing
 //! apart (an isotonic fit) inside the usable part of the side.
 
-use crate::clearance::{CHIP_SEP, NODE_SEP};
+use crate::clearance::{CHIP_SEP, EDGE_SPACING, NODE_SEP};
 use crate::edgepass::{end_rect, normal, side_of, Ctx, EndRef, Mode, Side};
 use crate::layout::LABEL_BOX_H;
 use crate::model::{Graph, Marker, Shape};
 use crate::scene::{
-    edge_drawn, edge_polyline, grow_scene, title_head, Bbox, Scene, SceneEdge, GLYPH_PORT_GAP,
-    MARGIN, SLANT_MAX,
+    edge_drawn, edge_polyline, grow_scene, title_head, Bbox, Scene, SceneEdge, ARROW_MARKER_PX,
+    GLYPH_PORT_GAP, MARGIN, SLANT_MAX,
 };
 use std::collections::BTreeMap;
 
@@ -57,6 +57,44 @@ const PORT_LEG_REACH: f64 = 3.0 * PORT_SPACING;
 /// A waypoint within this (px) of an end's tangent coordinate is the
 /// end's straight stub and moves with it.
 const STUB_EPS: f64 = 0.5;
+/// Widest pitch (px) the evenly spread ends of a crowded box side take
+/// (report M3, §2.4): a comb of three or more ends spreads over the
+/// side at up to this, centred where its edges head, so a wide box's
+/// fan keeps its ends together instead of reaching for the corners.
+pub(crate) const PORT_EVEN_MAX: f64 = 2.0 * PORT_SPACING;
+/// Least pitch (px) of an even comb ([`even_comb`]) holding two or more
+/// arrowheads, where its side has the room: a head's width and the
+/// spacing at which two strokes read as two, so neighbouring heads keep
+/// a clear gap. At the port spacing a narrow box's five arrivals sat
+/// 3 px apart and read as one bar of heads (fanout's Aggregator, B7
+/// review r1 #7).
+const HEAD_COMB_MIN: f64 = ARROW_MARKER_PX + EDGE_SPACING;
+/// How far (px) along their sides the ends of a 1:1 pair on facing
+/// sides may lie apart and still be drawn as one straight line (report
+/// M3): a lone end is slid that far to meet its partner, and a comb
+/// keeps such an end where its partner lies.
+const STRAIGHT_SNAP: f64 = PORT_SPACING / 2.0;
+/// How much more a straight end (its partner right across on the facing
+/// side, [`STRAIGHT_SNAP`]) weighs than a plain one when a side's ends
+/// are spaced: the others make way, so a straight edge never gains a
+/// sideways wobble from its neighbours' spacing (report §2.4).
+const STRAIGHT_WEIGHT: f64 = 8.0;
+/// What a state note card's link end weighs: a pin. It stays where its
+/// elbow meets its node's side whatever other edges share that side
+/// (they space round it), so `scene()` and `route()` draw it alike
+/// where their other edges differ, and a drag never moves it while its
+/// ends stay put (verifier: the links' elbow ends sat 7-18 px apart in
+/// the two, a router path spread past them in one and not the other).
+const NOTE_WEIGHT: f64 = 1.0e6;
+/// How far (px) spacing a side afresh may slide the end of an edge a
+/// drag holds ([`Ctx::held`]) before the side's redrawn ends are
+/// placed round the kept ones instead ([`around_kept`]): half a port
+/// spacing, a nudge the eye does not follow.
+const KEPT_NUDGE: f64 = PORT_SPACING / 2.0;
+/// What a back-edge's end weighs: its lane or curve is planned round
+/// the nodes it passes, not to the side's spacing, so it gives way
+/// first.
+const BACK_WEIGHT: f64 = 0.25;
 
 type Pt = (f64, f64);
 
@@ -178,6 +216,9 @@ struct PortEnd {
     /// The edge runs against the flow: its controls shape a bow round
     /// the nodes it passes, so its end spills round a corner last.
     back: bool,
+    /// How hard the end holds on to `want` when the side is spaced
+    /// ([`place_weighted`]): 1 for a plain end, see [`end_weight`].
+    weight: f64,
 }
 
 /// Tangent / normal coordinates of a screen point for `side`: the
@@ -517,25 +558,58 @@ fn split_range(side: Side, (x0, y0, x1, y1): (f64, f64, f64, f64)) -> (f64, f64)
 /// Pool-adjacent-violators on `d[i] - i*s`, then a per-end clamp (which
 /// keeps the gaps, as its bounds step by `s` too).
 pub(crate) fn place(d: &[f64], s: f64, lo: f64, hi: f64) -> Vec<f64> {
+    place_weighted(d, &vec![1.0; d.len()], s, lo, hi)
+}
+
+/// [`place`] with the squared move of end `i` weighted by `w[i]`
+/// (report M3, §2.4): where the ends must spread, the light ones move
+/// and the heavy ones (a straight edge's) keep their place.
+/// Pool-adjacent-violators pooling weighted means. An end weighing
+/// [`NOTE_WEIGHT`] is a pin: it stays exactly at its want, the ends
+/// before and after it spaced within the span left on either side, at
+/// a closer pitch where that is too short for them (a short side's span
+/// would otherwise shift the pin with them, or push them past its end).
+fn place_weighted(d: &[f64], w: &[f64], s: f64, lo: f64, hi: f64) -> Vec<f64> {
+    if let Some(p) = w.iter().position(|&x| x >= NOTE_WEIGHT) {
+        let pin = d[p];
+        // The pitch `m` ends fit at in `room` past the pin.
+        let pitch = |m: usize, room: f64| {
+            if m == 0 {
+                s
+            } else {
+                s.min(room.max(0.0) / m as f64)
+            }
+        };
+        let (sl, sr) = (pitch(p, pin - lo), pitch(d.len() - p - 1, hi - pin));
+        let mut out = place_weighted(&d[..p], &w[..p], sl, lo, pin - sl);
+        out.push(pin);
+        out.extend(place_weighted(&d[p + 1..], &w[p + 1..], sr, pin + sr, hi));
+        return out;
+    }
     let k = d.len();
-    // Blocks of (sum, count) over y = d - i*s, merged while decreasing.
-    let mut blocks: Vec<(f64, usize)> = Vec::with_capacity(k);
+    if k == 0 {
+        return Vec::new();
+    }
+    // Blocks of (weighted sum, weight, count) over y = d - i*s, merged
+    // while decreasing.
+    let mut blocks: Vec<(f64, f64, usize)> = Vec::with_capacity(k);
     for (i, &di) in d.iter().enumerate() {
-        blocks.push((di - i as f64 * s, 1));
+        let wi = w.get(i).copied().unwrap_or(1.0).max(SETTLE_EPS);
+        blocks.push(((di - i as f64 * s) * wi, wi, 1));
         while blocks.len() >= 2 {
-            let (sb, cb) = blocks[blocks.len() - 1];
-            let (sa, ca) = blocks[blocks.len() - 2];
-            if sa / ca as f64 <= sb / cb as f64 {
+            let (sb, wb, cb) = blocks[blocks.len() - 1];
+            let (sa, wa, ca) = blocks[blocks.len() - 2];
+            if sa / wa <= sb / wb {
                 break;
             }
             blocks.pop();
             let last = blocks.len() - 1;
-            blocks[last] = (sa + sb, ca + cb);
+            blocks[last] = (sa + sb, wa + wb, ca + cb);
         }
     }
     let mut out = Vec::with_capacity(k);
-    for (sum, cnt) in blocks {
-        let mean = sum / cnt as f64;
+    for (sum, wsum, cnt) in blocks {
+        let mean = sum / wsum;
         for _ in 0..cnt {
             let i = out.len() as f64;
             out.push(mean + i * s);
@@ -697,7 +771,7 @@ pub(crate) fn reorder(
 /// (see [`keep_parallel_order`]).
 #[allow(clippy::too_many_arguments)]
 fn place_ports(
-    _g: &Graph,
+    g: &Graph,
     sc: &mut Scene,
     cx: &Ctx,
     _mode: Mode,
@@ -706,48 +780,67 @@ fn place_ports(
     uncross: bool,
     mut judge: Option<Judge>,
 ) {
-    let mut groups: BTreeMap<(EndRef, Side), Vec<PortEnd>> = BTreeMap::new();
-    for i in 0..sc.edges.len() {
-        if !cx.drawn.get(i).copied().unwrap_or(false) {
-            continue;
-        }
-        let Some((from, to)) = cx.ends.get(i).copied().flatten() else {
-            continue;
-        };
-        let e = &sc.edges[i];
-        for (src, end) in [(true, from), (false, to)] {
-            let (p, _) = end_and_steer(sc, i, src, None);
-            let side = end_side(sc, end, p);
-            let (p, q) = end_and_steer(sc, i, src, Some(side));
-            let glyph = if src {
-                e.ends.start_marker(e.kind).is_some()
-            } else {
-                matches!(
-                    e.ends.end_marker(e.kind),
-                    Some(Marker::Cross | Marker::Circle)
-                )
-            };
-            groups.entry((end, side)).or_default().push(PortEnd {
-                edge: i,
-                src,
-                key: heading_on(side, p, q),
-                glyph,
-                at: p,
-                steer: q,
-                want: split(side, p).0,
-                spilled: None,
-                back: cx.back.get(i).copied().unwrap_or(false),
-            });
-        }
-    }
+    // Report M3 (§2.4), in a drawing the flowchart painter draws (not
+    // a class or ER scene, whose painters set their own ends) and only
+    // in `assign`, on the builders' ends: an end alone on its side
+    // meets it in the middle, a box side's comb of three or more ends
+    // spreads evenly, and a 1:1 pair on facing sides that nearly lines
+    // up is drawn straight. The router then starts from these ports,
+    // and the later passes only space what it moved.
+    let flow = g.edge_paint_width.is_none();
+    let shaping = flow && spill_over && judge.is_none();
+    let mut groups = side_groups(sc, cx);
     if spill_over {
         spill(sc, &mut groups);
+    }
+    // Sides a self-loop starts and ends on: its two ends are no part of
+    // the group, so an end there is not alone and keeps its place.
+    // `respace` draws a nearly straight pair straight again: the plain
+    // rule re-spacing a side the router changed slides a straight
+    // edge's end along it too (advanced: `Gate --> Auth` 2.9 px off
+    // straight, Gate's side respaced after the router moved `Gate ==>
+    // Job Queue`'s end).
+    let resnap = flow && !spill_over && judge.is_none();
+    let looped = if shaping || resnap {
+        looped_sides(sc, cx)
+    } else {
+        Vec::new()
+    };
+    // Lone ends first, so a comb sees where its straight edges' partners
+    // end up.
+    let mut order: Vec<(EndRef, Side)> = groups.keys().copied().collect();
+    if shaping {
+        order.sort_by_key(|k| (groups[k].len() != 1, *k));
     }
 
     // Per edge: the move of its start and of its end.
     let mut deltas: Vec<[Pt; 2]> = vec![[(0.0, 0.0); 2]; sc.edges.len()];
     let heads = title_heads(sc);
-    for ((end, side), mut ports) in groups {
+    for key in order {
+        let (end, side) = key;
+        let Some(mut ports) = groups.remove(&key) else {
+            continue;
+        };
+        // A side every end of which a drag holds ([`Ctx::held`], in
+        // `route_partial`) is left as the base scene drew it: no changed
+        // edge crowds it, and the base's ends there came out of the
+        // router, the respacing and the nudge, so the plain rule may
+        // find them unsettled (a parallel pair's slant asks for more
+        // than the port spacing) and re-place them in heading order. A
+        // 1 px drag of any node threw a choice's twins on such a side
+        // 15-35 px across each other (verify spread-face, g1, g92: 68-75
+        // unrelated ends over 20 px per diagram).
+        if ports
+            .iter()
+            .all(|p| p.spilled.is_none() && cx.held.get(p.edge).copied().unwrap_or(false))
+        {
+            continue;
+        }
+        // Weighed on the ends as they are now: a lone end placed above
+        // is where a comb's straight edge must meet it.
+        for p in ports.iter_mut() {
+            p.weight = end_weight(sc, cx, p, side, flow);
+        }
         let (lo, hi, tc, prof) = span(sc, end, side);
         // A straight side right under a frame's title: its ends keep
         // out of the chip's shadow, so no edge reaches them past the
@@ -757,7 +850,22 @@ fn place_ports(
             None => (lo, hi, false),
         };
         let shaded = shaded && ports.iter().any(|p| p.want < lo || p.want > hi);
-        if ports.len() < 2 && !shaded && !ports.iter().any(|p| p.spilled.is_some()) {
+        // A box side (not a frame's, not a bar's, whose branches meet it
+        // where they lie, nor one a self-loop also uses) the shaping
+        // above applies to.
+        let shaped = shaping
+            && prof.straight().is_some()
+            && !looped.contains(&key)
+            && matches!(end, EndRef::Node(v) if sc.nodes[v].shape != Shape::ForkBar)
+            && ports.iter().all(|p| p.spilled.is_none());
+        // Alone on its side, a forward edge meets it in the middle
+        // (report §2.4: the builders lean every end toward the other
+        // node, so a single arrival landed up to 44 px off its target's
+        // centre and the flow through it jogged). A back-edge's lane
+        // keeps the port at its span's edge, a note card's link the
+        // spot its elbow was drawn to.
+        let lone = shaped && ports.len() == 1 && free_end(sc, cx, &ports[0]);
+        if ports.len() < 2 && !shaded && !lone && !ports.iter().any(|p| p.spilled.is_some()) {
             continue;
         }
         ports.sort_by(port_order);
@@ -813,14 +921,81 @@ fn place_ports(
         // the wrong order is re-placed in order (G9): before routing,
         // and after the nudge.
         let crossed = |a: &PortEnd, b: &PortEnd| uncross && legs_cross(sc, a, b);
-        if !shaded
-            && ports.iter().all(|p| p.spilled.is_none())
-            && settled(&ports, side, s, lo, hi, crossed)
-        {
-            continue;
-        }
-        let d: Vec<f64> = ports.iter().map(|p| p.want).collect();
-        let x = place(&d, s, lo, hi);
+        let kept = |p: &PortEnd| cx.held.get(p.edge).copied().unwrap_or(false);
+        let x = if lone {
+            // The middle of the side's straight run (a slanted shape's
+            // top or bottom is offset from its box's middle).
+            vec![(lo + hi) / 2.0]
+        } else if let Some(x) = (shaped
+            && k >= 3
+            && !ports
+                .iter()
+                .enumerate()
+                .any(|(j, a)| ports[j + 1..].iter().any(|b| sibling(a, b))))
+        .then(|| {
+            // Two or more heads in the comb keep a gap between them.
+            let heads = ports
+                .iter()
+                .filter(|p| {
+                    let e = &sc.edges[p.edge];
+                    if p.src {
+                        e.ends.start_marker(e.kind).is_some()
+                    } else {
+                        e.ends.end_marker(e.kind).is_some()
+                    }
+                })
+                .count();
+            let head_min = if heads >= 2 { HEAD_COMB_MIN } else { 0.0 };
+            even_comb(&ports, kept, head_min, s, room, lo, hi)
+        })
+        .filter(|x| {
+            ports.iter().zip(x).all(|(p, &t)| {
+                let held = kept(p) || p.weight >= NOTE_WEIGHT;
+                !held || (t - split(side, p.at).0).abs() < PORT_EPS
+            })
+        }) {
+            // (Parallel edges — a 2-cycle's twins too, even with a note
+            // link's end between them — keep the spacing their run's
+            // slant needs and the order they are drawn in: a comb would
+            // pull one of a pair across under the other's label, or skew
+            // a twin's bow into its head.)
+            //
+            // In `route_partial` the ends a drag holds ([`Ctx::held`])
+            // pin the comb, and a comb that would move one — or a note
+            // link's pinned end, which the span may push it off — is not
+            // used: the plain rule below then leaves the side as drawn
+            // while it stays spaced, and spaces the others round a pin.
+            // (A comb kept in `scene()` and dropped in `route()`, where
+            // a back-edge's end heads the other way, moved a note link's
+            // end 4.2 px between the two.) The base scene's ports came out of the
+            // router, the respacing and the nudge after this comb, and
+            // combing them afresh made a hub's fan jump 20-50 px under
+            // a 1 px drag of a node none of its edges touch.
+            x
+        } else {
+            if !shaded
+                && ports.iter().all(|p| p.spilled.is_none())
+                && settled(&ports, side, s, lo, hi, crossed)
+            {
+                continue;
+            }
+            let d: Vec<f64> = ports.iter().map(|p| p.want).collect();
+            let w: Vec<f64> = ports.iter().map(|p| p.weight).collect();
+            let x = place_weighted(&d, &w, s, lo, hi);
+            // A drag's kept end the spacing would throw by more than a
+            // nudge: the redrawn ends are placed round the kept ones
+            // instead (see `around_kept`). A nudge stands, so the edges
+            // on a dragged node match `route()`'s.
+            let thrown = ports
+                .iter()
+                .zip(&x)
+                .any(|(p, &t)| kept(p) && (t - split(side, p.at).0).abs() > KEPT_NUDGE);
+            if thrown && !shaded && ports.iter().all(|p| p.spilled.is_none()) {
+                around_kept(&ports, kept, side, s, lo, hi).unwrap_or(x)
+            } else {
+                x
+            }
+        };
         // The moved edges as they were, for the judge and the leg check
         // below.
         let mut was: Vec<(usize, SceneEdge)> = Vec::new();
@@ -883,6 +1058,9 @@ fn place_ports(
             }
         }
     }
+    if shaping || resnap {
+        snap_straight_pairs(sc, cx, &looped, &mut deltas, moved);
+    }
     // A single-curve edge's label rides the curve's midpoint, which
     // moves by the mean of its two end moves: follow it, unless that
     // makes the label hit more than where it sits (the label stage
@@ -901,6 +1079,332 @@ fn place_ports(
             if let Some((_, m, _)) = &mut sc.edges[i].label {
                 *m = to;
             }
+        }
+    }
+}
+
+/// Every drawn edge end, grouped by the side of the node or frame it
+/// touches, as [`place_ports`] spaces them.
+fn side_groups(sc: &Scene, cx: &Ctx) -> BTreeMap<(EndRef, Side), Vec<PortEnd>> {
+    let mut groups: BTreeMap<(EndRef, Side), Vec<PortEnd>> = BTreeMap::new();
+    for i in 0..sc.edges.len() {
+        if !cx.drawn.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some((from, to)) = cx.ends.get(i).copied().flatten() else {
+            continue;
+        };
+        let e = &sc.edges[i];
+        for (src, end) in [(true, from), (false, to)] {
+            let (p, _) = end_and_steer(sc, i, src, None);
+            let side = end_side(sc, end, p);
+            let (p, q) = end_and_steer(sc, i, src, Some(side));
+            let glyph = if src {
+                e.ends.start_marker(e.kind).is_some()
+            } else {
+                matches!(
+                    e.ends.end_marker(e.kind),
+                    Some(Marker::Cross | Marker::Circle)
+                )
+            };
+            groups.entry((end, side)).or_default().push(PortEnd {
+                edge: i,
+                src,
+                key: heading_on(side, p, q),
+                glyph,
+                at: p,
+                steer: q,
+                want: split(side, p).0,
+                spilled: None,
+                back: cx.back.get(i).copied().unwrap_or(false),
+                weight: 1.0,
+            });
+        }
+    }
+    groups
+}
+
+/// Whether edge `i` links a state note card ([`crate::style::is_note_card`]).
+pub(crate) fn note_link(sc: &Scene, cx: &Ctx, i: usize) -> bool {
+    let card = |r: EndRef| match r {
+        EndRef::Node(v) => sc
+            .nodes
+            .get(v)
+            .is_some_and(|n| crate::style::is_note_card(&n.id, n.shape, &n.style)),
+        EndRef::Frame(_) => false,
+    };
+    cx.ends
+        .get(i)
+        .copied()
+        .flatten()
+        .is_some_and(|(a, b)| card(a) || card(b))
+}
+
+/// Whether the end `p`'s edge may be reshaped by the ports stage's own
+/// rules (report M3): a forward edge the stages may move (not one a
+/// drag holds, [`Ctx::held`]) that links no note card.
+fn free_end(sc: &Scene, cx: &Ctx, p: &PortEnd) -> bool {
+    !p.back && !cx.held.get(p.edge).copied().unwrap_or(false) && !note_link(sc, cx, p.edge)
+}
+
+/// Whether sides `a` and `b` face each other (top and bottom, left and
+/// right).
+fn facing(a: Side, b: Side) -> bool {
+    matches!(
+        (a, b),
+        (Side::Top, Side::Bottom)
+            | (Side::Bottom, Side::Top)
+            | (Side::Left, Side::Right)
+            | (Side::Right, Side::Left)
+    )
+}
+
+/// The tangent coordinate (along `side`) of the other end of `p`'s
+/// edge when that end lies straight out of `side`, on the facing side
+/// of its node, within [`STRAIGHT_SNAP`] of `p` along it.
+fn straight_partner(sc: &Scene, cx: &Ctx, p: &PortEnd, side: Side) -> Option<f64> {
+    let (from, to) = cx.ends.get(p.edge).copied().flatten()?;
+    let other = if p.src { to } else { from };
+    let q = end_and_steer(sc, p.edge, !p.src, None).0;
+    if !facing(side, end_side(sc, other, q)) {
+        return None;
+    }
+    let ((pt, pn), (qt, qn)) = (split(side, p.at), split(side, q));
+    ((qn - pn) * out_sign(side) > 0.0 && (qt - pt).abs() <= STRAIGHT_SNAP).then_some(qt)
+}
+
+/// How hard end `p` on `side` holds its place when the side is spaced
+/// (report M3, §2.4; flowchart drawings, `flow`, only — elsewhere every
+/// end weighs alike): a note card's link most ([`NOTE_WEIGHT`]), then a
+/// straight edge's end ([`STRAIGHT_WEIGHT`]); a back-edge's least
+/// ([`BACK_WEIGHT`]).
+fn end_weight(sc: &Scene, cx: &Ctx, p: &PortEnd, side: Side, flow: bool) -> f64 {
+    if !flow {
+        1.0
+    } else if note_link(sc, cx, p.edge) {
+        NOTE_WEIGHT
+    } else if p.back {
+        BACK_WEIGHT
+    } else if straight_partner(sc, cx, p, side).is_some() {
+        STRAIGHT_WEIGHT
+    } else {
+        1.0
+    }
+}
+
+/// The sides self-loops start or end on.
+fn looped_sides(sc: &Scene, cx: &Ctx) -> Vec<(EndRef, Side)> {
+    let mut out = Vec::new();
+    for (i, e) in sc.edges.iter().enumerate() {
+        let Some((a, b)) = cx.ends.get(i).copied().flatten() else {
+            continue;
+        };
+        if a != b {
+            continue;
+        }
+        for p in [e.bezier[0], e.bezier[3]] {
+            let key = (a, end_side(sc, a, p));
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+    }
+    out
+}
+
+/// The ends of a side holding both ends a drag keeps (`kept`, see
+/// [`Ctx::held`]) and redrawn ones, placed with the kept ends where
+/// they are: each redrawn end (in [`port_order`]) at the spot nearest
+/// where it wants to be that stays `s` from every end placed so far and
+/// on the span `[lo, hi]` (or as far out as a kept end lies: a crowded
+/// side's span reaches nearer its corners, and the base scene may have
+/// spaced more ends here). `None` when no end or every end is kept,
+/// when the kept ends are not spaced `s` apart themselves, or when a
+/// redrawn end finds no such spot: the side is then spaced afresh.
+/// Used where spacing it afresh would throw a kept end more than
+/// [`KEPT_NUDGE`]: in heading order it re-sorted the kept ends (a
+/// router path heads elsewhere than the builder's curve it replaced)
+/// and shifted a whole fan a port spacing under a 1 px drag.
+fn around_kept(
+    ports: &[PortEnd],
+    kept: impl Fn(&PortEnd) -> bool,
+    side: Side,
+    s: f64,
+    lo: f64,
+    hi: f64,
+) -> Option<Vec<f64>> {
+    let n_kept = ports.iter().filter(|p| kept(p)).count();
+    if n_kept == 0 || n_kept == ports.len() {
+        return None;
+    }
+    let at = |p: &PortEnd| split(side, p.at).0;
+    let mut taken: Vec<f64> = ports.iter().filter(|p| kept(p)).map(at).collect();
+    taken.sort_by(f64::total_cmp);
+    if taken.windows(2).any(|w| w[1] - w[0] < s - SETTLE_EPS) {
+        return None;
+    }
+    let (lo, hi) = (lo.min(taken[0]), hi.max(taken[taken.len() - 1]));
+    let on_span = |t: f64| t >= lo - SETTLE_EPS && t <= hi + SETTLE_EPS;
+    let mut x = vec![0.0; ports.len()];
+    for (j, p) in ports.iter().enumerate() {
+        if kept(p) {
+            x[j] = at(p);
+            continue;
+        }
+        let want = p.want.max(lo).min(hi);
+        // The nearest free spot is the want itself or the edge of a
+        // taken spot's reach (or of the span).
+        let mut tries = vec![want, lo, hi];
+        for &t in &taken {
+            tries.push(t - s);
+            tries.push(t + s);
+        }
+        let best = tries
+            .into_iter()
+            .filter(|&c| on_span(c) && taken.iter().all(|&t| (c - t).abs() >= s - SETTLE_EPS))
+            .min_by(|a, b| {
+                (a - want)
+                    .abs()
+                    .total_cmp(&(b - want).abs())
+                    .then(a.total_cmp(b))
+            })?;
+        x[j] = best;
+        taken.push(best);
+    }
+    Some(x)
+}
+
+/// Report M3 (§2.4): a box side's three or more ends (in order) at one
+/// even pitch, the side's usable span `[lo, hi]` shared out (never
+/// under the spacing `s` nor over the even room `room`, at most
+/// [`PORT_EVEN_MAX`], and at least `head_min` where the room allows:
+/// [`HEAD_COMB_MIN`] for a comb of arrowheads), the comb set where its
+/// ends want to be — their
+/// weighted mean, so a straight edge's or a note link's end stays put —
+/// and kept on the span. The plain spacing packed equal wants a port
+/// spacing apart and left wide gaps to the middle end: a fan's heads
+/// landed in near-touching pairs (fanout's 14 / 29 / 29 / 14 px).
+fn even_comb(
+    ports: &[PortEnd],
+    kept: impl Fn(&PortEnd) -> bool,
+    head_min: f64,
+    s: f64,
+    room: f64,
+    lo: f64,
+    hi: f64,
+) -> Vec<f64> {
+    let k = ports.len();
+    let pitch = ((hi - lo) / (k + 1) as f64)
+        .min(PORT_EVEN_MAX)
+        .max(s)
+        .max(head_min)
+        .min(room.max(s));
+    let slot = |j: usize| (j as f64 - (k - 1) as f64 / 2.0) * pitch;
+    // The ends `kept` (a drag's kept edges'), if any, alone set the
+    // centre.
+    let pinned = ports.iter().any(&kept);
+    let (mut num, mut den) = (0.0, 0.0);
+    for (j, p) in ports.iter().enumerate() {
+        let w = match (pinned, kept(p)) {
+            (false, _) => p.weight,
+            (true, true) => 1.0,
+            (true, false) => 0.0,
+        };
+        num += w * (p.want - slot(j));
+        den += w;
+    }
+    let c = num / den.max(SETTLE_EPS);
+    let (cmin, cmax) = (lo - slot(0), hi - slot(k - 1));
+    let c = if cmin <= cmax {
+        c.max(cmin).min(cmax)
+    } else {
+        (cmin + cmax) / 2.0
+    };
+    let d: Vec<f64> = (0..k).map(|j| c + slot(j)).collect();
+    let w: Vec<f64> = ports.iter().map(|p| p.weight).collect();
+    place_weighted(&d, &w, pitch, lo, hi)
+}
+
+/// Report M3 (§2.4): a free curve whose ends sit on facing box sides
+/// within [`STRAIGHT_SNAP`] of each other along them is drawn straight —
+/// one end slides to the other's spot: an end alone on its side first,
+/// else the arrival, else the start, each only where its side's other
+/// ends stay a port spacing away and the spot stays on the side's span.
+/// The spacing stages leave such a pair a few px apart (a comb's pitch,
+/// a box a px off its neighbour's column), and the curve between then
+/// wobbles sideways by that much. Adds each move to `deltas`.
+fn snap_straight_pairs(
+    sc: &mut Scene,
+    cx: &Ctx,
+    looped: &[(EndRef, Side)],
+    deltas: &mut [[Pt; 2]],
+    moved: &mut [bool],
+) {
+    let mut groups = side_groups(sc, cx);
+    let mut key_of: BTreeMap<(usize, bool), (EndRef, Side)> = BTreeMap::new();
+    for (key, ports) in &groups {
+        for p in ports {
+            key_of.insert((p.edge, p.src), *key);
+        }
+    }
+    for i in 0..sc.edges.len() {
+        let (Some(&ka), Some(&kb)) = (key_of.get(&(i, true)), key_of.get(&(i, false))) else {
+            continue;
+        };
+        let box_side = |k: (EndRef, Side)| matches!(k.0, EndRef::Node(_)) && !looped.contains(&k);
+        let bez = sc.edges[i].bezier;
+        if !sc.edges[i].waypoints.is_empty()
+            || !facing(ka.1, kb.1)
+            || !box_side(ka)
+            || !box_side(kb)
+        {
+            continue;
+        }
+        let Some(pa) = groups[&ka].iter().find(|p| p.edge == i && p.src) else {
+            continue;
+        };
+        if !free_end(sc, cx, pa) {
+            continue;
+        }
+        let ((ta, na), (tb, nb)) = (split(ka.1, bez[0]), split(kb.1, bez[3]));
+        if (nb - na) * out_sign(ka.1) <= 0.0
+            || !((PORT_EPS..=STRAIGHT_SNAP).contains(&(tb - ta).abs()))
+        {
+            continue;
+        }
+        let lone = |k: (EndRef, Side)| groups[&k].len() == 1;
+        let mut tries = [(false, kb, ta), (true, ka, tb)];
+        if lone(ka) && !lone(kb) {
+            tries.swap(0, 1);
+        }
+        for (src, key, to) in tries {
+            let (lo, hi, tc, prof) = span(sc, key.0, key.1);
+            let clear = groups[&key]
+                .iter()
+                .filter(|p| !(p.edge == i && p.src == src))
+                .all(|p| (split(key.1, p.at).0 - to).abs() >= PORT_SPACING - SETTLE_EPS);
+            if !clear || to < lo - SETTLE_EPS || to > hi + SETTLE_EPS {
+                continue;
+            }
+            let side = key.1;
+            let old = if src { bez[0] } else { bez[3] };
+            let new = join(side, to, prof.placed_at(to - tc));
+            let delta = (new.0 - old.0, new.1 - old.1);
+            move_end(&mut sc.edges[i], src, old, delta, side, false);
+            let end = usize::from(!src);
+            deltas[i][end] = (deltas[i][end].0 + delta.0, deltas[i][end].1 + delta.1);
+            if delta.0.hypot(delta.1) >= MOVED_MIN {
+                if let Some(m) = moved.get_mut(i) {
+                    *m = true;
+                }
+            }
+            if let Some(p) = groups
+                .get_mut(&key)
+                .and_then(|g| g.iter_mut().find(|p| p.edge == i && p.src == src))
+            {
+                p.at = new;
+            }
+            break;
         }
     }
 }
@@ -1567,6 +2071,127 @@ mod tests {
     }
 
     #[test]
+    fn weighted_placement_moves_the_light_ends_and_never_a_pin() {
+        // Unit weights: the plain fit.
+        assert_eq!(
+            place_weighted(&[10.0, 10.0, 10.0], &[1.0; 3], 14.0, -50.0, 50.0),
+            place(&[10.0, 10.0, 10.0], 14.0, -50.0, 50.0)
+        );
+        // A straight end weighing STRAIGHT_WEIGHT barely moves; its
+        // light neighbour takes the spacing (report §2.4: no S-wobble).
+        let x = place_weighted(&[0.0, 3.0], &[STRAIGHT_WEIGHT, 1.0], 14.0, -50.0, 50.0);
+        assert!(x[0].abs() < 2.0 && x[1] - x[0] >= 14.0 - 1e-9, "{x:?}");
+        // A pin stays exactly put, even where the span is too short for
+        // the spacing: the others squeeze against it.
+        let x = place_weighted(&[0.0, 11.0], &[NOTE_WEIGHT, 1.0], 14.0, -11.0, 11.0);
+        assert_eq!(x, [0.0, 11.0]);
+        let x = place_weighted(&[-3.0, 0.0], &[1.0, NOTE_WEIGHT], 14.0, -11.0, 11.0);
+        assert_eq!(x, [-11.0, 0.0]);
+        // Two past it on a short span: a closer pitch, never past its end.
+        let x = place_weighted(
+            &[0.0, 5.0, 9.0],
+            &[NOTE_WEIGHT, 1.0, 1.0],
+            10.0,
+            -11.0,
+            11.0,
+        );
+        assert_eq!(x, [0.0, 5.5, 11.0]);
+    }
+
+    /// Report M3 (§2.4): an end alone on its box side meets it in the
+    /// middle (long-labels' arrivals landed 35-44 px off their targets'
+    /// centres), a box side's comb of three or more ends is evenly
+    /// spaced (fanout's Aggregator took 14 / 29 / 29 / 14 px), in
+    /// `scene()` and in `route()` alike.
+    #[test]
+    fn lone_ends_meet_their_side_in_the_middle_and_combs_space_evenly() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let read =
+            |name: &str| std::fs::read_to_string(format!("{root}/examples/{name}.mmd")).unwrap();
+        for sc in both(&read("long-labels")) {
+            for (from, to) in [("B", "C"), ("B", "D"), ("C", "E")] {
+                let n = sc.nodes.iter().find(|n| n.id == to).unwrap();
+                let tip = ends(edge(&sc, from, to)).1;
+                assert!(
+                    (tip.0 - n.x).abs() < 5.0,
+                    "{from} -> {to}: {tip:?} vs {}",
+                    n.x
+                );
+            }
+        }
+        for sc in both(&read("fanout")) {
+            let agg = sc.nodes.iter().find(|n| n.id == "C").unwrap();
+            let mut xs: Vec<f64> = sc
+                .edges
+                .iter()
+                .filter(|e| e.to == "C")
+                .map(|e| ends(e).1 .0)
+                .collect();
+            xs.sort_by(f64::total_cmp);
+            assert_eq!(xs.len(), 5, "{xs:?}");
+            let gaps: Vec<f64> = xs.windows(2).map(|w| w[1] - w[0]).collect();
+            let (lo, hi) = gaps
+                .iter()
+                .fold((f64::MAX, 0.0f64), |a, &g| (a.0.min(g), a.1.max(g)));
+            assert!(hi - lo <= 2.0, "uneven comb {gaps:?}");
+            // Five heads keep a clear gap between them (B7 review r1
+            // #7: at the port spacing they sat 3 px apart, one bar).
+            assert!(lo >= HEAD_COMB_MIN - 1e-6, "{gaps:?}");
+            assert!(lo - ARROW_MARKER_PX >= EDGE_SPACING - 1e-6, "{gaps:?}");
+            // Centred: Worker 3 drops straight into its middle.
+            assert!((xs[2] - agg.x).abs() < 1e-6, "{xs:?} vs {}", agg.x);
+            for w in ["B1", "B2", "B4", "B5"] {
+                let n = sc.nodes.iter().find(|n| n.id == w).unwrap();
+                let tip = ends(edge(&sc, "A", w)).1;
+                assert!((tip.0 - n.x).abs() < 1e-6, "A -> {w}: {tip:?} vs {}", n.x);
+            }
+        }
+    }
+
+    /// Report M3: a 1:1 pair on facing sides whose ends lie a few px
+    /// apart along them is drawn straight — the lone end slides to its
+    /// partner's spot — while a pair further apart keeps its S.
+    #[test]
+    fn a_nearly_straight_pair_is_drawn_straight() {
+        let g =
+            parse("flowchart TD\nA[a wide source box] --> B\nA --> C\nA --> D\nC --> E").unwrap();
+        for (shift, straight) in [(4.0, true), (20.0, false)] {
+            let mut sc = scene(&g);
+            // E (C's only child) a few px off C's column.
+            let ei = sc.nodes.iter().position(|n| n.id == "E").unwrap();
+            sc.nodes[ei].x += shift;
+            let k = sc
+                .edges
+                .iter()
+                .position(|e| e.from == "C" && e.to == "E")
+                .unwrap();
+            for p in &mut sc.edges[k].bezier[2..] {
+                p.0 += shift;
+            }
+            crate::edgepass::finish(&g, &mut sc, Mode::Static);
+            let (p0, p3) = ends(&sc.edges[k]);
+            assert_eq!(
+                (p0.0 - p3.0).abs() < 1e-6,
+                straight,
+                "shift {shift}: {p0:?} {p3:?}"
+            );
+        }
+        // B7 review r2 (#6): a pair straightened before routing stays so
+        // when the respacing after the router slides its end along a
+        // side the router changed (advanced: Gate's bottom, re-spaced
+        // for `Gate ==> Job Queue`, left `Gate --> Auth` 2.9 px off).
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/advanced.mmd"
+        ))
+        .unwrap();
+        for sc in both(&src) {
+            let (p0, p3) = ends(edge(&sc, "Gate", "Auth"));
+            assert!((p0.0 - p3.0).abs() < 1e-6, "{p0:?} {p3:?}");
+        }
+    }
+
+    #[test]
     fn back_edge_never_starts_where_another_edge_arrives() {
         // A loop back from a branch: in both modes E -> B leaves E away
         // from where C -> E lands, and lands on B away from B -> C.
@@ -1657,6 +2282,7 @@ mod tests {
             want: at.1,
             spilled: None,
             back: false,
+            weight: 1.0,
         };
         // In heading order: edge 0 (straight) first, edge 1 (down) last.
         let ports = [end(0, (0.0, 10.0), 0.0), end(1, (0.0, 0.0), 0.5)];
@@ -1667,6 +2293,88 @@ mod tests {
         assert!(settled(&ports, Side::Right, 10.0, -20.0, 20.0, |_, _| {
             false
         }));
+    }
+
+    #[test]
+    fn a_drag_s_kept_ends_stay_and_pin_the_comb() {
+        // B7 review r1 (#1): in `route_partial` the ends a drag keeps
+        // hold their spots; the redrawn end takes the nearest free spot
+        // (here below the kept fan, where the base scene had it, not
+        // between two kept ends a port spacing apart), and a comb takes
+        // its centre from the kept ends alone.
+        let end = |edge: usize, want: f64, key: f64| PortEnd {
+            edge,
+            src: false,
+            key,
+            glyph: false,
+            at: (0.0, want),
+            steer: (0.0, want),
+            want,
+            spilled: None,
+            back: false,
+            weight: 1.0,
+        };
+        // Heading order puts the redrawn edge 3 between the kept ones.
+        let ports = [
+            end(0, 116.0, 0.0),
+            end(3, 110.0, 0.1),
+            end(1, 103.0, 0.2),
+            end(2, 129.0, 0.3),
+        ];
+        let kept = |p: &PortEnd| p.edge != 3;
+        let x = around_kept(&ports, kept, Side::Left, 13.0, 80.0, 140.0).unwrap();
+        assert_eq!(x, vec![116.0, 90.0, 103.0, 129.0]);
+        // Kept ends closer than the spacing: the side is spaced afresh.
+        let tight = [end(0, 100.0, 0.0), end(1, 105.0, 0.1), end(3, 130.0, 0.2)];
+        assert!(around_kept(&tight, kept, Side::Left, 13.0, 80.0, 140.0).is_none());
+        // Every end kept, or none: nothing to place round.
+        assert!(around_kept(&ports, |_| true, Side::Left, 13.0, 80.0, 140.0).is_none());
+        assert!(around_kept(&ports, |_| false, Side::Left, 13.0, 80.0, 140.0).is_none());
+        // A comb whose kept ends sit on its slots keeps them there,
+        // wherever the redrawn end wants to be.
+        let comb = [end(0, 100.0, 0.0), end(1, 114.0, 0.1), end(3, 140.0, 0.2)];
+        let x = even_comb(&comb, kept, 0.0, 14.0, 14.0, 60.0, 160.0);
+        assert!(
+            (x[0] - 100.0).abs() < 1e-9 && (x[1] - 114.0).abs() < 1e-9,
+            "{x:?}"
+        );
+        assert!((x[2] - 128.0).abs() < 1e-9, "{x:?}");
+        // Off its 25 px slots they would move (`place_ports` then spaces
+        // the side by the plain rule): the centre is theirs all the same.
+        let x = even_comb(&comb, kept, 0.0, 14.0, 30.0, 60.0, 160.0);
+        assert!((x[1] - 119.5).abs() < 1e-9, "{x:?}");
+    }
+
+    #[test]
+    fn a_side_whose_every_end_a_drag_keeps_is_left_as_drawn() {
+        // B7 review r2 (#1): the base scene's ends on a side the drag
+        // does not touch may be closer than the plain rule's spacing
+        // (the nudge and the respacing ran after it); every end kept,
+        // the side is left exactly as drawn, never re-placed.
+        let g = parse("flowchart TD\nA --> B\nA --> C\nA --> D").unwrap();
+        let mut sc = scene(&g);
+        let (b, c) = (ends(edge(&sc, "A", "B")).0, ends(edge(&sc, "A", "C")).0);
+        let i = sc.edges.iter().position(|e| e.to == "B").unwrap();
+        // Squeeze A -> B's start to 3 px off A -> C's.
+        let dx = c.0 - 3.0 - b.0;
+        let e = &mut sc.edges[i];
+        e.bezier[0].0 += dx;
+        e.bezier[1].0 += dx;
+        let was: Vec<(Pt, Pt)> = sc.edges.iter().map(ends).collect();
+        let mut kept = sc.clone();
+        crate::edgepass::finish_fixed(&g, &mut kept, Mode::Routed, &vec![true; sc.edges.len()]);
+        let now: Vec<(Pt, Pt)> = kept.edges.iter().map(ends).collect();
+        assert_eq!(was, now);
+        // With the squeezed edge redrawn the side is spaced again.
+        let mut fixed = vec![true; sc.edges.len()];
+        fixed[i] = false;
+        let mut redrawn = sc.clone();
+        crate::edgepass::finish_fixed(&g, &mut redrawn, Mode::Routed, &fixed);
+        let (b, c) = (
+            ends(edge(&redrawn, "A", "B")).0,
+            ends(edge(&redrawn, "A", "C")).0,
+        );
+        assert!(dist(b, c) >= PORT_SPACING - 1e-6, "{b:?} {c:?}");
     }
 
     #[test]

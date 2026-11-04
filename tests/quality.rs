@@ -50,8 +50,28 @@ const GAP_FLOORS: &[(&str, f64, f64)] = &[
     // width (`n32`, 204 px) now wraps to two lines, the drawing grows
     // 17 px taller, and a pair of parallel legs closes 9.63 -> 9.53 px
     // while the routed drawing crosses 4 fewer edges.
-    ("dense-lr", 9.5, 5.5),
-    ("dense-td", 12.1, 3.2),
+    //
+    // B7 (report M3, M8, §2.4, §2.6, §2.8): every labelled gap keeps
+    // its label clear of the head (72 px across a TD gap, the head and
+    // a clearance either side along LR), a lone end meets its box side
+    // in the middle, a comb spaces evenly, and a box's title strip no
+    // longer leaves a strip of dead room under its first row (dense-td
+    // 1 823 -> 1 663 px tall). Its static drawing's closest pair is
+    // now two router legs 10.5 px apart in one shared channel under the
+    // g5 / g6 frames, which closed by 160 px (12.16 -> 10.50); its
+    // routed pairs opened 6.6 -> 12.0 and dense-lr's 9.5 / 9.7 ->
+    // 11.7 / 12.1, ratcheted here.
+    //
+    // B7 review r1 (#3): the floor dense-td had lost is back at 12.1.
+    // The router's dependency on the dead strip was channel room: two
+    // unrelated edges the nudge leaves side by side under the spacing
+    // now get one moved clear where that costs nothing else
+    // (`router::spread_close`, static scene), and a gap a box opens in
+    // keeps its border off the lateral runs crossing it (`layout`'s
+    // `cross_need`): dense-td static 10.50 -> 13.04, dense-lr 11.74 ->
+    // 14.50, ratcheted to 12.0.
+    ("dense-lr", 12.0, 12.0),
+    ("dense-td", 12.1, 12.0),
     ("fanout-frames", 40.0, 40.0),
     ("wide-labels", 40.0, 40.0),
 ];
@@ -177,7 +197,20 @@ fn quality_gate() {
 /// `n12`'s bottom-corner ends `n12 -> n36` / `n12 -> n38` start 6 px up
 /// the bottom arc and their curves run 1-2 px longer beside g1's and
 /// g2's right borders (1018.7 -> 1021.7); no route changed.
-const BORDER_LEN_MAX: (f64, f64) = (1_022.0, 2_065.0);
+/// B7 (report M3, M8): 1022 -> 1475 static, 2065 -> 2105 routed, as
+/// intended drawing changes cost it: dense-td lost the dead strip under
+/// each box's first row (160 px over the drawing, as much as 99 px in
+/// one gap), its labelled gaps grew by their head room, and its lone
+/// ends moved to their sides' middles, so its long `n31 -> n38`
+/// (316 + 192 -> 453 + 277 px under g5's and g6's bottoms) and
+/// `n22 -> n40` (126 px down g6's left) ride borders the closer
+/// channel leaves no lane beside; bench-75 routed 360 -> 402.
+/// B7 review r1 (#2, #3): 1 475 -> 1 395 static, 2 105 -> 1 895 routed —
+/// a gap a box opens in keeps the box's top off the middle of the runs
+/// crossing it into the box (dense-td 1 098 -> 1 020 static, 1 180 ->
+/// 971 routed: its `n45 -> g8` no longer rides g1's top) and the static
+/// scene moves one of two edges side by side under the spacing clear.
+const BORDER_LEN_MAX: (f64, f64) = (1_395.0, 1_895.0);
 
 /// Edges keep off frame borders where their channel has room (G4).
 #[test]
@@ -217,8 +250,12 @@ fn every_fixture_has_a_ceiling() {
 /// by fewer strokes exists; the rest sit in bundles with no such spot.
 /// Integrated with the round-2 router (re-sorted ports, labelled edges
 /// kept off spacing-only reroutes): 35 / 20 on the merged pipeline;
-/// 0 / 4 on the generated dense fixtures.
-const LBL_EDGE_MAX: (usize, usize) = (0, 4);
+/// 0 / 4 on the generated dense fixtures. B7 (report M3): 0 -> 1
+/// static — dense-lr's `n12 -> n33` label sits beside its line in the
+/// cable of three curves that leaves hub `n12`'s over-full side (its
+/// lone far ends now meet their targets in the middle), its box's edge
+/// over the neighbour `n12 -> n36`; no spot along the cable is clear.
+const LBL_EDGE_MAX: (usize, usize) = (1, 4);
 
 /// Most hard label hits (node, label, chip or arrowhead) over all
 /// fixtures, per mode (static, routed). None: a spot covering an
@@ -278,8 +315,12 @@ fn layout_shape_gate() {
     /// ceiling locked the defect in): wide-labels' back-edge no longer
     /// loops under the row by its label's width, so the LR drawing is as
     /// flat as its row of long labels (345 -> 160 px tall, aspect 11.97;
-    /// mermaid draws it at 13.6).
-    const MAX_ASPECT: f64 = 12.5;
+    /// mermaid draws it at 13.6). 12.5 -> 12.6 with B7 review r3 #4: its
+    /// `consumed asynchronously by the worker pool` lies on its straight
+    /// line instead of above it (the head box on a straight line no
+    /// longer runs the line's whole length), the canvas 2.4 px shorter
+    /// (160 -> 157.6 px, aspect 12.32 -> 12.51), the drawing unchanged.
+    const MAX_ASPECT: f64 = 12.6;
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/quality");
     for &(name, _, _) in CEILINGS {
         let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");
@@ -362,11 +403,25 @@ fn crossing_gaps_do_not_read_as_dashes() {
 /// `svc4 -> logs` off the app frame's border, see `BORDER_LEN_MAX`),
 /// routed hug 3 667 -> 3 447, tight 9 224 -> 8 142 static and
 /// 20 942 -> 19 120 routed, overlap 2 746 -> 2 390 and 7 594 -> 6 748.
+/// B7 (report M3, M8, see `BORDER_LEN_MAX`): static overlap 2 920 ->
+/// 3 200 and routed 7 620 -> 7 770 (dense-td 1 734 -> 2 290 static,
+/// 4 318 -> 5 638 routed; dense-lr static 246 -> 490), the longest run
+/// 400 -> 470 and 1 290 -> 1 400 (dense-td), static tight 9 350 ->
+/// 12 860 (dense-td 3 888 -> 7 072: its channels a strip's depth
+/// closer; dense-lr 960 -> 2 562: the fan out of hub `n12` whose far
+/// ends now meet their targets in the middle runs as a cable); hug
+/// ratcheted down to 2 820 | 3 430 (dense-td static 2 208 -> 2 008).
+/// B7 review r1 (#2, #3, see `BORDER_LEN_MAX`): overlap 3 200 | 7 770 ->
+/// 2 950 | 7 160 (dense-td 2 290 -> 2 008 static, 5 638 -> 5 024 routed),
+/// tight 12 860 | 21 900 -> 12 630 | 20 700, routed hug 3 430 -> 3 290
+/// (dense-td 1 811 -> 1 674); static hug 2 820 -> 2 830, as dense-td's
+/// re-laid gaps cost it (2 008 -> 2 020: its `n25 -> n38` runs 12 px
+/// longer beside node `n13`), still under the 2 969 before B7.
 const CHANNEL_MAX: [(&str, f64, f64); 4] = [
-    ("overlap_len", 2_920.0, 7_620.0),
-    ("overlap_max", 400.0, 1_290.0),
-    ("tight_len", 9_350.0, 21_900.0),
-    ("hug_len", 3_010.0, 3_700.0),
+    ("overlap_len", 2_950.0, 7_160.0),
+    ("overlap_max", 470.0, 1_400.0),
+    ("tight_len", 12_630.0, 20_700.0),
+    ("hug_len", 2_830.0, 3_290.0),
 ];
 
 /// Most edges (over all fixtures, per mode) that pass a title chip
@@ -509,22 +564,50 @@ fn channels_keep_edges_apart_and_off_chips() {
 /// 2 | 3 -> 0 | 0, end_gap_max 4.5 -> 0.05 (the flattening of the
 /// outline polygon the metric measures against, `OUTLINE_FLATNESS`);
 /// ceiling 0.1. No other row moved.
+///
+/// B7 (report M3, M8, §2.4, §2.6, §2.8): lone ends meet their sides in
+/// the middle, combs space evenly, nearly straight pairs are drawn
+/// straight, labelled gaps keep head room and title strips no dead room
+/// under a box's first row. Lowered: end_tilt 8 -> 7 static, end_kink
+/// 55 | 71 -> 54 | 69, idiom_spline 23 | 22 -> 22 | 21, idiom_scubic
+/// routed 81 -> 80, x_drawn 505 | 508 -> 494 | 503, lat_backtrack routed
+/// 696.1 -> 667. Raised, as the closer channels of the dense fixtures
+/// cost them: band_pairs 91 | 101 -> 96 | 106 and band_len 41 064 |
+/// 47 104 -> 46 184 | 52 184 (dense-td's fans run as cables a strip's
+/// depth nearer each other, 19 804 -> 23 042 static, 22 150 -> 27 434
+/// routed; dense-lr's `n12` fan 4 670 -> 6 570 static), lat_backtrack
+/// static 1 813 -> 1 814.2 (dense-td 123.2 -> 124.5).
+///
+/// B7 review r1 (#2, #3): a gap a box opens in keeps the box's border off
+/// the lateral runs crossing it, and the static scene moves one of two
+/// edges side by side under the spacing clear. Lowered: band_pairs
+/// 96 | 106 -> 95 | 104, band_len 46 184 | 52 184 -> 46 030 | 51 310,
+/// end_kink static 54 -> 53, idiom_spline static 22 -> 21, x_drawn
+/// routed 503 -> 500. Raised, as dense-td's re-laid gaps (82 px deeper
+/// over the drawing) cost it, both still at or under the values before
+/// B7: x_drawn static 494 -> 498 (dense-td 88 -> 92) and idiom_spline
+/// routed 21 -> 22 (dense-td 0 -> 1, a `route()` channel spline the
+/// router no longer redraws orthogonally). A comb of two or more
+/// arrowheads keeps its heads a clear gap apart (`ports::HEAD_COMB_MIN`,
+/// B7 review r1 #7): x_drawn routed 500 -> 502 (dense-td 73 -> 76, still
+/// under the 503 before), band_pairs static 95 -> 94, band_len static
+/// 46 030 -> 45 800.
 const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
-    ("end_tilt", 8.0, 11.0),
+    ("end_tilt", 7.0, 11.0),
     ("end_tilt_max", 76.8, 128.4),
     ("end_gaps", 0.0, 0.0),
     ("end_gap_max", 0.1, 0.1),
     ("lat_wiggles", 16.0, 16.0),
-    ("lat_backtrack", 1_813.0, 696.1),
+    ("lat_backtrack", 1_814.2, 667.0),
     ("own_frame_x", 0.0, 0.0),
     ("own_frame_len", 0.0, 0.0),
-    ("band_pairs", 91.0, 101.0),
-    ("band_len", 41_064.0, 47_104.0),
-    ("idiom_scubic", 61.0, 81.0),
-    ("idiom_spline", 23.0, 22.0),
+    ("band_pairs", 94.0, 104.0),
+    ("band_len", 45_800.0, 51_310.0),
+    ("idiom_scubic", 61.0, 80.0),
+    ("idiom_spline", 21.0, 22.0),
     ("idiom_bow", 2.0, 1.0),
-    ("x_drawn", 505.0, 508.0),
-    ("end_kink", 55.0, 71.0),
+    ("x_drawn", 498.0, 502.0),
+    ("end_kink", 53.0, 69.0),
     ("ink_out", 0.0, 0.0),
 ];
 
@@ -698,4 +781,97 @@ fn long_labels_wrap_and_dense_labels_do_not_tower() {
         }
         assert!(wrapped <= 1, "{name}: {wrapped} labels wrapped");
     }
+}
+
+/// Most edges per fixture (over a 1 px drag of each of its nodes in
+/// turn, `route_partial` from the static scene) that move an end more
+/// than [`DRAG_JUMP`] px though neither end is the dragged node. What
+/// is left is edges the drag redraws because they pass near it (a
+/// redrawn edge takes `route()`'s course, which may differ from
+/// `scene()`'s) and labels on a node or head, redrawn on every frame.
+/// B7 review r1 (#1): the M3 comb re-spaced hub sides whose ends were
+/// all kept edges, and dense-lr's hub `n12` threw its fan 23-49 px on a
+/// drag of `n50`: 150 / 225 / 78 jumps here, against 2 / 94 / 26 before
+/// B7. A comb now takes its centre from the ends a drag keeps and is
+/// not used when it would move one, and a side holding kept and redrawn
+/// ends places the redrawn ones round the kept ones.
+///
+/// B7 review r2 (#1, #2): a side whose every end the drag keeps was
+/// still re-placed when the plain rule found the base's ends unsettled
+/// (a parallel pair's slant asks for more than the port spacing): a
+/// state choice's labelled twins on such a side swapped across their
+/// sibling on every drag of any node (`notes/spread-face` 0 -> 68,
+/// `notes/fork-twins` (= verify g92) 0 -> 75 over B7). Such a side is
+/// now left as drawn, which also leaves dense-lr / dense-td / bench-75
+/// at 0 / 17 / 18 (from 1 / 93 / 28). Paths are under `tests/fixtures`.
+///
+/// B7 review r3 (#7): an edge kept from the base because it merely
+/// passes near the drag had its ends re-placed by `route()`'s rules (and
+/// was searched again for spacing alone): a 1 px drag of a note card
+/// beside it threw it 22 px (`notes/near-drag` = verify g44, 1 -> 0).
+/// Such an edge now holds its ends (`Ctx::held`) and is rerouted only
+/// for what it hits: dense-td 17 -> 3, bench-75 18 -> 15.
+const DRAG_JUMPS_MAX: &[(&str, usize)] = &[
+    ("quality/dense-lr", 0),
+    ("quality/dense-td", 3),
+    ("quality/bench-75", 15),
+    ("notes/spread-face", 0),
+    ("notes/fork-twins", 0),
+    ("notes/near-drag", 0),
+];
+
+/// How far (px) an unrelated edge's end may move under a 1 px drag
+/// before [`DRAG_JUMPS_MAX`] counts it.
+const DRAG_JUMP: f64 = 20.0;
+
+/// A 1 px drag never throws the fans of nodes it does not touch
+/// (report invariant: the interactive drag stays stable, B7 review r1).
+#[test]
+fn a_one_px_drag_leaves_unrelated_edges_put() {
+    use flowmaid::model::Document;
+    use flowmaid::scene::{route_partial, scene, SceneEdge};
+    type P = (f64, f64);
+    let ends = |e: &SceneEdge| -> (P, P) {
+        match (e.waypoints.first(), e.waypoints.last()) {
+            (Some(&a), Some(&b)) if e.waypoints.len() >= 2 => (a, b),
+            _ => (e.bezier[0], e.bezier[3]),
+        }
+    };
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let mut bad = Vec::new();
+    for &(name, max) in DRAG_JUMPS_MAX {
+        let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");
+        let g = match flowmaid::parser::parse_document(&src).expect("parses") {
+            Document::Flowchart(g) | Document::State(g) => g,
+            _ => panic!("{name}: not a flowchart"),
+        };
+        let base = scene(&g);
+        let at: Vec<P> = base.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let mut jumps = Vec::new();
+        for (v, node) in g.nodes.iter().enumerate() {
+            let mut c = at.clone();
+            c[v].0 += 1.0;
+            let p = route_partial(&g, &c, &base, &at);
+            for (a, b) in base.edges.iter().zip(&p.edges).take(g.edges.len()) {
+                if a.from == node.id || a.to == node.id {
+                    continue;
+                }
+                let ((a0, a1), (b0, b1)) = (ends(a), ends(b));
+                let d = |x: P, y: P| (x.0 - y.0).hypot(x.1 - y.1);
+                let m = d(a0, b0).max(d(a1, b1));
+                if m > DRAG_JUMP {
+                    jumps.push(format!("drag {}: {} -> {} {m:.1}", node.id, a.from, a.to));
+                }
+            }
+        }
+        println!("{name}: {} drag jumps", jumps.len());
+        if jumps.len() > max {
+            bad.push(format!(
+                "{name}: {} > {max} drag jumps\n  {}",
+                jumps.len(),
+                jumps.join("\n  ")
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }

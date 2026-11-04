@@ -3362,6 +3362,20 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene 
             })
             .collect()
     };
+    // Each stand-in cut back to a frame tells the layout which: its
+    // label is drawn between those borders (B7 review r4 #2).
+    ga.frame_cut = vec![[None, None]; ga.edges.len()];
+    for (i, si) in stand_in.iter().enumerate() {
+        let Some(ei) = *si else { continue };
+        if own_drawn[i] {
+            continue;
+        }
+        let cut = |end: End| match end {
+            End::Sub(s) => Some(s),
+            End::Node(_) => None,
+        };
+        ga.frame_cut[ei] = [cut(g.sub_edges[i].from), cut(g.sub_edges[i].to)];
+    }
     let (lo, groups) = layout_clustered_ranked(&ga, sizes, &node_cluster, &rank_only);
     let lanes = static_lanes(&ga, &lo, Some(&node_cluster), ne);
     let mut sc = scene_from_layout(&ga, sizes, labels, lo, &lanes, ne);
@@ -4659,8 +4673,10 @@ const PARTIAL_ROUTE_SHARE: f64 = 0.5;
 /// touches a node or an arrowhead (with the edge owning that head),
 /// are drawn afresh; those whose `base` path comes within
 /// `PARTIAL_CLEAR` of a moved node's old or new box, of the strip a
-/// frame grew by or of its moved title chip keep their `base` path but
-/// are rerouted when it now hits something. Every other edge keeps its
+/// frame grew by or of its moved title chip keep their `base` path and
+/// ends but are rerouted when it now hits a node, a frame or a title
+/// chip, or runs on top of another edge (never for spacing alone).
+/// Every other edge keeps its
 /// `base` geometry (channel waypoints, label slot; only a port shared
 /// with a redrawn edge is spaced again, and its label moves when it now
 /// covers something) and is an obstacle the affected edges are routed
@@ -4718,7 +4734,7 @@ pub fn route_partial(
     // label text), and a node's box follows its text: an edit to any of
     // them must not keep stale geometry.
     let label_text = |e: &SceneEdge| e.label.as_ref().map(|l| l.0.clone());
-    let lines_up = sc.edges.len() == base.edges.len()
+    let same_graph = sc.edges.len() == base.edges.len()
         && sc.edges.iter().zip(&base.edges).all(|(a, b)| {
             a.from == b.from
                 && a.to == b.to
@@ -4731,10 +4747,24 @@ pub fn route_partial(
             .nodes
             .iter()
             .zip(&base.nodes)
-            .all(|(a, b)| a.id == b.id && a.label == b.label && a.shape == b.shape)
-        && clusters_line_up(g, base);
-    if !lines_up {
-        return route_labelled(g, centers, &raw_sizes, &labels);
+            .all(|(a, b)| a.id == b.id && a.label == b.label && a.shape == b.shape);
+    // A full `route()` still keeps the note links a drag leaves (see
+    // `note_link_kept`) while the graph is the base's: a static frame
+    // that does not stand for `route()`'s (one the layout drew wider
+    // than its members, as composite states' often are) sends every
+    // drag of such a diagram here.
+    let full = |mut sc: Scene| {
+        if same_graph {
+            for i in 0..g.edges.len().min(sc.edges.len()) {
+                if let Some(kept) = note_link_kept(g, base, centers, base_centers, &moved, i) {
+                    sc.edges[i] = kept;
+                }
+            }
+        }
+        sc
+    };
+    if !same_graph || !clusters_line_up(g, base) {
+        return full(route_labelled(g, centers, &raw_sizes, &labels));
     }
     type R = (f64, f64, f64, f64);
     let node_rect = |nd: &SceneNode| -> R {
@@ -4827,12 +4857,24 @@ pub fn route_partial(
     // like a moved node's (G11).
     let clash = crate::labels::label_clashes(&base.nodes, &base.edges);
     let mut fixed = vec![true; base.edges.len()];
+    // Every edge but the redrawn ones holds its ends (`Ctx::held`): one
+    // kept near the drag (not `fixed`) is rerouted only where it now
+    // hits something or runs on top of another edge, its ends left
+    // where the base put them.
+    let mut held = vec![true; base.edges.len()];
     let mut redrawn = 0;
     for (i, e) in sc.edges.iter_mut().enumerate() {
         let b = &base.edges[i];
         let own = own_moved.contains(&(b.from.as_str(), b.to.as_str()));
-        if moved_end(&b.from) || moved_end(&b.to) || own || clash[i] {
+        if let Some(kept) = (!own && !clash[i])
+            .then(|| note_link_kept(g, base, centers, base_centers, &moved, i))
+            .flatten()
+        {
+            // A state note card's link drawn as the drag leaves it.
+            *e = kept;
+        } else if moved_end(&b.from) || moved_end(&b.to) || own || clash[i] {
             fixed[i] = false;
+            held[i] = false;
             redrawn += 1;
         } else {
             fixed[i] = !near(b);
@@ -4842,15 +4884,135 @@ pub fn route_partial(
     // Most of the drawing redrawn afresh (not merely near the drag): a
     // full route() costs about the same and draws it better.
     if redrawn as f64 > PARTIAL_ROUTE_SHARE * fixed.len() as f64 {
-        return route_labelled(g, centers, &raw_sizes, &labels);
+        return full(route_labelled(g, centers, &raw_sizes, &labels));
     }
     sc.clusters = clusters;
     // The base canvas already covers the kept geometry; the pipeline's
     // refit grows it for whatever the drag pushed outward.
     sc.width = base.width;
     sc.height = base.height;
-    crate::edgepass::finish_fixed(g, &mut sc, crate::edgepass::Mode::Routed, &fixed);
+    crate::edgepass::finish_held(g, &mut sc, crate::edgepass::Mode::Routed, &fixed, &held);
     sc
+}
+
+/// How far (px) a drag may move a state note card or the node it notes
+/// before [`route_partial`] redraws their link instead of letting it
+/// follow ([`note_link_kept`]): a node's clearance from the edges round
+/// it ([`crate::clearance::CRAMP_NODE_GAP`]), so a link that follows
+/// never comes nearer anything than its node already did.
+const NOTE_FOLLOW: f64 = crate::clearance::CRAMP_NODE_GAP;
+
+/// The drawing of `base`'s edge `i` that [`route_partial`] keeps when it
+/// links a state note card ([`crate::style::is_note_card`]) to a node
+/// and the drag moved neither end, or moved one of them (or both alike)
+/// by at most [`NOTE_FOLLOW`]: the base link itself, its moved end (and
+/// the run into it) carried along — unless one of the moved nodes' new
+/// boxes now meets it, which redraws it as `route()` would. `None` for
+/// any other edge. A note link is short and its ends are pinned, but
+/// redrawn afresh it took `route()`'s course, which can differ from
+/// `scene()`'s (a router path round its state's composite): a 1 px drag
+/// near it, or of its card or state, threw it 20-70 px (verifier: 22 of
+/// 206 composite-state diagrams).
+fn note_link_kept(
+    g: &Graph,
+    base: &Scene,
+    centers: &[(f64, f64)],
+    base_centers: &[(f64, f64)],
+    moved: &[bool],
+    i: usize,
+) -> Option<SceneEdge> {
+    let ge = g.edges.get(i)?;
+    let b = base.edges.get(i)?;
+    let card = |v: usize| {
+        base.nodes
+            .get(v)
+            .is_some_and(|n| crate::style::is_note_card(&n.id, n.shape, &n.style))
+    };
+    if ge.from == ge.to || !(card(ge.from) || card(ge.to)) {
+        return None;
+    }
+    let delta = |v: usize| {
+        (
+            centers[v].0 - base_centers[v].0,
+            centers[v].1 - base_centers[v].1,
+        )
+    };
+    let small = |d: (f64, f64)| d.0.hypot(d.1) <= NOTE_FOLLOW;
+    let (da, db) = (delta(ge.from), delta(ge.to));
+    let mut e = b.clone();
+    match (moved[ge.from], moved[ge.to]) {
+        (false, false) => {}
+        (true, true) if (da.0 - db.0).abs() < 1e-9 && (da.1 - db.1).abs() < 1e-9 && small(da) => {
+            for p in e.bezier.iter_mut().chain(e.waypoints.iter_mut()) {
+                *p = (p.0 + da.0, p.1 + da.1);
+            }
+        }
+        (true, false) if small(da) => follow_end(&mut e, true, da),
+        (false, true) if small(db) => follow_end(&mut e, false, db),
+        _ => return None,
+    }
+    // A moved node's new box newly over the link (closer than the
+    // clearance that counts as crossing it): redraw it.
+    let (was, pts) = (edge_polyline(b), edge_polyline(&e));
+    let c = crate::clearance::NODE_CLEARANCE;
+    let meets = |pts: &[(f64, f64)], v: usize, at: (f64, f64)| {
+        let n = &base.nodes[v];
+        let r = (
+            at.0 - n.w / 2.0 - c,
+            at.1 - n.h / 2.0 - c,
+            at.0 + n.w / 2.0 + c,
+            at.1 + n.h / 2.0 + c,
+        );
+        pts.windows(2).any(|w| seg_meets_rect(w[0], w[1], r))
+    };
+    let hit = (0..g.nodes.len())
+        .filter(|&v| moved[v] && v != ge.from && v != ge.to)
+        .any(|v| meets(&pts, v, centers[v]) && !meets(&was, v, base_centers[v]));
+    (!hit).then_some(e)
+}
+
+/// Carry the start (`src`) or the end of `e` along by `d`, with the run
+/// into it: a curve's control at that end; a path's waypoints on its
+/// first leg (those sharing the end's line across the leg) slid across
+/// the leg only, so an orthogonal leg stays straight and the corner it
+/// turns into keeps its other leg.
+fn follow_end(e: &mut SceneEdge, src: bool, d: (f64, f64)) {
+    let add = |p: &mut (f64, f64), dx: f64, dy: f64| {
+        p.0 += dx;
+        p.1 += dy;
+    };
+    let (pi, ci) = if src { (0, 1) } else { (3, 2) };
+    if e.waypoints.len() < 2 {
+        add(&mut e.bezier[pi], d.0, d.1);
+        add(&mut e.bezier[ci], d.0, d.1);
+        return;
+    }
+    let n = e.waypoints.len();
+    let order: Vec<usize> = if src {
+        (0..n).collect()
+    } else {
+        (0..n).rev().collect()
+    };
+    let end = e.waypoints[order[0]];
+    let vertical = (e.waypoints[order[1]].0 - end.0).abs() < 1e-9;
+    let level = (e.waypoints[order[1]].1 - end.1).abs() < 1e-9;
+    add(&mut e.waypoints[order[0]], d.0, d.1);
+    for &k in &order[1..] {
+        let q = e.waypoints[k];
+        if vertical && (q.0 - end.0).abs() < 1e-9 {
+            add(&mut e.waypoints[k], d.0, 0.0);
+        } else if level && !vertical && (q.1 - end.1).abs() < 1e-9 {
+            add(&mut e.waypoints[k], 0.0, d.1);
+        } else {
+            break;
+        }
+    }
+    let (w0, w1) = (e.waypoints[0], e.waypoints[n - 1]);
+    if e.bezier[0] == e.bezier[1] && e.bezier[2] == e.bezier[3] {
+        e.bezier = [w0, w0, w1, w1];
+    } else {
+        add(&mut e.bezier[pi], d.0, d.1);
+    }
 }
 
 /// Whether `base`'s frames still stand for `g`'s subgraphs, so
@@ -5268,6 +5430,83 @@ const NODE_STROKE_WIDTH: f64 = 1.8;
 pub(crate) fn dotted_dash(width: f64) -> String {
     let r = |v: f64| (v * 10.0).round() / 10.0;
     format!("{} {}", r(width), r(width * 1.5))
+}
+
+/// Least run (px) of stroke a styled edge keeps in sight on either side
+/// of a label lying on its line (report M3, B7 review r3 #1): three dots
+/// of a dotted edge's dash at the default width, two at a 3 px
+/// `linkStyle` width; a run a thick or coloured stroke reads on.
+const STYLE_STUB: f64 = 15.0;
+/// The most [`label_stub`] asks for, whatever a `stroke-dasharray`.
+const STYLE_STUB_MAX: f64 = 3.0 * STYLE_STUB;
+
+/// Report M3, B7 review r3 #1: how much stroke (px) an edge drawn by the
+/// flowchart painter must show on either side of a label chip lying on
+/// its line for its style to read — 0 for a plain solid edge, which
+/// needs only its line; otherwise [`STYLE_STUB`], or two periods of its
+/// dash where those are longer (capped at [`STYLE_STUB_MAX`]). Styled
+/// means dotted (`-.->`), thick (`==>`), animated, or painted by
+/// `linkStyle` with a colour, a width other than the plain
+/// [`EDGE_WIDTH`] or a dash (`stroke-dasharray:0` draws it solid). A label centred in a gap sized only for itself and
+/// its head left about 6 px either side: a single dash, and a `==>` /
+/// `linkStyle` edge that read as plain. The layout sizes an LR / RL
+/// labelled gap for this much (`layout`'s head room) and the label
+/// stage keeps a chip off it (or beside its line where the gap is
+/// shorter, as a drag may make it).
+pub(crate) fn label_stub(kind: EdgeKind, meta: &crate::model::EdgeMeta) -> f64 {
+    let st = &meta.style;
+    let width = st.stroke_width.unwrap_or(match kind {
+        EdgeKind::Thick | EdgeKind::ThickOpen => EDGE_WIDTH_THICK,
+        _ => EDGE_WIDTH,
+    });
+    // One period of the dash the painter draws (0 = solid); a list of
+    // odd length repeats twice per period, as SVG has it.
+    let period = match (&st.stroke_dasharray, meta.animation) {
+        (_, Some(_)) => dash_period(EDGE_ANIMATION_DASH),
+        (Some(d), None) => dash_period(d),
+        (None, None) if matches!(kind, EdgeKind::Dotted | EdgeKind::DottedOpen) => 2.5 * width,
+        (None, None) => 0.0,
+    };
+    // A width is a style where it draws other than the plain one: a
+    // `==>`'s, or a `linkStyle` width that is not the default (B7 review
+    // r4 #7: `linkStyle default stroke-width:2px` grew every labelled LR
+    // gap by about 30 px with nothing to show for it). Any colour counts:
+    // the layout cannot know which theme paints the drawing, and one
+    // that repeats a theme's own line reads as plain under that theme
+    // alone.
+    let styled = period > 0.0 || (width - EDGE_WIDTH).abs() > 1e-9 || st.stroke.is_some();
+    if styled {
+        (2.0 * period).clamp(STYLE_STUB, STYLE_STUB_MAX)
+    } else {
+        0.0
+    }
+}
+
+/// One period (px) of an SVG `stroke-dasharray` value (`5 5`, `5,5`,
+/// `5px 3px`, `4 2 1`): its lengths summed, twice for an odd count. 0
+/// for a solid line (`0`, `none`); a value that does not parse counts as
+/// a short dash.
+fn dash_period(d: &str) -> f64 {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for part in d.split(|c: char| c == ',' || c.is_whitespace()) {
+        let part = part.trim().trim_end_matches("px");
+        if part.is_empty() {
+            continue;
+        }
+        match part.parse::<f64>() {
+            Ok(v) if v.is_finite() && v >= 0.0 => {
+                sum += v;
+                count += 1;
+            }
+            _ if part.eq_ignore_ascii_case("none") => return 0.0,
+            _ => return STYLE_STUB / 2.0,
+        }
+    }
+    if count % 2 == 1 {
+        sum *= 2.0;
+    }
+    sum
 }
 /// Size of an end glyph in default edge strokes.
 const ARROW_MARKER_UNITS: f64 = 5.5;
@@ -7834,8 +8073,13 @@ fn direct_back(
 /// gap between clusters instead of cutting through their interiors.
 /// `a_box`/`b_box` = `(x, y, w, h)` of the endpoint's top-level cluster
 /// (or the node's own box when it has no cluster). Returns empty when
-/// the clusters aren't cleanly stacked along the flow axis (fall back
-/// to the direct curve then).
+/// the clusters aren't cleanly stacked along the flow axis, or stand
+/// closer than the two `GAP`s the path steps out and in by (fall back
+/// to the direct curve then, as the static layout draws such an edge):
+/// there the step out of one box would pass the step into the other
+/// and the path double back on itself (B7 review r1 #8: BT, with the
+/// frames 18 px apart, `Third row --> Deep` rose 14 px past the gap,
+/// fell back and ended in a slanted run under the head).
 fn cross_cluster_route(
     a_c: (f64, f64),
     a_sz: (f64, f64),
@@ -7849,11 +8093,12 @@ fn cross_cluster_route(
     if vertical {
         let down = b_c.1 >= a_c.1;
         // Only route when the two boxes are clearly separated along the
-        // flow axis (source fully above target, or vice-versa).
+        // flow axis (source fully above target, or vice-versa), with
+        // room for both steps.
         let ok = if down {
-            a_box.1 + a_box.3 < b_box.1
+            a_box.1 + a_box.3 + 2.0 * GAP <= b_box.1
         } else {
-            b_box.1 + b_box.3 < a_box.1
+            b_box.1 + b_box.3 + 2.0 * GAP <= a_box.1
         };
         if !ok {
             return Vec::new();
@@ -7887,9 +8132,9 @@ fn cross_cluster_route(
     } else {
         let right = b_c.0 >= a_c.0;
         let ok = if right {
-            a_box.0 + a_box.2 < b_box.0
+            a_box.0 + a_box.2 + 2.0 * GAP <= b_box.0
         } else {
-            b_box.0 + b_box.2 < a_box.0
+            b_box.0 + b_box.2 + 2.0 * GAP <= a_box.0
         };
         if !ok {
             return Vec::new();
@@ -10502,6 +10747,63 @@ mod tests {
         let r = route(&g, &centers);
         assert_eq!(r.edges[0].ends, g.edges[0].ends);
         assert!(to_svg(&r).contains("marker-start=\"url(#cross-start)\""));
+    }
+
+    /// B7 review r1 (#8): two boxes closer than the channel's two steps
+    /// get no channel (its step out of one would pass its step into the
+    /// other and the path double back); far enough apart they do, in
+    /// order along the flow, either way and in either direction.
+    #[test]
+    fn a_cross_cluster_channel_never_doubles_back() {
+        // BT: the source box below, the target's 18 px above it.
+        let (a, b) = ((0.0, 302.0, 134.0, 288.0), (0.0, 28.0, 134.0, 256.0));
+        assert!(cross_cluster_route(
+            (95.0, 361.0),
+            (92.0, 38.0),
+            a,
+            (95.0, 237.0),
+            (65.0, 38.0),
+            b,
+            true
+        )
+        .is_empty());
+        let a = (0.0, 330.0, 134.0, 288.0);
+        let up = cross_cluster_route(
+            (95.0, 391.0),
+            (92.0, 38.0),
+            a,
+            (95.0, 237.0),
+            (65.0, 38.0),
+            b,
+            true,
+        );
+        assert!(up.windows(2).all(|w| w[1].1 <= w[0].1), "{up:?}");
+        // LR: the same, sideways.
+        let (a, b) = ((0.0, 0.0, 100.0, 80.0), (120.0, 0.0, 100.0, 80.0));
+        assert!(cross_cluster_route(
+            (50.0, 40.0),
+            (60.0, 30.0),
+            a,
+            (170.0, 40.0),
+            (60.0, 30.0),
+            b,
+            false
+        )
+        .is_empty());
+        let b = (140.0, 0.0, 100.0, 80.0);
+        let right = cross_cluster_route(
+            (50.0, 40.0),
+            (60.0, 30.0),
+            a,
+            (190.0, 40.0),
+            (60.0, 30.0),
+            b,
+            false,
+        );
+        assert!(
+            right.len() == 4 && right.windows(2).all(|w| w[1].0 >= w[0].0),
+            "{right:?}"
+        );
     }
 
     #[test]
@@ -15381,6 +15683,182 @@ mod tests {
         );
     }
 
+    /// Report M8 (§2.8): a box's title strip takes its room above the
+    /// box's first row only — on the screen top, the layers' far side in
+    /// BT — so the next row inside follows at the usual layer gap (the
+    /// slot grown on both sides left a strip's worth of dead room under
+    /// every first row: 86 px where any other gap is 60).
+    #[test]
+    fn a_title_strip_leaves_no_dead_room_under_its_first_row() {
+        for dir in ["TD", "BT"] {
+            let src = format!(
+                "flowchart {dir}\n  C[Client] --> A\n  subgraph P [Platform]\n    \
+                 A[Auth service] --> U[User DB]\n    U --> W[Worker]\n  end\n"
+            );
+            let sc = scene(&parse(&src).unwrap());
+            let n = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+            let (top, next) = if dir == "TD" {
+                (n("A"), n("U"))
+            } else {
+                (n("W"), n("U"))
+            };
+            // Down the screen from the first row to the next either way.
+            let gap = (next.y - next.h / 2.0) - (top.y + top.h / 2.0);
+            assert!((gap - crate::layout::GAP_L).abs() < 1e-6, "{dir}: {gap}");
+            // The strip itself still sits above the first row, inside the
+            // frame: its title clear of the row.
+            let f = &sc.clusters[0];
+            let first = if dir == "TD" { n("A") } else { n("W") };
+            assert!(
+                first.y - first.h / 2.0 - f.y >= SUB_HEADER + SUB_PAD - 1e-6,
+                "{dir}: frame top {} over {}",
+                f.y,
+                first.y - first.h / 2.0
+            );
+        }
+    }
+
+    /// B7 review r1 (#2): an edge crossing into a box from the row above
+    /// with a sideways run keeps the box's border off the run's middle by
+    /// [`crate::clearance::FRAME_SEP`] (the strip no longer doubled, M8,
+    /// had put it 3 px off: advanced's `Gate ==> Job Queue` rode Async
+    /// Workers' top for 122 px and was rerouted into an L inside it); a
+    /// straight drop into a box keeps the plain gap. In advanced, no edge
+    /// cuts a foreign frame (Auth -> Users' stub into the comb on Users'
+    /// lid swung it round Async Workers' corner) nor rides Async Workers'
+    /// border, and `Gate ==> Job Queue` stays a curve, in either mode.
+    #[test]
+    fn a_run_into_a_box_crosses_its_border_clear_of_the_run() {
+        let src = "flowchart TD\n  G[Gateway] --> Q\n  G --> X[Elsewhere]\n  \
+                   subgraph W [Workers]\n    Q[Queue] --> A[Worker]\n  end\n";
+        let sc = scene(&parse(src).unwrap());
+        let n = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+        let frame = |id: &str| sc.clusters.iter().find(|c| c.id == id).unwrap();
+        let (g, q) = (n("G"), n("Q"));
+        assert!((g.x - q.x).abs() > 24.0, "the run into W must be sideways");
+        let mid = ((g.y + g.h / 2.0) + (q.y - q.h / 2.0)) / 2.0;
+        let top = frame("W").y;
+        assert!(
+            top - mid >= crate::clearance::FRAME_SEP - 1e-6,
+            "border {top} vs run middle {mid}"
+        );
+        // A straight drop keeps the plain gap and the strip over it.
+        let src =
+            "flowchart TD\n  C[Client] --> S\n  subgraph P [Platform]\n    S[Straight]\n  end\n";
+        let sc = scene(&parse(src).unwrap());
+        let n = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+        let (c, st) = (n("C"), n("S"));
+        assert!((c.x - st.x).abs() <= 24.0);
+        let gap = (st.y - st.h / 2.0) - (c.y + c.h / 2.0);
+        assert!(gap <= crate::layout::GAP_L + SUB_HEADER + 1e-6, "{gap}");
+
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/advanced.mmd"
+        ))
+        .unwrap();
+        let rep = crate::quality::measure_source(&src, false).unwrap();
+        for m in [&rep.statik, &rep.routed] {
+            assert_eq!(m.edge_frame_x, 0, "{:?}", m.details);
+            let bad = |d: &&String| d.contains("border Workers") || d.starts_with("Gate->Q ortho");
+            assert!(!m.details.iter().any(|d| bad(&d)), "{:?}", m.details);
+        }
+    }
+
+    /// Report M3 (§2.6): a decision's labelled branches between adjacent
+    /// layers get a gap that holds the label, the head and a stub either
+    /// side; each label sits in the middle of its curve, where the S is
+    /// straight, clear of the arrowhead; and each arrival lands in the
+    /// middle of its target (long-labels: 43.7 px off-centre once).
+    #[test]
+    fn decision_labels_sit_mid_curve_clear_of_their_heads() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/long-labels.mmd"
+        ))
+        .unwrap();
+        for sc in static_and_routed(&src) {
+            for to in ["C", "D"] {
+                let e = sc
+                    .edges
+                    .iter()
+                    .find(|e| e.from == "B" && e.to == to)
+                    .unwrap();
+                let (b, t) = (
+                    sc.nodes.iter().find(|n| n.id == "B").unwrap(),
+                    sc.nodes.iter().find(|n| n.id == to).unwrap(),
+                );
+                let gap = (t.y - t.h / 2.0) - (b.y + b.h / 2.0);
+                assert!(gap >= 72.0 - 1e-6, "B -> {to}: gap {gap}");
+                let (_, m, _) = e.label.as_ref().unwrap();
+                let mid = cubic_mid(e.bezier[0], e.bezier[1], e.bezier[2], e.bezier[3]);
+                // (Within a step of the label stage's spots along it.)
+                assert!(
+                    (m.0 - mid.0).hypot(m.1 - mid.1) <= 6.0,
+                    "B -> {to}: label at {m:?}, curve middle {mid:?}"
+                );
+                let tip = e.bezier[3];
+                let clear = tip.1 - (m.1 + LABEL_BOX_H / 2.0);
+                assert!(
+                    clear >= ARROW_MARKER_PX + crate::layout::LABEL_CLEAR,
+                    "B -> {to}: {clear} px from label to tip"
+                );
+                assert!((tip.0 - t.x).abs() < 5.0, "B -> {to}: {} vs {}", tip.0, t.x);
+            }
+        }
+    }
+
+    /// B7 review r1 (#6, report M3): a hub's labelled branches across one
+    /// gap get a gap deep enough that each label, centred on its curve's
+    /// middle, clears the fan's other curves; the label sits there, not
+    /// in the half near the head (`express` sat 5.7 px off its head's
+    /// base, on the bend, where at the middle its box met `Pack`'s
+    /// curve). In both modes.
+    #[test]
+    fn a_hub_s_labels_sit_mid_curve_clear_of_their_fan_and_heads() {
+        let src = "flowchart TD\n  A[Order received] --> B[Pack]\n  A -->|express| C[Ship now]\n  \
+                   A --> D[Invoice]\n  A -->|gift wrap| E[Wrap]\n  B --> F[Done]\n  C --> F\n";
+        for sc in static_and_routed(src) {
+            for to in ["C", "E"] {
+                let e = sc
+                    .edges
+                    .iter()
+                    .find(|e| e.from == "A" && e.to == to)
+                    .unwrap();
+                let (_, m, w) = e.label.clone().unwrap();
+                let mid = cubic_mid(e.bezier[0], e.bezier[1], e.bezier[2], e.bezier[3]);
+                assert!(
+                    (m.0 - mid.0).hypot(m.1 - mid.1) <= 6.0,
+                    "A -> {to}: label at {m:?}, curve middle {mid:?}"
+                );
+                let clear = e.bezier[3].1 - (m.1 + LABEL_BOX_H / 2.0);
+                assert!(
+                    clear >= ARROW_MARKER_PX + crate::layout::LABEL_CLEAR,
+                    "A -> {to}: {clear} px from label to tip"
+                );
+                // No other stroke of the fan runs through the label.
+                let r = (
+                    m.0 - w / 2.0,
+                    m.1 - LABEL_BOX_H / 2.0,
+                    m.0 + w / 2.0,
+                    m.1 + LABEL_BOX_H / 2.0,
+                );
+                for f in sc.edges.iter().filter(|f| f.from == "A" && f.to != to) {
+                    let pts = edge_polyline(f);
+                    assert!(
+                        pts.iter()
+                            .all(|p| p.0 < r.0 || p.0 > r.2 || p.1 < r.1 || p.1 > r.3),
+                        "A -> {to}'s label is crossed by A -> {}",
+                        f.to
+                    );
+                }
+            }
+        }
+        // Nor does the harness find a label on another stroke.
+        let rep = crate::quality::measure_source(src, false).unwrap();
+        assert_eq!((rep.statik.lbl_edge, rep.routed.lbl_edge), (0, 0));
+    }
+
     #[test]
     fn lr_colliding_labels_grow_their_gap_only_to_the_widest_one() {
         // Four labels share the gap after `laptop`, and their spans
@@ -15407,7 +15885,11 @@ mod tests {
             .filter_map(|e| e.label.as_ref().map(|l| l.2))
             .fold(0.0, f64::max);
         assert!(gap >= widest, "gap {gap} cannot hold a {widest} label");
-        assert!(gap <= widest + 2.0 * LABEL_BOX_H, "gap {gap} for {widest}");
+        // Plus the arrowhead the label keeps clear of (report M3).
+        assert!(
+            gap <= widest + 2.0 * LABEL_BOX_H + ARROW_MARKER_PX,
+            "gap {gap} for {widest}"
+        );
     }
 
     #[test]
@@ -15609,6 +16091,141 @@ mod tests {
             && !near(p0.1, p3.1)
             && ((near(c1.0, p0.0) && !near(c1.1, p0.1) && near(c2.1, p3.1) && !near(c2.0, p3.0))
                 || (near(c1.1, p0.1) && !near(c1.0, p0.0) && near(c2.0, p3.0) && !near(c2.1, p3.1)))
+    }
+
+    /// Verifier leftovers (B7): a note card's link whose node side also
+    /// holds another edge's end — a router path one way, none the other —
+    /// had its elbow end spread 7 px off in `scene()` and not in
+    /// `route()` (`spread-face`, `spread-bottom`); and a link the router
+    /// drew had 36 px corners in `scene()`, 14 px in `route()`
+    /// (`nested-composite`). The link end is a pin to the ports stage and
+    /// a link keeps the router's corners, so both draw every link alike
+    /// from the same centres, and a 1 px drag of a node no link ends on
+    /// moves none of them.
+    #[test]
+    fn note_links_hold_their_ends_and_corners_in_scene_route_and_drag() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/notes");
+        for name in [
+            "spread-face",
+            "spread-bottom",
+            "nested-composite",
+            "straight-link",
+            "wide-frames",
+        ] {
+            let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");
+            let g = match crate::parser::parse_document(&src).unwrap() {
+                crate::model::Document::State(g) => g,
+                other => panic!("not a state diagram: {other:?}"),
+            };
+            let s = scene(&g);
+            let at: Vec<(f64, f64)> = s.nodes.iter().map(|n| (n.x, n.y)).collect();
+            let r = route(&g, &at);
+            let links: Vec<usize> = (0..g.edges.len())
+                .filter(|&ei| {
+                    let e = &g.edges[ei];
+                    is_note_card(&s.nodes[e.from]) || is_note_card(&s.nodes[e.to])
+                })
+                .collect();
+            let same = |a: &SceneEdge, b: &SceneEdge| {
+                let close = |p: &(f64, f64), q: &(f64, f64)| {
+                    (p.0 - q.0).abs() < 1e-6 && (p.1 - q.1).abs() < 1e-6
+                };
+                a.waypoints.len() == b.waypoints.len()
+                    && a.waypoints
+                        .iter()
+                        .zip(&b.waypoints)
+                        .all(|(p, q)| close(p, q))
+                    && (!a.waypoints.is_empty()
+                        || a.bezier.iter().zip(&b.bezier).all(|(p, q)| close(p, q)))
+            };
+            let mut held = 0;
+            for &ei in &links {
+                let (a, b) = (&s.edges[ei], &r.edges[ei]);
+                // An elbow, or the nested composite's link the router
+                // drew round its box (`in458`, whose corners differed;
+                // other router paths may take another course in
+                // `route()`, whose search is a drag frame's): one and
+                // the same.
+                let card = |id: &str| {
+                    s.nodes
+                        .iter()
+                        .find(|n| n.id == id)
+                        .map(|n| n.label.as_str())
+                };
+                let routed = name == "nested-composite"
+                    && (card(&a.from) == Some("in458") || card(&a.to) == Some("in458"));
+                // A straight link (B7 review r1 #4, `straight-link`: a
+                // comb kept in `scene()` and not in `route()` pushed its
+                // pinned end 4.2 px aside): the same line.
+                let straight = a.waypoints.is_empty()
+                    && (a.bezier[0].0 - a.bezier[3].0).abs() < 1e-6
+                    && a.bezier.iter().all(|p| (p.0 - a.bezier[0].0).abs() < 1e-6);
+                if straight {
+                    assert!(
+                        b.waypoints.is_empty()
+                            && b.bezier.iter().all(|p| (p.0 - a.bezier[0].0).abs() < 1e-6),
+                        "{name} {} -> {}: {:?} vs {:?}",
+                        a.from,
+                        a.to,
+                        a.bezier,
+                        b.bezier
+                    );
+                    held += 1;
+                } else if elbow_of(a) || routed {
+                    assert!(
+                        same(a, b),
+                        "{name} {} -> {}: {:?} {:?}\nvs {:?} {:?}",
+                        a.from,
+                        a.to,
+                        a.bezier,
+                        a.waypoints,
+                        b.bezier,
+                        b.waypoints
+                    );
+                    held += 1;
+                }
+            }
+            assert!(held >= 1, "{name}: no link compared");
+            // A 1 px drag of any node, card or state, its frames redrawn
+            // or the whole drawing handed to `route()` (B7 review r1 #4:
+            // `wide-frames`' composites are drawn wider than `route()`
+            // draws them, so every drag of it is a full `route()`): a
+            // link neither end of which moved stays as drawn, and one
+            // whose card or state moved follows it by that 1 px.
+            for v in 0..g.nodes.len() {
+                let mut moved = at.clone();
+                moved[v].0 += 1.0;
+                let p = route_partial(&g, &moved, &s, &at);
+                for &ei in &links {
+                    let e = &g.edges[ei];
+                    let (a, b) = (&s.edges[ei], &p.edges[ei]);
+                    if e.from != v && e.to != v {
+                        assert!(
+                            same(a, b),
+                            "{name}: dragging {} moved {} -> {}",
+                            g.nodes[v].id,
+                            a.from,
+                            a.to
+                        );
+                        continue;
+                    }
+                    let pts = |e: &SceneEdge| -> Vec<(f64, f64)> {
+                        e.bezier.iter().chain(&e.waypoints).copied().collect()
+                    };
+                    let (pa, pb) = (pts(a), pts(b));
+                    assert_eq!(pa.len(), pb.len(), "{name}: {} -> {}", a.from, a.to);
+                    for (x, y) in pa.iter().zip(&pb) {
+                        assert!(
+                            (x.0 - y.0).abs() <= 1.0 + 1e-6 && (x.1 - y.1).abs() < 1e-6,
+                            "{name}: dragging {} threw {} -> {}: {x:?} -> {y:?}",
+                            g.nodes[v].id,
+                            a.from,
+                            a.to
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -165,6 +165,116 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Changed
 
+- **Labelled gaps keep their labels off the arrowhead; ends meet their
+  sides in the middle** (report M3, §2.4, §2.6). In a flowchart or state
+  diagram a gap between adjacent layers that carries an edge label grows
+  to hold the label, an arrowhead and a stub either side of it: 72 px
+  down the page for a one-line label (the 60 px gap used to stay, a
+  20 px chip swallowing a third of it and the edge reading as two hooks),
+  and along LR / RL the label's width, the head (both heads of a `<-->`
+  edge, whose label otherwise stepped above its line) and a clearance
+  either side (the head used to be left out); there a label on its line sits
+  centred on the run clear of its arrowhead, so the clearance falls at
+  both ends of its chip (at the curve's middle the chip stopped 3-4 px
+  short of the head, which seemed to grow out of it). So does the gap
+  between two composite states (or subgraphs) stacked one after the
+  other when a labelled transition between them is drawn from border to
+  border: such a gap stayed about 18 px whenever the transition's
+  stand-in ran on to members deeper inside a box, and its chip covered
+  the whole edge and its arrowhead. A styled edge's
+  LR / RL gap (dotted, thick, animated, or `linkStyle`-painted with a
+  colour, a width other than the plain 2 px, or a dash; `linkStyle
+  default stroke-width:2px` draws plain and leaves a plain gap) also
+  keeps a run of its stroke in sight either
+  side of the chip: 15 px, or two periods of a longer dash (the chip
+  used to leave about 6 px, one dash of a dotted edge, and a thick or
+  coloured edge read as plain); where a drag brings the ends nearer than
+  that, the label steps beside its line instead of hiding the stroke. A
+  plain edge's gap is unchanged. On a straight line across the page a
+  head keeps a label only its own length (and 3 px) away: a `curve:
+  linear` or `step` edge's label no longer steps beside its line (the
+  head's room took the whole line), and `route()` keeps such a label on
+  its line where `scene()` does (its straight curve's sparse samples
+  near the ends made the head 21 px long, so a 1 px drag moved the
+  label 20 px); class and ER relations, whose painters draw their own
+  end glyphs, keep their labels' distance from those glyphs as before
+  (their output is unchanged). A decision's branch label sits in
+  the middle of its curve, where the S runs straight, instead of in the
+  half that turns into its target. So does a hub's (a node with more
+  ends) where the drawing runs down the page: the gap grows (by up to
+  48 px) until the label, centred on its curve's middle, clears the
+  fan's other curves (a hub's `express` sat on the bend 6 px off its
+  head, its middle crossed by a sibling's curve); a fan too crowded for
+  that, or with parallel twins, keeps its gap and its labels keep to the
+  half away from the hub. A label the first placement pass moved aside
+  (it runs before a fan's ends are spread) returns to its curve's middle
+  once that spot is clear: a decision fan's `thick` stayed 3 px off its
+  head after its sibling had moved 30 px away. An edge end alone on its box side
+  meets that side in the middle (long-labels' arrivals landed up to
+  44 px off their targets' centres, and the flow through a node jogged);
+  three or more ends on one box side are spaced evenly, centred where
+  their edges head (fanout's Aggregator took 14 / 29 / 29 / 14 px), and
+  a comb of arrowheads keeps a clear gap between its heads; when
+  ends must make room, the ends of straight edges keep their place and a
+  back-edge's give way; and a 1:1 pair on facing sides a few px apart
+  along them is drawn straight, also after the router re-spaced a side
+  it changed (advanced's `Gate --> Auth` was left 2.9 px off straight).
+  Parallel edges keep their own spacing.
+  In a drag (`route_partial`) the ends of the edges the drag keeps hold
+  their places: a side whose every end the drag keeps is left exactly as
+  drawn, a side is combed only round its kept ends, and a redrawn end
+  that would throw a kept one more than half a port spacing takes the
+  nearest free spot beside the kept fan instead, so a 1 px drag never
+  re-spaces the fan of a node it does not touch (a state choice's
+  labelled twins, whose slant asks for more than the port spacing, used
+  to swap across their sibling on every drag of any node). An edge the
+  drag keeps because it merely passes near the dragged node holds its
+  ends too, and is rerouted only for a node, frame or title it now hits
+  or a run on top of another edge, never for spacing alone (its ends
+  used to be re-spaced by `route()`'s
+  rules: a 1 px drag of a note card beside one threw it 22 px; over
+  dense-td's and bench-75's drags 17 and 18 such jumps, now 3 and 15).
+  A drag that
+  falls back to a full `route()` (a composite state drawn wider than its
+  members sends every drag there) draws the fans as `route()` does. A
+  state note card's link holds its end whatever else shares its node's
+  side (an even spread never pushes it aside), and keeps the router's
+  corners, so `scene()` and `route()` draw an elbow or straight link
+  alike (its elbow ends used to sit 7-18 px apart in the two, a straight
+  one 4 px); a link the router redrew round something may still take
+  another course in a full `route()`. A drag (`route_partial`) keeps a
+  note link exactly as drawn while neither its card nor its state moves
+  (unless the dragged node now lies across it), and carries it along
+  when one of them moves up to 8 px, also when the drag is redrawn by a
+  full `route()`; a 1 px drag used to throw it 20-70 px in about one
+  composite-state diagram in ten. Class and ER diagrams,
+  whose painters set their own ends, are unchanged. The layout search
+  judges a candidate on the old depths, so the head room never changes
+  a layering or ordering choice.
+- **No dead room under a subgraph's first row** (report M8, §2.8). A
+  box's title strip now takes its room only above the box's first row
+  (below it in BT, the screen top), so the next row inside follows at the
+  usual layer gap; the strip used to be reserved on both sides of the
+  row, leaving 26 px of empty band under every box's first row. Titles
+  are still never struck. Where an edge runs sideways across a gap into
+  (or out of) a box, the gap keeps the box's border clear of the run's
+  middle, so the curve crosses the border instead of riding it (the
+  strip used to give that room by chance: advanced's `Gate ==> Job
+  Queue` would otherwise run along Async Workers' top); a straight drop
+  into a box keeps the plain gap (subgraph 786 -> 758 px tall, advanced
+  1 267 -> 1 236, dense-td 1 823 -> 1 746). In the static scene, two
+  unrelated edges left side by side closer than the edge spacing get one
+  moved clear (a free curve slid along the flow, a router leg across its
+  channel) where that costs nothing else, and an end's straight run into
+  its arrowhead is left out where it would swing the curve into a box it
+  passes beside (it is squared at paint time instead). A path whose one
+  step lies between its two port legs is drawn straight where both ports
+  can slide onto a line their sides share (BT, a port slid off a frame's
+  title chip left a 29 px step right under the head, on the border of the
+  frame round its node). `route()` no longer threads a channel between
+  two boxes closer than its two 16 px steps: the step out of one passed
+  the step into the other and the path doubled back on itself; such an
+  edge starts as the static scene's direct curve.
 - **Long node labels wrap** (report M7, §2.12). A flowchart or state
   label that breaks none of its own lines now wraps at 200 px (mermaid's
   `flowchart.wrappingWidth` default) instead of stretching its node into

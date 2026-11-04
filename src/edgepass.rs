@@ -11,7 +11,9 @@
 //!    onto a side another edge already uses.
 //! 4. [`crate::router::nudge`]: spread shared channels, merge stair
 //!    steps and round corners (in the static scene, then put each side's
-//!    ports in the order their paths head).
+//!    ports in the order their paths head); then
+//!    [`crate::router::spread_close`] moves one of two unrelated edges
+//!    still side by side under the spacing clear.
 //! 5. [`crate::labels::relabel`]: re-place the labels of changed edges,
 //!    and any label that covers something or sits on another stroke
 //!    where a clearer spot exists.
@@ -30,7 +32,7 @@
 //! [`scene`]: crate::scene::scene
 //! [`route`]: crate::scene::route
 
-use crate::clearance::{CLEAR_GAP, CRAMP_NODE_GAP, EDGE_SPACING};
+use crate::clearance::{CLEAR_GAP, CRAMP_NODE_GAP, EDGE_SPACING, FRAME_INSET};
 use crate::model::{Direction, End, Graph};
 use crate::scene::{
     basis_sample, edge_drawn, edge_polyline, grow_canvas, own_box_targets, sample_cubic,
@@ -90,6 +92,20 @@ pub(crate) struct Ctx {
     /// changed edge crowds it. All `false` except in
     /// [`crate::scene::route_partial`].
     pub fixed: Vec<bool>,
+    /// Index-parallel with `sc.edges`: the edge's ends hold their places
+    /// (B7 review r3 #7). Every [`Ctx::fixed`] edge, and in
+    /// [`crate::scene::route_partial`] an edge it keeps from its base
+    /// that may still be rerouted where a drag left it hitting
+    /// something (it passes near what the drag changed): the ports stage
+    /// never re-places its ends by its own rules (a drag's redrawn ends
+    /// make room round them), and the router reroutes it for a node,
+    /// frame or chip it now hits or a run on top of another edge, never
+    /// for spacing alone. Such an edge's
+    /// ends used to be re-placed by `route()`'s rules, which need not
+    /// agree with the base's, so a 1 px drag of a node beside it threw
+    /// them 20-45 px. All `false` (but where `fixed`) outside
+    /// `route_partial`.
+    pub held: Vec<bool>,
 }
 
 /// Build the shared context. `sc.edges` holds `g.edges` first, then the
@@ -215,6 +231,7 @@ pub(crate) fn ctx(g: &Graph, sc: &Scene) -> Ctx {
         })
         .collect();
     let fixed = vec![false; sc.edges.len()];
+    let held = fixed.clone();
     Ctx {
         ends,
         node_frames,
@@ -222,6 +239,7 @@ pub(crate) fn ctx(g: &Graph, sc: &Scene) -> Ctx {
         back,
         drawn,
         fixed,
+        held,
     }
 }
 
@@ -305,8 +323,18 @@ pub(crate) fn finish(g: &Graph, sc: &mut Scene, mode: Mode) {
 /// changed made the stage drop labels it could not improve onto worse
 /// spots, such as their own node.)
 pub(crate) fn finish_fixed(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool]) {
+    finish_held(g, sc, mode, fixed, fixed);
+}
+
+/// [`finish_fixed`] with the edges flagged in `held` (index-parallel
+/// with `sc.edges`, a superset of `fixed`; missing entries are `false`)
+/// holding their ends: see [`Ctx::held`].
+pub(crate) fn finish_held(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool], held: &[bool]) {
     let mut cx = ctx(g, sc);
     for (f, &x) in cx.fixed.iter_mut().zip(fixed) {
+        *f = x;
+    }
+    for (f, &x) in cx.held.iter_mut().zip(held) {
         *f = x;
     }
     let mut moved = vec![false; sc.edges.len()];
@@ -321,6 +349,10 @@ pub(crate) fn finish_fixed(g: &Graph, sc: &mut Scene, mode: Mode, fixed: &[bool]
     // keeps) the final ends; in the static scene it ends by putting each
     // side's ends in the order their paths now head (G9).
     crate::router::nudge(g, sc, &cx, mode, &mut moved);
+    // Then two unrelated edges the nudge (or the builder) left side by
+    // side under the spacing get one moved clear, where that costs
+    // nothing else (G4).
+    crate::router::spread_close(g, sc, &cx, mode, &mut moved);
     glyph_stubs(sc, &cx, &mut moved);
     snap_ends(sc, &cx);
     let budget = match mode {
@@ -582,7 +614,8 @@ const SNAP_REACH: f64 = 0.5;
 /// ([`glyph_stubs`]) stays as clear of the scene as it was: where its
 /// curve changes, it comes no nearer than [`CRAMP_NODE_GAP`] to a node
 /// that is not one of its ends (unless its old curve came nearer
-/// still), and runs no longer within [`CLEAR_GAP`] — nor within
+/// still), cuts into no frame holding neither end that its old curve
+/// stayed out of, and runs no longer within [`CLEAR_GAP`] — nor within
 /// [`EDGE_SPACING`] — of another edge than it did (only the latter for
 /// one ending on the node the stub runs into, `stubbed`: ends
 /// converging on a node run in side by side). The routing and port
@@ -653,6 +686,32 @@ fn stub_keeps_clear(sc: &Scene, cx: &Ctx, i: usize, new: &[Pt], stubbed: &[usize
         let g_now = now.iter().map(gap).fold(f64::INFINITY, f64::min);
         let g_was = was.iter().map(gap).fold(f64::INFINITY, f64::min);
         if g_now < CRAMP_NODE_GAP && g_now < g_was - STUB_SAME {
+            return false;
+        }
+    }
+    // Nor does it newly cut into a frame holding neither end (B7 review
+    // r1 #2: advanced's `Auth -> Users`, its stub into a comb's end on
+    // the drum's lid, swung the spline's last span out round the corner
+    // of the Async Workers frame it passed beside).
+    let own_frame = |f: usize, end: EndRef| match end {
+        EndRef::Node(v) => cx.node_frames.get(v).is_some_and(|fs| fs.contains(&f)),
+        EndRef::Frame(c) => cx.frame_anc.get(c).is_some_and(|fs| fs.contains(&f)),
+    };
+    for (f, c) in sc.clusters.iter().enumerate() {
+        let r = (c.x, c.y, c.x + c.w, c.y + c.h);
+        if own_frame(f, from) || own_frame(f, to) || !near(r) {
+            continue;
+        }
+        let inner = (
+            r.0 + FRAME_INSET,
+            r.1 + FRAME_INSET,
+            r.2 - FRAME_INSET,
+            r.3 - FRAME_INSET,
+        );
+        // Entered as the router and the harness count it: a piece of a
+        // segment strictly inside the inset box.
+        let enters = |run: &[Pt]| run.windows(2).any(|w| enters_box(w[0], w[1], inner));
+        if enters(now) && !enters(was) {
             return false;
         }
     }
@@ -728,6 +787,38 @@ fn stub_keeps_clear(sc: &Scene, cx: &Ctx, i: usize, new: &[Pt], stubbed: &[usize
         }
     }
     true
+}
+
+/// Whether segment `a`-`b` has a piece strictly inside the box `r`
+/// `(x0, y0, x1, y1)`: the midpoint of its clipped part lies inside
+/// (Liang-Barsky), as `router::World::score` counts a frame entered.
+fn enters_box(a: Pt, b: Pt, r: (f64, f64, f64, f64)) -> bool {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for (p, q) in [
+        (-dx, a.0 - r.0),
+        (dx, r.2 - a.0),
+        (-dy, a.1 - r.1),
+        (dy, r.3 - a.1),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return false;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+            if t0 > t1 {
+                return false;
+            }
+        }
+    }
+    let m = (a.0 + dx * (t0 + t1) / 2.0, a.1 + dy * (t0 + t1) / 2.0);
+    m.0 > r.0 && m.0 < r.2 && m.1 > r.1 && m.1 < r.3
 }
 
 /// The pieces (point pairs) of `e`'s curve ([`edge_polyline`]'s, as
