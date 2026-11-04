@@ -172,7 +172,10 @@ Minor, not patch: several class structs gain public fields (see
   down the page for a one-line label (the 60 px gap used to stay, a
   20 px chip swallowing a third of it and the edge reading as two hooks),
   and along LR / RL the label's width, the head and a clearance either
-  side (the head used to be left out). A decision's branch label sits in
+  side (the head used to be left out); there a label on its line sits
+  centred on the run clear of its arrowhead, so the clearance falls at
+  both ends of its chip (at the curve's middle the chip stopped 3-4 px
+  short of the head, which seemed to grow out of it). A decision's branch label sits in
   the middle of its curve, where the S runs straight, instead of in the
   half that turns into its target. So does a hub's (a node with more
   ends) where the drawing runs down the page: the gap grows (by up to

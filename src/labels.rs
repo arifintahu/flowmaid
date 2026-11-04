@@ -1900,6 +1900,32 @@ fn place(
     )
     .with_siblings(sibs);
 
+    // In the final pass, a label lying along its line at the curve's
+    // middle moves to the middle of the run clear of its arrowhead
+    // (`head_clear_spot`), where that spot is clean and no other stroke
+    // comes within STROKE_PAD of it.
+    if matches!(pass, Pass::Changed(_)) {
+        for ei in 0..n {
+            let (Some(pts), Some((_, at, w))) = (&lines[ei], edges[ei].label.clone()) else {
+                continue;
+            };
+            let Some(to) = head_clear_spot(&edges[ei], pts, at) else {
+                continue;
+            };
+            let r = label_rect(to, w);
+            if field.hits(&placed, ei, r).none()
+                && placed.clear(ei, r, keep[ei])
+                && field.strokes().count(r, ei, 0) == 0
+            {
+                if let Some((_, m, _)) = &mut edges[ei].label {
+                    *m = to;
+                }
+                placed.set(ei, r);
+                moved.push(ei);
+            }
+        }
+    }
+
     // Labels already searched, and the boxes labels left or took in the
     // last round (by mover): a searched label is tried again only when
     // one of those lies within its reach.
@@ -2035,7 +2061,13 @@ fn line_middle(pts: &[(f64, f64)]) -> (f64, f64) {
         .windows(2)
         .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
         .sum();
-    let mut left = len / 2.0;
+    line_at(pts, len / 2.0)
+}
+
+/// The point `s` px along polyline `pts` (by length; its last point
+/// past its end).
+fn line_at(pts: &[(f64, f64)], s: f64) -> (f64, f64) {
+    let mut left = s;
     for w in pts.windows(2) {
         let d = (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
         if d >= left && d > 0.0 {
@@ -2048,6 +2080,73 @@ fn line_middle(pts: &[(f64, f64)]) -> (f64, f64) {
         left -= d;
     }
     pts.last().copied().unwrap_or((0.0, 0.0))
+}
+
+/// Report M3 (§2.6), B7 review r2 #3: the spot a label lying along its
+/// line takes — a single free curve the flowchart painter draws across
+/// the page (LR / RL: its chord runs more across than down), with an
+/// arrowhead at one end only, whose label (`at`) sits on the line, or
+/// just beside it (where the stages stepped it off the head), between
+/// its middle and that spot: the middle of the run
+/// clear of the head, halfway between the tail and the head's base
+/// (from there up to the middle: a label the stages slid a little off
+/// the head moves the rest of the way). The
+/// layout sizes such a gap for the label, a head and [`LABEL_CLEAR`] on
+/// either side (`layout`'s LR head room), which is where the label sits
+/// only so centred: at the curve's middle it stood half a head nearer
+/// its head, 2.6-4.2 px off the head's base with 7.5-9 px of stub at
+/// the tail, and the head seemed to grow out of the chip. `None` where
+/// the rule does not apply (a TD / BT label is a row tall, and its gap
+/// keeps a [`crate::layout::LABEL_RUN`] either side).
+fn head_clear_spot(e: &SceneEdge, pts: &[(f64, f64)], at: (f64, f64)) -> Option<(f64, f64)> {
+    let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else {
+        return None;
+    };
+    let heads = (
+        e.ends.start_marker(e.kind).is_some(),
+        e.ends.end_marker(e.kind).is_some(),
+    );
+    if e.paint_width.is_some()
+        || e.from == e.to
+        || !e.waypoints.is_empty()
+        || heads.0 == heads.1
+        || (last.0 - first.0).abs() <= (last.1 - first.1).abs()
+    {
+        return None;
+    }
+    // Where along the line the label sits (arc length), and how far off.
+    let (mut off, mut s_at, mut len) = (f64::INFINITY, 0.0, 0.0);
+    for w in pts.windows(2) {
+        let d = (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
+        let f = if d > 0.0 {
+            (((at.0 - w[0].0) * (w[1].0 - w[0].0) + (at.1 - w[0].1) * (w[1].1 - w[0].1)) / (d * d))
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let q = (
+            w[0].0 + (w[1].0 - w[0].0) * f,
+            w[0].1 + (w[1].1 - w[0].1) * f,
+        );
+        let o = (at.0 - q.0).hypot(at.1 - q.1);
+        if o < off {
+            (off, s_at) = (o, len + f * d);
+        }
+        len += d;
+    }
+    if off > LABEL_BOX_H / 2.0 + LABEL_SIDE_AIR + FAN_ON_LINE || len <= 2.0 * ARROW_MARKER_PX {
+        return None;
+    }
+    // Halfway between the tail and the head's base, and how far the
+    // label lies from there toward the head (the middle at most).
+    let (s, toward) = if heads.1 {
+        let s = (len - ARROW_MARKER_PX) / 2.0;
+        (s, s_at - s)
+    } else {
+        let s = (len + ARROW_MARKER_PX) / 2.0;
+        (s, s - s_at)
+    };
+    (toward > TOUCH_EPS && toward <= ARROW_MARKER_PX / 2.0 + FAN_ON_LINE).then(|| line_at(pts, s))
 }
 
 /// Whether edge `e`, drawn as one free curve down (or up) the page,
@@ -2914,6 +3013,43 @@ mod tests {
         let sc = crate::scene::scene(&g);
         let sibs = label_siblings(&sc.nodes, &sc.edges, |i| sc.edges[i].label.is_some());
         assert!(sibs.iter().all(Vec::is_empty), "{sibs:?}");
+    }
+
+    /// B7 review r2 (#3, report M3): a label lying on a straight LR edge
+    /// is centred on the run clear of its arrowhead, in `scene()` and
+    /// `route()`: the chip keeps [`LABEL_CLEAR`] from the head's base
+    /// (it stopped 2.6-4.2 px short of it, the head seeming to grow out
+    /// of the chip) and as much stub at its tail. A label the stages
+    /// stepped beside its line stays there.
+    #[test]
+    fn an_lr_label_centres_on_the_run_clear_of_its_head() {
+        let g = crate::parser::parse(
+            "flowchart LR\n  A[Alpha] -->|ok| B[Beta]\n  B -->|denied| C[Gamma]\n  \
+             C -->|access denied| D[Delta]\n  D -->|a much longer label here| E[Epsilon]",
+        )
+        .unwrap();
+        let sc = crate::scene::scene(&g);
+        let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let routed = crate::scene::route(&g, &at);
+        for (mode, sc) in [("scene", &sc), ("route", &routed)] {
+            let mut on_line = 0;
+            for e in &sc.edges {
+                let (text, c, w) = e.label.as_ref().unwrap();
+                let (a, b) = (e.bezier[0], e.bezier[3]);
+                assert!((a.1 - b.1).abs() < 1e-6, "{mode} {text}: straight");
+                if (c.1 - a.1).abs() > FAN_ON_LINE {
+                    continue;
+                }
+                on_line += 1;
+                let tail = c.0 - w / 2.0 - a.0;
+                let head = b.0 - ARROW_MARKER_PX - (c.0 + w / 2.0);
+                assert!(
+                    head >= LABEL_CLEAR - 1e-6 && (tail - head).abs() < 1e-6,
+                    "{mode} {text}: tail {tail:.1} head {head:.1}"
+                );
+            }
+            assert!(on_line >= 3, "{mode}: {on_line} labels on their lines");
+        }
     }
 
     #[test]

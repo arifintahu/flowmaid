@@ -3257,9 +3257,14 @@ fn place(
                 // gap keeps its label clear of the arrowhead too (report
                 // M3, §2.6): across TD / BT a [`LABEL_RUN`] on either
                 // side; along LR / RL, where the label is a whole width
-                // long and slides along its line off the head, the head
-                // and a clearance on both sides. (Class and ER scenes
-                // keep their glyph room in `room` and the plain rule.)
+                // long, the head and a clearance on both sides — the
+                // label stage centres such a label on the run clear of
+                // its head (`labels::head_clear_spot`), so the clearance
+                // falls at both ends of the chip. (Growing the LR gap by
+                // a `LABEL_RUN` either side re-laid dense-lr and drew
+                // wide-labels flatter than `MAX_ASPECT`.) (Class and ER
+                // scenes keep their glyph room in `room` and the plain
+                // rule.)
                 let flow = ext > 0.0 && g.edge_paint_width.is_none() && !judged;
                 let need = match (flow, horizontal) {
                     (true, false) => Some(ext + 2.0 * LABEL_RUN),
