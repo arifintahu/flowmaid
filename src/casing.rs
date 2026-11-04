@@ -13,10 +13,9 @@
 //! px reads as dashed, and a dashed edge means `-.->` in mermaid.
 
 use crate::labels::seg_cells;
-use crate::model::EdgeKind;
 use crate::scene::{
-    edge_drawn, edge_polyline, DefsKey, Scene, SceneEdge, ARROW_MARKER_PX, EDGE_WIDTH,
-    EDGE_WIDTH_THICK,
+    edge_drawn, edge_head_len, edge_painted_polyline, edge_stroke_width as stroke_width, DefsKey,
+    Scene, ARROW_MARKER_PX,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,6 +32,21 @@ pub(crate) const CASING_HALO: f64 = 1.5;
 /// Two crossing points of one edge pair closer than this (px) are one
 /// crossing (sampled polylines can hit twice).
 const CROSS_MERGE: f64 = 4.0;
+/// Crossings on one line closer than this (px) are one cluster: about
+/// three gaps wide, so their cuts read as one place where lines meet.
+/// The line takes one role across a cluster (report Q15, see
+/// [`Assign::unify`]): under at one and over at the next, a few px
+/// apart, it reads as broken.
+const CROSS_CLUSTER: f64 = 25.0;
+/// Lines shorter than this (px) keep at most one gap where they can
+/// ([`Assign::spare_short`]): three dash periods, the length over which
+/// two cuts already read as a dashed stroke.
+const SHORT_LINE: f64 = 3.0 * GAP_PERIOD;
+/// Gaps any line may hold after [`Assign::unify`] gives one role per
+/// cluster, even where no line held as many before: a few sparse gaps
+/// along a line read as crossings, not dashes (those are kept off by
+/// [`chain_cost`]).
+const UNIFY_GAPS: usize = 6;
 /// Side (px) of a cell of the segment grid that finds candidate pairs.
 const CASING_CELL: f64 = 64.0;
 /// Room (px) the mask box leaves around the under-edge's points, so
@@ -62,15 +76,6 @@ type Pt = (f64, f64);
 /// The grid cells one segment is bucketed into.
 type Cells = Vec<(i64, i64)>;
 
-/// Stroke width `to_svg` paints edge `e` with.
-fn stroke_width(e: &SceneEdge) -> f64 {
-    let base = match e.kind {
-        EdgeKind::Thick | EdgeKind::ThickOpen => EDGE_WIDTH_THICK,
-        _ => EDGE_WIDTH,
-    };
-    e.meta.style.stroke_width.unwrap_or(base)
-}
-
 /// Proper intersection point of segments `a`–`b` and `c`–`d`, half-open
 /// on both (the same rule as the quality yardstick).
 fn seg_cross(a: Pt, b: Pt, c: Pt, d: Pt) -> Option<Pt> {
@@ -99,10 +104,25 @@ fn dist(a: Pt, b: Pt) -> f64 {
 /// no cut, and left out (see [`cut_kinds`]). The quality yardstick reads
 /// this too, to count the cuts each edge collects (G1).
 pub(crate) fn crossings(sc: &Scene) -> Vec<(usize, usize, Pt, bool)> {
-    crossings_with(sc, true)
-        .into_iter()
+    gapped(crossings_with(sc, true))
+}
+
+/// The crossings of [`crossings_in`] that get a cut, as [`crossings`]
+/// lists them.
+fn gapped(xs: Vec<(usize, usize, Pt, Cut)>) -> Vec<(usize, usize, Pt, bool)> {
+    xs.into_iter()
         .filter(|x| x.3 != Cut::Plain)
         .map(|(u, o, p, c)| (u, o, p, c == Cut::Notch))
+        .collect()
+}
+
+/// Every edge's stroke as painted ([`edge_painted_polyline`]) where
+/// [`crossings_in`] looks for crossings (a drawn edge between two
+/// nodes), else `None`.
+fn painted_lines(sc: &Scene) -> Vec<Option<Vec<Pt>>> {
+    sc.edges
+        .iter()
+        .map(|e| (edge_drawn(e) && e.from != e.to).then(|| edge_painted_polyline(e)))
         .collect()
 }
 
@@ -168,16 +188,23 @@ fn cut_kinds(gaps: &[(usize, f64)]) -> Vec<Cut> {
 /// [`crossings`], optionally keeping those next to an edge end too (the
 /// set the quality yardstick counts as `edge_edge_x`).
 fn crossings_with(sc: &Scene, skip_ends: bool) -> Vec<(usize, usize, Pt, Cut)> {
-    let idx: Vec<usize> = (0..sc.edges.len())
-        .filter(|&i| {
-            let e = &sc.edges[i];
-            edge_drawn(e) && e.from != e.to
-        })
-        .collect();
+    crossings_in(sc, &painted_lines(sc), skip_ends)
+}
+
+/// [`crossings_with`] of the strokes `all` ([`painted_lines`]: edge
+/// `i`'s painted polyline, `None` for one never crossed), so a painter
+/// that already holds them works none out twice.
+fn crossings_in(
+    sc: &Scene,
+    all: &[Option<Vec<Pt>>],
+    skip_ends: bool,
+) -> Vec<(usize, usize, Pt, Cut)> {
+    let idx: Vec<usize> = (0..sc.edges.len()).filter(|&i| all[i].is_some()).collect();
     if idx.len() < 2 {
         return Vec::new();
     }
-    let lines: Vec<Vec<Pt>> = idx.iter().map(|&i| edge_polyline(&sc.edges[i])).collect();
+    // The strokes as painted (their squared glyph ends included).
+    let lines: Vec<&[Pt]> = idx.iter().filter_map(|&i| all[i].as_deref()).collect();
 
     // Segment grid: cell -> (line, segment). A segment too long to
     // bucket (a node dragged far away) is checked against every other
@@ -255,11 +282,18 @@ fn crossings_with(sc: &Scene, skip_ends: bool) -> Vec<(usize, usize, Pt, Cut)> {
                     continue;
                 };
                 // Counted up to an end the two share (the yardstick's
-                // rule): ends crossing on their port legs cross too.
-                let near_end = skip_ends
-                    && [pa[0], pa[pa.len() - 1], pb[0], pb[pb.len() - 1]]
+                // rule): ends crossing on their port legs cross too. A
+                // gap masks a disc of the under-line, end glyph and all:
+                // none within a glyph and the disc's radius of an end, so
+                // a gap never bites a head.
+                let near_end = skip_ends && {
+                    let (ea, eb) = (&sc.edges[idx[ka]], &sc.edges[idx[kb]]);
+                    let head = edge_head_len(ea).max(edge_head_len(eb));
+                    let reach = head + gap_reach(ea, eb);
+                    [pa[0], pa[pa.len() - 1], pb[0], pb[pb.len() - 1]]
                         .iter()
-                        .any(|&q| dist(p, q) < ARROW_MARKER_PX);
+                        .any(|&q| dist(p, q) < reach)
+                };
                 if near_end {
                     continue;
                 }
@@ -295,6 +329,15 @@ fn crossings_with(sc: &Scene, skip_ends: bool) -> Vec<(usize, usize, Pt, Cut)> {
         x.3 = kind;
     }
     out
+}
+
+/// Radius (px) of the widest gap [`masks`] can cut where edges `a` and
+/// `b` cross, whichever passes under: the over-line's half stroke, the
+/// air and the halo.
+fn gap_reach(a: &crate::scene::SceneEdge, b: &crate::scene::SceneEdge) -> f64 {
+    let (wa, wb) = (stroke_width(a), stroke_width(b));
+    let hole = |under: f64, over: f64| over / 2.0 + CASING_GAP_STROKES * under + CASING_HALO;
+    hole(wa, wb).max(hole(wb, wa))
 }
 
 /// One crossing of a line pair `(a, b)`, `a < b`: the point, and how
@@ -456,6 +499,8 @@ impl<'a> Assign<'a> {
             }
         }
         st.balance();
+        st.unify();
+        st.spare_short();
         st
     }
 
@@ -624,6 +669,140 @@ impl<'a> Assign<'a> {
                 }
             }
         }
+    }
+
+    /// One role per line across each cluster of its crossings (report
+    /// Q15): crossings on one line closer than [`CROSS_CLUSTER`] are one
+    /// place where lines meet, and a line going under at one and over at
+    /// the next, a few px on, reads as broken. A mixed cluster takes the
+    /// role most of its crossings already give its line (a tie: under
+    /// for a back-edge, which goes under by preference, else over, so
+    /// the line stays whole), else the other, the first that leaves the
+    /// lines it touches less mixed ([`Self::mixed`]), no chain of gaps
+    /// any nearer a dashed look ([`chain_cost`] no higher) and no line
+    /// with more gaps than the most any line held before. Lines in
+    /// order, clusters along them: deterministic.
+    fn unify(&mut self) {
+        let ctx = self.ctx;
+        let cap = self.gap_cap();
+        for line in 0..ctx.members.len() {
+            let mut along: Vec<(f64, usize)> = ctx.members[line]
+                .iter()
+                .map(|&c| (ctx.at_on(c, line), c))
+                .collect();
+            along.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+            let mut start = 0;
+            for i in 1..=along.len() {
+                if i < along.len() && along[i].0 - along[i - 1].0 < CROSS_CLUSTER {
+                    continue;
+                }
+                let cluster: Vec<usize> = along[start..i].iter().map(|&(_, c)| c).collect();
+                start = i;
+                if cluster.len() < 2 {
+                    continue;
+                }
+                let unders = cluster
+                    .iter()
+                    .filter(|&&c| self.under_line(c) == line)
+                    .count();
+                if unders == 0 || unders == cluster.len() {
+                    continue;
+                }
+                let first_under = match (2 * unders).cmp(&cluster.len()) {
+                    Ordering::Greater => true,
+                    Ordering::Less => false,
+                    Ordering::Equal => ctx.back[line],
+                };
+                for under in [first_under, !first_under] {
+                    let flips: Vec<usize> = cluster
+                        .iter()
+                        .copied()
+                        .filter(|&c| (self.under_line(c) == line) != under)
+                        .collect();
+                    let mut touched: Vec<usize> = flips
+                        .iter()
+                        .flat_map(|&c| ctx.pair[c])
+                        .chain(std::iter::once(line))
+                        .collect();
+                    touched.sort_unstable();
+                    touched.dedup();
+                    let before: usize = touched.iter().map(|&e| self.mixed(e)).sum();
+                    let delta: i64 = flips.iter().map(|&c| self.flip_quiet(c)).sum();
+                    let after: usize = touched.iter().map(|&e| self.mixed(e)).sum();
+                    let most = touched.iter().map(|&e| self.gaps[e].len()).max();
+                    if delta <= 0 && after < before && most <= Some(cap) {
+                        break;
+                    }
+                    for &c in flips.iter().rev() {
+                        self.flip_quiet(c);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A short line keeps at most one gap where it can (report §2.10):
+    /// two cuts in a line of a few dozen px leave it in dashes, while
+    /// each crossing line, longer, takes one cut in its length. Shortest
+    /// lines first; a gap moves to the other line only when that keeps
+    /// every chain as far from a dashed look ([`chain_cost`] no higher),
+    /// mixes no cluster ([`Self::mixed`] no higher) and piles no more
+    /// gaps on the longer line than [`Self::gap_cap`].
+    fn spare_short(&mut self) {
+        let ctx = self.ctx;
+        let cap = self.gap_cap();
+        let mut lines: Vec<usize> = (0..ctx.members.len())
+            .filter(|&e| ctx.length[e] < SHORT_LINE && self.gaps[e].len() > 1)
+            .collect();
+        lines.sort_by(|&x, &y| ctx.length[x].total_cmp(&ctx.length[y]).then(x.cmp(&y)));
+        for line in lines {
+            let mine: Vec<usize> = self.ids[line].clone();
+            for c in mine {
+                if self.gaps[line].len() <= 1 {
+                    break;
+                }
+                let other = ctx.pair[c][usize::from(ctx.pair[c][0] == line)];
+                // A back-edge keeps its gaps (it goes under by preference).
+                if ctx.length[other] <= ctx.length[line]
+                    || self.gaps[other].len() >= cap
+                    || (ctx.back[line] && !ctx.back[other])
+                {
+                    continue;
+                }
+                let before = self.mixed(line) + self.mixed(other);
+                let delta = self.flip_quiet(c);
+                if delta > 0 || self.mixed(line) + self.mixed(other) > before {
+                    self.flip_quiet(c);
+                }
+            }
+        }
+    }
+
+    /// Most gaps [`Self::unify`] and [`Self::spare_short`] leave on a
+    /// line: as many as the busiest line holds after the search, or
+    /// [`UNIFY_GAPS`], a few spread along a line reading as crossings.
+    fn gap_cap(&self) -> usize {
+        self.gaps
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(UNIFY_GAPS)
+    }
+
+    /// How many neighbouring crossings of `line` (closer than
+    /// [`CROSS_CLUSTER`] along it) give it opposite roles.
+    fn mixed(&self, line: usize) -> usize {
+        let ctx = self.ctx;
+        let mut along: Vec<(f64, bool)> = ctx.members[line]
+            .iter()
+            .map(|&c| (ctx.at_on(c, line), self.under_line(c) == line))
+            .collect();
+        along.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        along
+            .windows(2)
+            .filter(|w| w[1].0 - w[0].0 < CROSS_CLUSTER && w[0].1 != w[1].1)
+            .count()
     }
 
     /// Adds crossing `c`'s gap at `s` to `line`.
@@ -896,9 +1075,9 @@ fn add_gap(gaps: &mut Vec<f64>, s: f64) {
 /// count of lines, and of where they head off rather than where they
 /// land, so a wide fan-out across the flow never outvotes it. A tie
 /// goes to top-down, mermaid's default.
-fn back_edges(lines: &[Vec<Pt>]) -> Vec<bool> {
-    let delta = |p: &Vec<Pt>| (p[p.len() - 1].0 - p[0].0, p[p.len() - 1].1 - p[0].1);
-    let first_step = |p: &Vec<Pt>| {
+fn back_edges(lines: &[&[Pt]]) -> Vec<bool> {
+    let delta = |p: &&[Pt]| (p[p.len() - 1].0 - p[0].0, p[p.len() - 1].1 - p[0].1);
+    let first_step = |p: &&[Pt]| {
         p.iter()
             .map(|q| (q.0 - p[0].0, q.1 - p[0].1))
             .find(|d| d.0 != 0.0 || d.1 != 0.0)
@@ -931,13 +1110,31 @@ fn back_edges(lines: &[Vec<Pt>]) -> Vec<bool> {
 /// `t` maps scene to SVG coordinates (as `to_svg` draws); ids are
 /// `{dom}-x{edge}`, `dom` being the diagram's dom id or, when it has
 /// none, a hash of the scene's geometry, so several SVGs on one page
-/// never share an id unless they draw the same thing.
-pub(crate) fn masks(sc: &Scene, t: &dyn Fn(Pt) -> Pt, dom_id: Option<&str>) -> Masks {
+/// never share an id unless they draw the same thing. `line_of(i)` is
+/// edge `i`'s stroke as painted ([`edge_painted_polyline`]), asked once
+/// per edge that can cross and only when the scene gets masks at all:
+/// the painter hands over the strokes it draws, worked out once.
+pub(crate) fn masks(
+    sc: &Scene,
+    line_of: &dyn Fn(usize) -> Vec<Pt>,
+    t: &dyn Fn(Pt) -> Pt,
+    dom_id: Option<&str>,
+) -> Masks {
     let mut attr = vec![String::new(); sc.edges.len()];
-    let xs = if sc.edges.len() > CASING_MAX_EDGES {
+    let lines: Vec<Option<Vec<Pt>>> = if sc.edges.len() > CASING_MAX_EDGES {
         Vec::new()
     } else {
-        crossings(sc)
+        (0..sc.edges.len())
+            .map(|i| {
+                let e = &sc.edges[i];
+                (edge_drawn(e) && e.from != e.to).then(|| line_of(i))
+            })
+            .collect()
+    };
+    let xs = if lines.is_empty() {
+        Vec::new()
+    } else {
+        gapped(crossings_in(sc, &lines, true))
     };
     if xs.is_empty() {
         return Masks {
@@ -961,7 +1158,7 @@ pub(crate) fn masks(sc: &Scene, t: &dyn Fn(Pt) -> Pt, dom_id: Option<&str>) -> M
     }
     let mut defs = String::new();
     for (u, holes) in per {
-        let pts = edge_polyline(&sc.edges[u]);
+        let pts = lines[u].as_deref().unwrap_or_default();
         let (mut x0, mut y0, mut x1, mut y1) = (
             f64::INFINITY,
             f64::INFINITY,
@@ -1025,8 +1222,10 @@ mod tests {
     /// Least share (numerator, denominator) of the fixtures' crossings
     /// of a back-edge with a forward edge that put the back-edge under.
     /// Measured: 142 of 248 (57%). A layout change that moves crossings
-    /// can shift this; re-measure before loosening it.
-    const BACK_UNDER_SHARE: (usize, usize) = (1, 2);
+    /// can shift this; re-measure before loosening it. Re-measured with
+    /// B7 (report M3, M8: lone ends centred, combs, head room, no dead
+    /// strip under a box's first row): 79 of 161 (49%).
+    const BACK_UNDER_SHARE: (usize, usize) = (12, 25);
 
     /// A line crossed every 20 px: never more than [`CUTS_PER_WINDOW`]
     /// cuts (gaps or notches) within any [`CUT_WINDOW`]; the rest are
@@ -1049,6 +1248,165 @@ mod tests {
         // A sparse line keeps every full gap.
         let sparse: Vec<(usize, f64)> = (0..5).map(|k| (1, 150.0 * k as f64)).collect();
         assert!(cut_kinds(&sparse).iter().all(|k| *k == Cut::Gap));
+    }
+
+    /// B1 review #6: a gap is a disc on the under-line, its arrowhead
+    /// included; a crossing just over a head's length from a tip still
+    /// bit that head. Crossings within a head and the widest gap's
+    /// radius of an end get no gap.
+    #[test]
+    fn a_crossing_gap_never_bites_an_arrowhead() {
+        let mut sc = scene(&parse("flowchart TD\nA --> B\nC --> D\n").unwrap());
+        let line = |a: Pt, b: Pt| {
+            [
+                a,
+                (a.0 + (b.0 - a.0) / 3.0, a.1 + (b.1 - a.1) / 3.0),
+                (a.0 + (b.0 - a.0) * 2.0 / 3.0, a.1 + (b.1 - a.1) * 2.0 / 3.0),
+                b,
+            ]
+        };
+        let reach = ARROW_MARKER_PX + gap_reach(&sc.edges[0], &sc.edges[1]);
+        assert!(reach > ARROW_MARKER_PX + 4.0, "{reach}");
+        for (y, gapped) in [(-(ARROW_MARKER_PX + 2.0), false), (-(reach + 2.0), true)] {
+            for e in &mut sc.edges {
+                e.waypoints.clear();
+            }
+            // Down into the tip at the origin; across 200 px from either end.
+            sc.edges[0].bezier = line((0.0, -300.0), (0.0, 0.0));
+            sc.edges[1].bezier = line((-200.0, y), (200.0, y));
+            assert_eq!(crossings(&sc).len(), usize::from(gapped), "crossing at {y}");
+        }
+    }
+
+    /// Pairs of cut crossings on one line within [`CROSS_CLUSTER`] of
+    /// each other where that line goes under at one and over at the
+    /// other (report Q15: the line reads as broken), as (line, point).
+    fn opposite_patterns(sc: &Scene) -> Vec<(usize, Pt)> {
+        let xs = crossings(sc);
+        let mut out = Vec::new();
+        for (i, a) in xs.iter().enumerate() {
+            for b in &xs[i + 1..] {
+                if dist(a.2, b.2) >= CROSS_CLUSTER {
+                    continue;
+                }
+                // The line both share, under at one and over at the other.
+                for line in [a.0, a.1] {
+                    let at_b = (b.0 == line, b.1 == line);
+                    if !(at_b.0 || at_b.1) {
+                        continue;
+                    }
+                    if (a.0 == line) != at_b.0 {
+                        out.push((line, a.2));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Most [`opposite_patterns`] over the quality fixtures, static and
+    /// routed: 109 | 138 before each line took one role per cluster of
+    /// crossings (report Q15). What is left sits on bench-75's busiest
+    /// lines, where the one role would chain gaps into a dashed look or
+    /// pile more gaps on a line than any held (dense-lr 6 | 6 -> 1 | 0,
+    /// dense-td 13 | 16 -> 2 | 1, bench-75 90 | 116 -> 73 | 98).
+    const OPPOSITE_MAX: (usize, usize) = (76, 99);
+
+    /// Most fixture lines shorter than [`SHORT_LINE`] cut twice or more,
+    /// static and routed: 3 | 2 before short lines handed their extra
+    /// gaps on. Left: dense-td's `n21 -> n16`, a back-edge (it keeps
+    /// its gaps, going under by preference), and one bench-75 drag line
+    /// whose crossers would chain theirs. Routed 1 -> 2 with B7 (report
+    /// M3, M8): the dense fixtures' re-laid gaps (head room in labelled
+    /// ones, no dead strip under a box's first row) leave one more short
+    /// line of a `route()` drawing cut twice.
+    const SHORT_TWICE_MAX: (usize, usize) = (1, 2);
+
+    #[test]
+    fn a_short_line_keeps_at_most_one_gap() {
+        // dense-td (report §2.10, Q15): a 130 px edge under two long
+        // sweeps took both gaps, 50 px apart, and read as dashed. A line
+        // shorter than SHORT_LINE now hands its extra gaps to the longer
+        // lines crossing it wherever that dashes nothing.
+        let mut sc = scene(&parse("flowchart TD\nA --> B\nC --> D\nE --> F\n").unwrap());
+        let line = |a: Pt, b: Pt| {
+            [
+                a,
+                (a.0 + (b.0 - a.0) / 3.0, a.1 + (b.1 - a.1) / 3.0),
+                (a.0 + (b.0 - a.0) * 2.0 / 3.0, a.1 + (b.1 - a.1) * 2.0 / 3.0),
+                b,
+            ]
+        };
+        for e in &mut sc.edges {
+            e.waypoints.clear();
+        }
+        sc.edges[0].bezier = line((0.0, -60.0), (0.0, 70.0));
+        sc.edges[1].bezier = line((-400.0, -20.0), (400.0, -10.0));
+        sc.edges[2].bezier = line((-400.0, 30.0), (400.0, 40.0));
+        let xs = crossings(&sc);
+        assert_eq!(xs.len(), 2, "{xs:?}");
+        assert!(xs.iter().filter(|x| x.0 == 0).count() <= 1, "{xs:?}");
+        // Short fixture lines with two cuts or more, per mode: capped.
+        let mut twice = [0usize; 2];
+        for (_, src) in fixtures() {
+            let g = parse(&src).unwrap();
+            let sc = scene(&g);
+            let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+            for (k, sc) in [sc.clone(), route(&g, &at)].iter().enumerate() {
+                let xs = crossings(sc);
+                for (i, e) in sc.edges.iter().enumerate() {
+                    if !edge_drawn(e) || e.from == e.to {
+                        continue;
+                    }
+                    let p = edge_painted_polyline(e);
+                    let len: f64 = p.windows(2).map(|w| dist(w[0], w[1])).sum();
+                    let cuts = xs.iter().filter(|x| x.0 == i).count();
+                    twice[k] += usize::from(len < SHORT_LINE && cuts > 1);
+                }
+            }
+        }
+        assert!(twice[0] <= SHORT_TWICE_MAX.0, "static {}", twice[0]);
+        assert!(twice[1] <= SHORT_TWICE_MAX.1, "routed {}", twice[1]);
+    }
+
+    #[test]
+    fn a_line_takes_one_role_across_a_cluster_of_crossings() {
+        // fanout (report Q15): the loop-back line crossed two lines 14 px
+        // apart, going under the first and over the second, so it read
+        // as broken. Now it stays whole and both others go under it.
+        let mut sc = scene(&parse("flowchart TD\nA --> B\nC --> D\nE --> F\n").unwrap());
+        let line = |a: Pt, b: Pt| {
+            [
+                a,
+                (a.0 + (b.0 - a.0) / 3.0, a.1 + (b.1 - a.1) / 3.0),
+                (a.0 + (b.0 - a.0) * 2.0 / 3.0, a.1 + (b.1 - a.1) * 2.0 / 3.0),
+                b,
+            ]
+        };
+        for e in &mut sc.edges {
+            e.waypoints.clear();
+        }
+        sc.edges[0].bezier = line((0.0, -300.0), (0.0, 300.0));
+        sc.edges[1].bezier = line((-200.0, 0.0), (200.0, 0.0));
+        sc.edges[2].bezier = line((-200.0, 14.0), (200.0, 14.0));
+        let xs = crossings(&sc);
+        assert_eq!(xs.len(), 2, "{xs:?}");
+        assert!(
+            xs.iter().all(|x| x.1 == 0),
+            "the long line over both: {xs:?}"
+        );
+        assert!(opposite_patterns(&sc).is_empty());
+        // The fixtures: what is left is capped.
+        let (mut stat, mut routed) = (0, 0);
+        for (_, src) in fixtures() {
+            let g = parse(&src).unwrap();
+            let sc = scene(&g);
+            let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+            stat += opposite_patterns(&sc).len();
+            routed += opposite_patterns(&route(&g, &at)).len();
+        }
+        assert!(stat <= OPPOSITE_MAX.0, "static {stat}");
+        assert!(routed <= OPPOSITE_MAX.1, "routed {routed}");
     }
 
     fn fixtures() -> Vec<(String, String)> {
@@ -1075,7 +1433,7 @@ mod tests {
         for x in 0..idx.len() {
             for y in x + 1..idx.len() {
                 let (ea, eb) = (&sc.edges[idx[x]], &sc.edges[idx[y]]);
-                let (a, b) = (edge_polyline(ea), edge_polyline(eb));
+                let (a, b) = (edge_painted_polyline(ea), edge_painted_polyline(eb));
                 let mut hits: Vec<Pt> = Vec::new();
                 for sa in a.windows(2) {
                     for sb in b.windows(2) {
@@ -1100,10 +1458,12 @@ mod tests {
             let sc = scene(&g);
             let all = crossings_with(&sc, false).len();
             assert_eq!(all, brute(&sc), "{name}: grid search vs brute force");
-            // The yardstick skips pairs whose bounding boxes it finds
-            // disjoint, which misses an exactly level or plumb edge.
+            // The yardstick's `edge_edge_x` skips pairs whose bounding
+            // boxes it finds disjoint, which misses an exactly level or
+            // plumb edge; its `x_drawn` counts every drawn crossing.
             let m = crate::quality::measure(&g, &sc);
             assert!(all >= m.edge_edge_x, "{name}: {all} < {}", m.edge_edge_x);
+            assert_eq!(all, m.x_drawn, "{name}: drawn crossings");
             let svg = to_svg(&sc);
             let holes = svg.matches("fill=\"#000\"/>").count();
             assert_eq!(holes, crossings(&sc).len(), "{name}: one hole per crossing");
@@ -1123,7 +1483,7 @@ mod tests {
     fn crossing_free_diagrams_get_no_mask() {
         let g = parse("flowchart TD\nA-->B\nA-->C\nB-->D\nC-->D").unwrap();
         let sc = scene(&g);
-        let m = masks(&sc, &|p| p, None);
+        let m = masks(&sc, &|i| edge_painted_polyline(&sc.edges[i]), &|p| p, None);
         assert!(m.defs.is_empty() && m.attr.iter().all(String::is_empty));
         assert!(!to_svg(&sc).contains("<mask"));
     }
@@ -1286,7 +1646,8 @@ mod tests {
             (100.0, 40.0),
             (0.0, 0.0),
         ]);
-        let back = back_edges(&lines);
+        let refs: Vec<&[Pt]> = lines.iter().map(Vec::as_slice).collect();
+        let back = back_edges(&refs);
         assert_eq!(back.iter().filter(|b| **b).count(), 1, "{back:?}");
         assert!(back[lines.len() - 1]);
     }

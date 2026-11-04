@@ -18,15 +18,16 @@
 use crate::markdown;
 use crate::model::{
     ArchEdge, ArchGroup, ArchService, ArchSide, Architecture, Attr, Card, Class, ClassDiagram,
-    ClassRel, CommitKind, Direction, Document, EdgeAnimation, EdgeCurve, EdgeEnds, EdgeKind,
-    EdgeMeta, End, ErDiagram, FrameKind, GitBranch, GitCommit, GitGraph, GitOrientation, Graph,
-    Journey, JourneySection, JourneyTask, Key, LinkStyle, LinkTarget, Marker, Member, MindShape,
-    Mindmap, NodeStyle, NoteSide, PieChart, PieSlice, RelKind, Relation, SankeyAlignment,
-    SankeyConfig, SankeyDiagram, SankeyLabelStyle, SankeyLink, SankeyLinkColor, SeqHead, SeqItem,
-    SequenceDiagram, Shape, SubEdge, Subgraph, Timeline, TimelineDirection, TimelinePeriod,
-    TimelineSection, Visibility,
+    ClassNote, ClassRel, CommitKind, Direction, Document, EdgeAnimation, EdgeCurve, EdgeEnds,
+    EdgeKind, EdgeMeta, End, ErDiagram, FrameKind, GitBranch, GitCommit, GitGraph, GitOrientation,
+    Graph, Journey, JourneySection, JourneyTask, Key, LinkStyle, LinkTarget, Marker, Member,
+    MindShape, Mindmap, NodeStyle, NoteSide, PieChart, PieSlice, RelKind, Relation,
+    SankeyAlignment, SankeyConfig, SankeyDiagram, SankeyLabelStyle, SankeyLink, SankeyLinkColor,
+    SeqHead, SeqItem, SequenceDiagram, Shape, SubEdge, Subgraph, Timeline, TimelineDirection,
+    TimelinePeriod, TimelineSection, Visibility,
 };
 use crate::shapedata;
+use crate::style::{Theme, ThemeVars};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
@@ -205,18 +206,23 @@ fn clean_label_1line(s: &str) -> String {
     clean_label(s).replace('\n', " ")
 }
 
-/// Lower a markdown string body (see [`crate::markdown`]): node labels
-/// (`node`) keep their lines and wrap; edge labels and subgraph titles
-/// are one line.
-fn md_label(raw: &str, lineno: usize, node: bool) -> Result<String, ParseError> {
-    markdown::lower(raw, node, !node).map_err(|m| err(lineno, m))
+/// Lower a markdown string body (see [`crate::markdown`]) for an edge
+/// label or a subgraph title: one line.
+fn md_label(raw: &str, lineno: usize) -> Result<String, ParseError> {
+    markdown::lower(raw, None, true).map_err(|m| err(lineno, m))
+}
+
+/// [`md_label`] for a node label: it keeps its lines and wraps at
+/// `wrap` (the graph's [`Graph::wrapping_width`]).
+fn md_node_label(raw: &str, lineno: usize, wrap: Option<f64>) -> Result<String, ParseError> {
+    markdown::lower(raw, wrap, false).map_err(|m| err(lineno, m))
 }
 
 /// An edge label or subgraph title: a whole-label markdown string is
 /// lowered to one line, anything else cleaned like before.
 fn label_1line(s: &str, lineno: usize) -> Result<String, ParseError> {
     match markdown::md_quoted(s) {
-        Some(inner) => md_label(inner, lineno, false),
+        Some(inner) => md_label(inner, lineno),
         None => Ok(clean_label_1line(s)),
     }
 }
@@ -294,6 +300,47 @@ fn strip_frontmatter(source: &str) -> Result<Cow<'_, str>, ParseError> {
         .collect::<Vec<_>>()
         .join("\n");
     Ok(Cow::Owned(out))
+}
+
+/// Blank every line of a `%%{ … }%%` directive that spans lines
+/// (mermaid's multi-line `%%{\n  init: {…}\n}%%`, the usual way to
+/// write `themeVariables`): its inner lines are not `%%` comments, so
+/// every diagram parser would read them as statements. A directive
+/// opens on a line starting `%%{` and runs to the first `}%%`; text
+/// after that on its last line is kept. One-line directives are left
+/// alone (they are `%%` comment lines already), and blanking rather
+/// than removing keeps every later line number exact, as
+/// [`strip_frontmatter`] does. [`theme_directive`] reads the directives
+/// from the unstripped source.
+fn strip_directives(source: &str) -> Cow<'_, str> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out: Option<Vec<String>> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let opens = lines[i].trim_start().starts_with("%%{");
+        if opens && !lines[i].contains("}%%") {
+            let Some(end) = (i + 1..lines.len()).find(|&k| lines[k].contains("}%%")) else {
+                break; // never closed: leave the source to the parsers
+            };
+            let o = out.get_or_insert_with(|| lines.iter().map(|l| l.to_string()).collect());
+            for line in o.iter_mut().take(end).skip(i) {
+                line.clear();
+            }
+            let tail = &lines[end][lines[end].find("}%%").unwrap() + 3..];
+            o[end] = if tail.trim().is_empty() {
+                String::new()
+            } else {
+                tail.to_string()
+            };
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    match out {
+        Some(o) => Cow::Owned(o.join("\n")),
+        None => Cow::Borrowed(source),
+    }
 }
 
 /// If `line` is a YAML frontmatter fence — leading spaces/tabs, then
@@ -734,6 +781,8 @@ const LINK_STYLE_KW: &str = "linkStyle";
 const LINK_STYLE_DEFAULT: &str = "default";
 /// The optional curve clause of a `linkStyle` statement.
 const LINK_STYLE_INTERPOLATE: &str = "interpolate";
+/// The `classDef` name mermaid layers under every node's own classes.
+const DEFAULT_CLASS: &str = "default";
 
 /// One `linkStyle` statement (`rest` follows the keyword):
 /// `default` or `N[,N…]` (no spaces), an optional `interpolate
@@ -1179,8 +1228,9 @@ fn apply_node_meta(
                     g.nodes[n].label = if plain {
                         clean_label(&text)
                     } else {
-                        markdown::lower_text(&text, true, false)
+                        markdown::lower_text(&text, g.wrapping_width(), false)
                     };
+                    g.set_md_label(n, (!plain).then_some(text));
                 }
             }
             _ => {}
@@ -1535,6 +1585,7 @@ pub fn parse_document(source: &str) -> Result<Document, ParseError> {
     // header tak terdeteksi dengan error yang menyesatkan.
     let raw_source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let stripped = strip_frontmatter(raw_source)?;
+    let stripped = strip_directives(&stripped);
     let source: &str = &stripped;
     for (i, raw) in source.lines().enumerate() {
         let line = raw.trim();
@@ -1551,7 +1602,12 @@ pub fn parse_document(source: &str) -> Result<Document, ParseError> {
             }),
             Some("pie") => parse_pie(source, i + 1).map(Document::Pie),
             Some("stateDiagram-v2") | Some("stateDiagram") => {
-                parse_state(source, i + 1).map(Document::State)
+                parse_state(source, i + 1).map(|mut g| {
+                    if let Some(w) = wrapping_width_directive(raw_source) {
+                        g.set_wrapping_width(Some(w));
+                    }
+                    Document::State(g)
+                })
             }
             Some("mindmap") => parse_mindmap(source, i + 1).map(Document::Mindmap),
             Some("journey") => parse_journey(source, i + 1).map(Document::Journey),
@@ -1575,7 +1631,8 @@ pub fn parse_document(source: &str) -> Result<Document, ParseError> {
             )),
             // `source` here is already BOM+frontmatter-stripped —
             // go straight to the body so it isn't re-stripped.
-            None => parse_flowchart(source).map(Document::Flowchart),
+            None => parse_flowchart(source, wrapping_width_directive(raw_source))
+                .map(Document::Flowchart),
         };
     }
     Ok(Document::Flowchart(Graph::default()))
@@ -1587,7 +1644,10 @@ pub fn parse(source: &str) -> Result<Graph, ParseError> {
     // juga, jadi dapat perlakuan yang sama (BOM + frontmatter).
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let stripped = strip_frontmatter(source)?;
-    parse_flowchart(&stripped)
+    parse_flowchart(
+        &strip_directives(&stripped),
+        wrapping_width_directive(source),
+    )
 }
 
 /// The flowchart parse body, on a source that has ALREADY had its BOM
@@ -1595,8 +1655,12 @@ pub fn parse(source: &str) -> Result<Graph, ParseError> {
 /// flowchart arm both funnel through here so the strip happens exactly
 /// once — otherwise a diagram BODY whose first line is itself `---`
 /// would be mistaken for a second frontmatter block on the re-strip.
-fn parse_flowchart(source: &str) -> Result<Graph, ParseError> {
+fn parse_flowchart(source: &str, wrap: Option<f64>) -> Result<Graph, ParseError> {
     let mut g = Graph::default();
+    // Before any label: a markdown node label wraps as it is lowered.
+    if let Some(w) = wrap {
+        g.set_wrapping_width(Some(w));
+    }
     // Accessibility statements are line-level in mermaid (an
     // `accTitle:` value runs to the end of the line, `;` included), so
     // they come out BEFORE the `;` statement split. Only lines after
@@ -1995,6 +2059,22 @@ fn parse_flowchart(source: &str) -> Result<Graph, ParseError> {
         st.fill = Some(BORDERLESS_PAINT.to_string());
         st.stroke = Some(BORDERLESS_PAINT.to_string());
     }
+    // `classDef default …` is the bottom layer for EVERY node, as in
+    // mermaid (its nodes compile `["default", "node", ...classes]`): a
+    // node's own classes and `style` lines still win per property. A
+    // borderless shape is bare text by definition, so it takes only
+    // the default's text colour, never a box.
+    if let Some(def) = class_defs.get(DEFAULT_CLASS) {
+        for (n, node) in g.nodes.iter_mut().enumerate() {
+            if fm.borderless.contains(&n) {
+                if def.color.is_some() {
+                    node.style.color.clone_from(&def.color);
+                }
+            } else {
+                node.style.apply_over(def);
+            }
+        }
+    }
     for (n, name) in assigns {
         if let Some(def) = class_defs.get(&name) {
             g.nodes[n].style.apply_over(def);
@@ -2136,7 +2216,7 @@ fn header_is_parsed(t: &str) -> bool {
 }
 
 /// The "supported: ..." list both parser entry points quote, built
-/// from [`DIAGRAM_HEADERS`] so it stays in step with the dispatch.
+/// from `DIAGRAM_HEADERS` so it stays in step with the dispatch.
 /// Public so the CLI `--help` can quote the very same list.
 pub fn supported_types() -> String {
     let mut out = String::from("flowchart, graph");
@@ -2176,7 +2256,7 @@ fn parse_subgraph_header(rest: &str, lineno: usize) -> Result<(String, String), 
     // markdown text; flowmaid keeps it even with spaces, as it does for
     // a bare multi-word title.
     if let Some(inner) = markdown::md_quoted(rest) {
-        return Ok((inner.trim().to_string(), md_label(inner, lineno, false)?));
+        return Ok((inner.trim().to_string(), md_label(inner, lineno)?));
     }
     if let Some(bi) = rest.find('[') {
         let id = rest[..bi].trim();
@@ -2192,7 +2272,7 @@ fn parse_subgraph_header(rest: &str, lineno: usize) -> Result<(String, String), 
         // A markdown string is lowered to one line; a plain title keeps
         // its `<br/>` breaks as `\n` so the frame draws one row each.
         let title = match markdown::md_quoted(inner) {
-            Some(md) => md_label(md, lineno, false)?,
+            Some(md) => md_label(md, lineno)?,
             None => clean_label(inner),
         };
         return Ok((id.to_string(), title));
@@ -2284,7 +2364,7 @@ fn parse_statement(
                         "edge label opened with '|' but never closed".to_string(),
                     ));
                 }
-                label = Some(md_label(&inner, lineno, false)?);
+                label = Some(md_label(&inner, lineno)?);
             } else {
                 cur.pos = save;
                 let l = cur.take_until("|").ok_or_else(|| {
@@ -2600,10 +2680,15 @@ fn parse_node(
         None
     };
 
-    let (shape, label) = match parsed {
-        Some((s, (l, true))) => (Some(s), Some(md_label(&l, lineno, true)?)),
-        Some((s, (l, false))) => (Some(s), Some(clean_label(&l))),
-        None => (None, None),
+    // `md`: the markdown body a label was lowered from (`Some(None)`: a
+    // plain label, which forgets an earlier markdown one).
+    let (shape, label, md) = match parsed {
+        Some((s, (l, true))) => {
+            let low = md_node_label(&l, lineno, g.wrapping_width())?;
+            (Some(s), Some(low), Some(Some(l)))
+        }
+        Some((s, (l, false))) => (Some(s), Some(clean_label(&l)), Some(None)),
+        None => (None, None, None),
     };
     // An id that names a declared subgraph (pre-scanned, so
     // forward references work) is an edge endpoint on the whole
@@ -2621,6 +2706,9 @@ fn parse_node(
         }
     }
     let n = g.ensure_node(&id, label, shape);
+    if let Some(md) = md {
+        g.set_md_label(n, md);
+    }
     // A bracket shape replaces whatever an earlier `@{ shape: … }` set,
     // borderless text included.
     if shape.is_some() {
@@ -2630,13 +2718,22 @@ fn parse_node(
     // block claims it for that block (the canonical docs example
     // relies on this: `c1-->a2` at top level, then `a2` inside
     // `subgraph one` puts a2 in the box). Top-level mentions never
-    // un-claim.
+    // un-claim, and neither does a mention after the block that owns
+    // the node has closed: mermaid's first block to CLOSE keeps it
+    // (`makeUniq`), so `W1 --> Users` in `Platform`, after the nested
+    // `Workers` block that holds W1 ended, leaves W1 in `Workers` —
+    // re-claiming it emptied the nested box, which then vanished.
+    // An open owner (an enclosing block) still gives the node up to
+    // the inner block mentioning it, which closes first.
     if let Some(&owner) = subs.last() {
         if !g.subgraphs[owner].nodes.contains(&n) {
-            for s in g.subgraphs.iter_mut() {
-                s.nodes.retain(|&m| m != n);
+            let held = g.subgraphs.iter().position(|s| s.nodes.contains(&n));
+            if held.map_or(true, |s| subs.contains(&s)) {
+                for s in g.subgraphs.iter_mut() {
+                    s.nodes.retain(|&m| m != n);
+                }
+                g.subgraphs[owner].nodes.push(n);
             }
-            g.subgraphs[owner].nodes.push(n);
         }
     }
 
@@ -3331,6 +3428,9 @@ fn parse_class(source: &str, header_line: usize) -> Result<ClassDiagram, ParseEr
     d.acc_descr = acc.descr;
     // (class index, line where its `{` opened) for a good diagnostic.
     let mut open: Option<(usize, usize)> = None;
+    // `note for Name` notes by index, resolved once every class is
+    // known (the class may be declared after the note).
+    let mut note_for: Vec<(usize, String)> = Vec::new();
     for (i, raw) in source.lines().enumerate() {
         let lineno = i + 1;
         if lineno <= header_line {
@@ -3349,9 +3449,11 @@ fn parse_class(source: &str, header_line: usize) -> Result<ClassDiagram, ParseEr
         if let Some((ci, _)) = open {
             if line == "}" {
                 open = None;
-            } else if !line.starts_with("<<") {
-                // Skip `<<interface>>` / `<<abstract>>` stereotypes
-                // (not yet rendered) rather than treat them as fields.
+            } else if let Some(a) = annotation_of(line) {
+                // `<<interface>>` / `<<abstract>>` inside the block is
+                // the class's stereotype, never a field.
+                d.classes[ci].annotations.push(a.to_string());
+            } else {
                 add_class_member(&mut d.classes[ci], line);
             }
             continue;
@@ -3360,34 +3462,65 @@ fn parse_class(source: &str, header_line: usize) -> Result<ClassDiagram, ParseEr
             let rest = rest.trim();
             // `class Name {` opens a block; `class Name` just declares.
             if let Some(name) = rest.strip_suffix('{') {
-                let ci = d.ensure_class(name.trim());
+                let ci = declare_class(&mut d, name.trim());
                 open = Some((ci, lineno));
             } else {
-                // `class A, B, C` declares several at once (Mermaid).
-                for name in rest.split(',').map(str::trim).filter(|n| !n.is_empty()) {
-                    d.ensure_class(name);
+                // `class A, B, C` declares several at once (Mermaid); a
+                // comma inside a generic (`class Map~K, V~`) or a
+                // backtick name (`` class `A, B` ``) is not a separator.
+                let (mut depth_odd, mut in_tick) = (false, false);
+                let names = rest.split(|c: char| {
+                    match c {
+                        '~' if !in_tick => depth_odd = !depth_odd,
+                        '`' => in_tick = !in_tick,
+                        _ => {}
+                    }
+                    c == ',' && !depth_odd && !in_tick
+                });
+                for name in names.map(str::trim).filter(|n| !n.is_empty()) {
+                    declare_class(&mut d, name);
                 }
             }
             continue;
         }
-        // Ignore directives we don't render yet (`direction LR`,
-        // `note ...`) instead of mis-reading them as relations.
-        if strip_keyword(line, "direction").is_some() || strip_keyword(line, "note").is_some() {
+        // `<<interface>> Name` on its own line annotates that class.
+        if let Some(a) = line.strip_prefix("<<").and_then(|r| r.split_once(">>")) {
+            let (a, name) = (a.0.trim(), a.1.trim());
+            if !a.is_empty() && !name.is_empty() {
+                let ci = declare_class(&mut d, name);
+                d.classes[ci].annotations.push(a.to_string());
+                continue;
+            }
+        }
+        if let Some(rest) = strip_keyword(line, "direction") {
+            // An unknown direction is ignored, as mermaid ignores it
+            // (and as flowmaid did before it read the line at all).
+            if let Ok(dir) = parse_direction(rest, lineno) {
+                d.direction = dir;
+            }
+            continue;
+        }
+        if let Some(rest) = strip_keyword(line, "note") {
+            let (note, class) = parse_class_note(rest.trim(), lineno)?;
+            if let Some(name) = class {
+                note_for.push((d.notes.len(), name));
+            }
+            d.notes.push(note);
             continue;
         }
         // Classify by the part BEFORE the first unquoted colon: if it
         // holds no relation operator, this is an inline member
         // `Name : member` — quoted cardinalities and member text must
         // not sway the decision (`Animal : has -- dashes` is a member,
-        // `A "1:n" --> B` is a relation).
-        let colon = find_unquoted(line, ":");
+        // `A "1:n" --> B` is a relation), nor may a backtick name
+        // (`` `Foo:Bar` ``).
+        let colon = find_class_unquoted(line, ":");
         let head = colon.map_or(line, |c| line[..c].trim());
         if find_class_op(head).is_none() {
             if let Some(c) = colon {
-                let name = line[..c].trim();
                 let member = line[c + 1..].trim();
-                if is_class_ident(name) && !member.is_empty() {
-                    let ci = d.ensure_class(name);
+                if let (Some((id, generic)), false) = (class_name(&line[..c]), member.is_empty()) {
+                    let ci = ensure_generic_class(&mut d, id, generic);
                     add_class_member(&mut d.classes[ci], member);
                     continue;
                 }
@@ -3404,11 +3537,124 @@ fn parse_class(source: &str, header_line: usize) -> Result<ClassDiagram, ParseEr
             ),
         ));
     }
+    // A note for a class the diagram never declares stays free, as
+    // mermaid draws it: it does not create the class.
+    for (k, id) in note_for {
+        d.notes[k].class = d.class_index(&id);
+    }
     Ok(d)
 }
 
 fn is_class_ident(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// A class-diagram name char outside backticks. Mermaid's class
+/// grammar glues `MINUS` tokens into a name (`Animal-Name`, `A-`,
+/// `-B`), but lexes `--` first, so a name never holds a `--` / `..`
+/// operator: [`find_class_op`] finds it before any name can.
+fn is_class_name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// A class name as written, split into (id, generic): a bare name
+/// (`Animal-Name`, see [`is_class_name_char`]) or a backtick literal
+/// whose text is the id, backticks stripped as mermaid strips them
+/// (`` `Foo Bar` `` is the class `Foo Bar`, `` `Foo` `` is `Foo`),
+/// either one optionally generic (`Box~T~`, `` `Foo Bar`~T~ ``).
+/// `None` when it is neither.
+fn class_name(raw: &str) -> Option<(&str, Option<&str>)> {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('`') {
+        let close = rest.find('`')?;
+        let (id, tail) = (&rest[..close], &rest[close + 1..]);
+        let generic = match tail {
+            "" => None,
+            t => Some(
+                t.strip_prefix('~')?
+                    .strip_suffix('~')
+                    .filter(|g| !g.is_empty())?,
+            ),
+        };
+        return (!id.is_empty()).then_some((id, generic));
+    }
+    let (id, generic) = split_generic(raw);
+    (!id.is_empty() && id.chars().all(is_class_name_char)).then_some((id, generic))
+}
+
+/// `Box~T~` → (`Box`, `Some("T")`): mermaid's generic class name. The
+/// id is the part before the first `~`, so `class Box~T~` and a later
+/// `Box : +size() int` are one class, not two. A name without a
+/// closed `~…~` suffix is returned whole.
+fn split_generic(name: &str) -> (&str, Option<&str>) {
+    match name.find('~') {
+        Some(i) if i > 0 && name.len() > i + 2 && name.ends_with('~') => {
+            (&name[..i], Some(&name[i + 1..name.len() - 1]))
+        }
+        _ => (name, None),
+    }
+}
+
+/// [`ClassDiagram::ensure_class`] for a possibly generic class (see
+/// [`class_name`]); the first spelling that names the generic sets it.
+fn ensure_generic_class(d: &mut ClassDiagram, id: &str, generic: Option<&str>) -> usize {
+    let ci = d.ensure_class(id);
+    if let (Some(t), None) = (generic, &d.classes[ci].generic) {
+        d.classes[ci].generic = Some(t.to_string());
+    }
+    ci
+}
+
+/// The class a `class …` / `<<stereotype>> …` statement declares. Any
+/// text is taken as a name there, as it always was; a [`class_name`]
+/// spelling is read as one (backticks stripped, generic split off).
+fn declare_class(d: &mut ClassDiagram, name: &str) -> usize {
+    let (id, generic) = class_name(name).unwrap_or_else(|| split_generic(name));
+    ensure_generic_class(d, id, generic)
+}
+
+/// The stereotype of a `<<interface>>` member line, without guillemets.
+fn annotation_of(line: &str) -> Option<&str> {
+    let a = line.strip_prefix("<<")?.strip_suffix(">>")?.trim();
+    (!a.is_empty()).then_some(a)
+}
+
+/// `note "text"` or `note for Class "text"` (the part after `note`):
+/// the note (still free) and, for `note for`, the class name it names
+/// as its id (resolved by [`parse_class`] once the whole diagram is
+/// read; a backtick name may hold spaces: `` note for `Foo Bar` "x" ``). The
+/// text may be quoted; `\n` and `<br/>` break lines, as mermaid's own
+/// class notes do. A note without text, or `note for` without a class
+/// name, is an error, as in mermaid.
+fn parse_class_note(rest: &str, lineno: usize) -> Result<(ClassNote, Option<String>), ParseError> {
+    let (class, text) = match strip_keyword(rest, "for") {
+        Some(r) => {
+            let r = r.trim();
+            // The name ends at the first whitespace after its closing
+            // backtick, if it opens with one.
+            let from = match r.strip_prefix('`') {
+                Some(t) => t.find('`').map_or(r.len(), |c| c + 2),
+                None => 0,
+            };
+            let end = r[from..]
+                .find(char::is_whitespace)
+                .map_or(r.len(), |e| from + e);
+            let name = &r[..end];
+            let Some((id, _)) = class_name(name) else {
+                return Err(err(
+                    lineno,
+                    format!("'note for' needs a class name, got '{name}'"),
+                ));
+            };
+            (Some(id.to_string()), r[end..].trim())
+        }
+        None => (None, rest),
+    };
+    if text.is_empty() {
+        return Err(err(lineno, "note text is empty".to_string()));
+    }
+    let text = clean_label(&text.replace("\\n", "<br/>"));
+    Ok((ClassNote::new(text, None), class))
 }
 
 /// First byte index of `needle` in `s` that lies outside any `"..."`
@@ -3426,26 +3672,95 @@ fn find_unquoted(s: &str, needle: &str) -> Option<usize> {
     None
 }
 
+/// [`find_unquoted`] for class statements, where a backtick name is
+/// opaque too: no colon or operator inside `` `Foo:Bar` `` or
+/// `` `A--B` `` counts, and a quote inside one (`` `Foo "x"` ``) opens
+/// no cardinality.
+fn find_class_unquoted(s: &str, needle: &str) -> Option<usize> {
+    let mut open: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        match open {
+            Some(q) if c == q => open = None,
+            Some(_) => {}
+            None if c == '"' || c == '`' => open = Some(c),
+            None if s[i..].starts_with(needle) => return Some(i),
+            None => {}
+        }
+    }
+    None
+}
+
+/// A relation operator located by [`find_class_op`]: its byte span in
+/// the line, the glyph written at each end of its line (`None` = a
+/// plain end) and whether the line is dotted (`..`).
+struct ClassOp {
+    pos: usize,
+    len: usize,
+    left: Option<RelKind>,
+    right: Option<RelKind>,
+    dashed: bool,
+}
+
 /// Locate the relation operator in `rel`: the earliest position
-/// outside any quoted cardinality where a [`CLASS_OPS`] operator
-/// matches (longest wins, since the table is ordered longest-first).
-/// Returns `(byte position, op, kind, dashed, head_at_left)`.
+/// outside any quoted cardinality or backtick name where an operator
+/// starts — a line (`--` solid, `..` dotted) with an optional end glyph
+/// glued to either side ([`CLASS_LEFT_ENDS`] / [`CLASS_RIGHT_ENDS`],
+/// longest first). Either end may carry any glyph, as in mermaid's
+/// grammar (`relationType? lineType relationType?`): `A <|--|> B`,
+/// `A *--> B`, `A o.. B`, `bar ()-- foo`.
+///
+/// Scanning from the left, `A-B --> C-D` finds `-->` (a lone hyphen
+/// is no operator), while `A--B` finds `--` and `A-- -B` links `A` to
+/// `-B`, as mermaid's lexer reads them.
 ///
 /// `o` is a valid identifier char, so an `o--` / `--o` marker only
-/// counts at an operand boundary — never inside a name like `Foo`.
-fn find_class_op(rel: &str) -> Option<(usize, &'static str, RelKind, bool, bool)> {
-    let mut in_quote = false;
+/// counts at an operand boundary — never inside a name like `Foo` or
+/// `my_o`. A hyphen is a boundary: mermaid reads `A-o--B` as `A-`
+/// aggregating `B`.
+fn find_class_op(rel: &str) -> Option<ClassOp> {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let line_at = |j: usize| match rel.get(j..j + 2) {
+        Some("--") => Some(false),
+        Some("..") => Some(true),
+        _ => None,
+    };
+    // A triangle / arrow on a dotted line is a realization / dependency.
+    let styled = |k: RelKind, dashed: bool| match (k, dashed) {
+        (RelKind::Inheritance, true) => RelKind::Realization,
+        (RelKind::Association, true) => RelKind::Dependency,
+        _ => k,
+    };
+    let mut open: Option<char> = None;
     let mut prev: Option<char> = None;
     for (i, c) in rel.char_indices() {
-        if c == '"' {
-            in_quote = !in_quote;
-        } else if !in_quote {
-            if let Some(&(op, k, dash, hl)) = CLASS_OPS.iter().find(|t| rel[i..].starts_with(t.0)) {
-                let before_ok = !op.starts_with('o') || prev.map_or(true, |p| !p.is_alphanumeric());
-                let after_ok = !op.ends_with('o')
-                    || !rel[i + op.len()..].starts_with(|c: char| c.is_alphanumeric());
-                if before_ok && after_ok {
-                    return Some((i, op, k, dash, hl));
+        match open {
+            Some(q) if c == q => open = None,
+            Some(_) => {}
+            None if c == '"' || c == '`' => open = Some(c),
+            None => {
+                let left = CLASS_LEFT_ENDS.iter().find(|&&(g, _)| {
+                    rel[i..].starts_with(g)
+                        && (g != "o" || !prev.is_some_and(word))
+                        && line_at(i + g.len()).is_some()
+                });
+                let (left, at) = match left {
+                    Some(&(g, k)) => (Some(k), i + g.len()),
+                    None => (None, i),
+                };
+                if let Some(dashed) = line_at(at) {
+                    let after = at + 2;
+                    // `A--oC` is a link to `oC`, as in mermaid.
+                    let right = CLASS_RIGHT_ENDS.iter().find(|&&(g, _)| {
+                        rel[after..].starts_with(g)
+                            && (g != "o" || !rel[after + 1..].starts_with(word))
+                    });
+                    return Some(ClassOp {
+                        pos: i,
+                        len: after + right.map_or(0, |(g, _)| g.len()) - i,
+                        left: left.map(|k| styled(k, dashed)),
+                        right: right.map(|&(_, k)| styled(k, dashed)),
+                        dashed,
+                    });
                 }
             }
         }
@@ -3476,30 +3791,33 @@ fn add_class_member(c: &mut Class, s: &str) {
     }
 }
 
-/// Relation operators, longest first. Each maps to
-/// (kind, dashed, head_at_left).
-const CLASS_OPS: &[(&str, RelKind, bool, bool)] = &[
-    ("<|--", RelKind::Inheritance, false, true),
-    ("--|>", RelKind::Inheritance, false, false),
-    ("<|..", RelKind::Realization, true, true),
-    ("..|>", RelKind::Realization, true, false),
-    ("*--", RelKind::Composition, false, true),
-    ("--*", RelKind::Composition, false, false),
-    ("o--", RelKind::Aggregation, false, true),
-    ("--o", RelKind::Aggregation, false, false),
-    ("-->", RelKind::Association, false, false),
-    ("<--", RelKind::Association, false, true),
-    ("..>", RelKind::Dependency, true, false),
-    ("<..", RelKind::Dependency, true, true),
-    ("--", RelKind::Link, false, false),
-    ("..", RelKind::Link, true, false),
+/// End glyphs written left of a relation's line (`<|--`, `*--`,
+/// `()--`), longest first, with the kind they draw on a solid line
+/// (a dotted one turns a triangle into a realization and an arrow into
+/// a dependency).
+const CLASS_LEFT_ENDS: &[(&str, RelKind)] = &[
+    ("<|", RelKind::Inheritance),
+    ("()", RelKind::Lollipop),
+    ("<", RelKind::Association),
+    ("*", RelKind::Composition),
+    ("o", RelKind::Aggregation),
+];
+
+/// End glyphs written right of a relation's line (`--|>`, `--*`,
+/// `--()`), as [`CLASS_LEFT_ENDS`].
+const CLASS_RIGHT_ENDS: &[(&str, RelKind)] = &[
+    ("|>", RelKind::Inheritance),
+    ("()", RelKind::Lollipop),
+    (">", RelKind::Association),
+    ("*", RelKind::Composition),
+    ("o", RelKind::Aggregation),
 ];
 
 /// `ClassA "card" <op> "card" ClassB : label`.
 fn parse_class_relation(d: &mut ClassDiagram, line: &str, lineno: usize) -> Result<(), ParseError> {
     // Split off a trailing `: label` at the first colon OUTSIDE any
-    // quoted cardinality (`"1:n"` keeps its colon).
-    let (rel, label) = match find_unquoted(line, ":") {
+    // quoted cardinality (`"1:n"` keeps its colon) or backtick name.
+    let (rel, label) = match find_class_unquoted(line, ":") {
         Some(c) => (
             line[..c].trim(),
             Some(clean_label_1line(line[c + 1..].trim())),
@@ -3508,56 +3826,85 @@ fn parse_class_relation(d: &mut ClassDiagram, line: &str, lineno: usize) -> Resu
     };
     // Locate the operator: earliest position outside quotes, longest
     // match, honouring operand boundaries.
-    let (opos, op, kind, dashed, head_left) = find_class_op(rel)
+    let op = find_class_op(rel)
         .ok_or_else(|| err(lineno, format!("unknown class relation near: '{}'", rel)))?;
-    let left = rel[..opos].trim();
-    let right = rel[opos + op.len()..].trim();
+    let left = rel[..op.pos].trim();
+    let right = rel[op.pos + op.len..].trim();
     // Strip optional cardinality quotes from the inner edges.
     let (left_name, left_card) = split_card_end(left, true);
     let (right_name, right_card) = split_card_end(right, false);
-    if !is_class_ident(left_name) || !is_class_ident(right_name) {
+    let (Some((lid, lgen)), Some((rid, rgen))) = (class_name(left_name), class_name(right_name))
+    else {
         return Err(err(
             lineno,
             format!("class relation needs two class names, got '{left_name}' / '{right_name}'"),
         ));
-    }
-    let li = d.ensure_class(left_name);
-    let ri = d.ensure_class(right_name);
-    // Normalise so the decorated end is `to`.
+    };
+    // A lollipop facing a plain end makes its operand an interface:
+    // a new one per relation, as mermaid adds an `interfaceN` node
+    // (after the class it hangs on). Facing another glyph
+    // (`A ()--> B`), both operands stay classes, as in mermaid.
+    let lollipop = |g: Option<RelKind>| g == Some(RelKind::Lollipop);
+    let (li, ri) = if lollipop(op.left) && op.right.is_none() {
+        let ri = ensure_generic_class(d, rid, rgen);
+        (add_lollipop(d, lid, lgen), ri)
+    } else if lollipop(op.right) && op.left.is_none() {
+        let li = ensure_generic_class(d, lid, lgen);
+        (li, add_lollipop(d, rid, rgen))
+    } else {
+        let li = ensure_generic_class(d, lid, lgen);
+        (li, ensure_generic_class(d, rid, rgen))
+    };
+    // Normalise so the decorated end is `to`; `head_left` keeps the
+    // source order, which the layout ranks by. A two-way relation
+    // stays in source order with its left glyph as `from_kind`.
+    let (head_left, kind, from_kind) = match (op.left, op.right) {
+        (Some(l), Some(r)) => (false, r, Some(l)),
+        (Some(l), None) => (true, l, None),
+        (None, r) => (false, r.unwrap_or(RelKind::Link), None),
+    };
     let (from, to, from_card, to_card) = if head_left {
         (ri, li, right_card, left_card)
     } else {
         (li, ri, left_card, right_card)
     };
-    d.relations.push(ClassRel {
-        from,
-        to,
-        kind,
-        dashed,
-        from_card,
-        to_card,
-        label,
-    });
+    let mut rel = ClassRel::new(from, to, kind);
+    rel.dashed = op.dashed;
+    rel.from_card = from_card;
+    rel.to_card = to_card;
+    rel.label = label;
+    rel.head_left = head_left;
+    rel.from_kind = from_kind;
+    d.relations.push(rel);
     Ok(())
+}
+
+/// [`ClassDiagram::add_lollipop`] for a lollipop operand as written
+/// (see [`class_name`]): a generic one shows its parameter too.
+fn add_lollipop(d: &mut ClassDiagram, id: &str, generic: Option<&str>) -> usize {
+    let i = d.add_lollipop(id);
+    d.classes[i].generic = generic.map(str::to_string);
+    i
 }
 
 /// Split a `Name "card"` (card on the operator side) into
 /// (name, card). `card_after` = the quote sits after the name
-/// (left operand); otherwise before (right operand).
+/// (left operand); otherwise before (right operand). The card is the
+/// quoted run at the operator end, so a quote inside a backtick name
+/// (`` `Foo "x"` ``) is never taken for one.
 fn split_card_end(s: &str, card_after: bool) -> (&str, Option<String>) {
     let s = s.trim();
-    if let (Some(q0), Some(q1)) = (s.find('"'), s.rfind('"')) {
-        if q1 > q0 {
-            let card = s[q0 + 1..q1].to_string();
-            let name = if card_after {
-                s[..q0].trim()
-            } else {
-                s[q1 + 1..].trim()
-            };
-            return (name, Some(card));
-        }
+    let split = if card_after {
+        let r = s.strip_suffix('"');
+        r.and_then(|r| r.rfind('"').map(|q| (r[..q].trim(), &r[q + 1..])))
+    } else {
+        let r = s.strip_prefix('"');
+        r.and_then(|r| r.find('"').map(|q| (r[q + 1..].trim(), &r[..q])))
+    };
+    match split {
+        Some((name, card)) => (name, Some(card.to_string())),
+        None => (s, None),
     }
-    (s, None)
 }
 
 // ---------------------------------------------------------------
@@ -5295,7 +5642,9 @@ fn parse_state(source: &str, header_line: usize) -> Result<Graph, ParseError> {
 
     // Open composite blocks: (subgraph index, opening line).
     let mut stack: Vec<(usize, usize)> = Vec::new();
-    let mut note_block = false;
+    // A block note being read: where it attaches, and its lines so far.
+    // `None` inside the block = a note form we keep skipping.
+    let mut note_block: Option<Option<(StateNote, Vec<String>)>> = None;
     for (i, raw) in source.lines().enumerate() {
         let lineno = i + 1;
         if lineno <= header_line {
@@ -5309,9 +5658,13 @@ fn parse_state(source: &str, header_line: usize) -> Result<Graph, ParseError> {
         if line.is_empty() {
             continue;
         }
-        if note_block {
+        if let Some(open) = note_block.as_mut() {
             if line.eq_ignore_ascii_case("end note") {
-                note_block = false;
+                if let Some((at, lines)) = note_block.take().flatten() {
+                    state_note(&mut g, &stack, &sub_ids, at, &lines.join("\n"));
+                }
+            } else if let Some((_, lines)) = open {
+                lines.push(note_text(line));
             }
             continue;
         }
@@ -5329,12 +5682,27 @@ fn parse_state(source: &str, header_line: usize) -> Result<Graph, ParseError> {
             }
             continue;
         }
-        // Notes are accepted and skipped (not rendered yet):
-        // `note left of X : text` is one line; without a ':' it is a
-        // block that runs until `end note`.
+        // Notes, mermaid-style: a yellow card joined to its state by a
+        // dotted line. `note left of X : text` is one line; without a
+        // ':' the text runs on the next lines until `end note`.
+        // `note "text" as N` is a free-standing card named N. Any other
+        // note form is skipped as before (a block one to `end note`).
         if let Some(rest) = strip_keyword(line, "note") {
-            if !rest.contains(':') {
-                note_block = true;
+            let rest = rest.trim();
+            if let Some((text, id)) = floating_note(rest) {
+                let idx = state_node(&mut g, &stack, id, Some(text), Some(Shape::Rect));
+                g.nodes[idx].style = note_style();
+                continue;
+            }
+            let (head, text) = match rest.split_once(':') {
+                Some((h, t)) => (h, Some(t)),
+                None => (rest, None),
+            };
+            let at = state_note_head(head);
+            match (at, text) {
+                (Some(at), Some(t)) => state_note(&mut g, &stack, &sub_ids, at, &note_text(t)),
+                (at, None) => note_block = Some(at.map(|a| (a, Vec::new()))),
+                (None, Some(_)) => {}
             }
             continue;
         }
@@ -5420,7 +5788,128 @@ fn parse_state(source: &str, header_line: usize) -> Result<Graph, ParseError> {
             ),
         ));
     }
+    // A block note left open runs to the end of the source: draw what
+    // it swallowed, so the missing `end note` shows instead of the rest
+    // of the diagram vanishing.
+    if let Some(Some((at, lines))) = note_block {
+        state_note(&mut g, &stack, &sub_ids, at, &lines.join("\n"));
+    }
     Ok(g)
+}
+
+/// Where a `note left of X` / `note right of X` attaches: X (a state or
+/// a composite id) and whether the card goes before it along the flow.
+struct StateNote {
+    target: String,
+    before: bool,
+}
+
+/// The head of a positioned note (`left of X`, `right of X`, before any
+/// `:`), or `None` for any other form.
+fn state_note_head(head: &str) -> Option<StateNote> {
+    let (before, rest) = if let Some(r) = strip_keyword(head.trim(), "left") {
+        (true, r)
+    } else {
+        (false, strip_keyword(head.trim(), "right")?)
+    };
+    let target = strip_keyword(rest.trim(), "of")?.trim();
+    is_class_ident(target).then(|| StateNote {
+        target: target.to_string(),
+        before,
+    })
+}
+
+/// `"text" as N` after `note`: the card's text and its id.
+fn floating_note(rest: &str) -> Option<(String, &str)> {
+    let body = rest.strip_prefix('"')?;
+    let close = body.find('"')?;
+    let id = strip_keyword(body[close + 1..].trim(), "as")?.trim();
+    is_class_ident(id).then(|| (note_text(&body[..close]), id))
+}
+
+/// Note text: cleaned like a label, `<br/>` breaks kept as lines, each
+/// line trimmed (`a <br/> b` is "a" over "b").
+fn note_text(s: &str) -> String {
+    clean_label(s)
+        .split('\n')
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// An id for a new note card the graph does not hold yet (`__start_*`
+/// style); should the source name it later, [`state_node`] moves the
+/// card on.
+fn fresh_note_id(g: &Graph) -> String {
+    let mut k = g.nodes.len();
+    while g.node_index(&format!("__note_{k}")).is_some() {
+        k += 1;
+    }
+    format!("__note_{k}")
+}
+
+/// A note card's colours ([`crate::style::NOTE_STYLE`]).
+fn note_style() -> NodeStyle {
+    let crate::style::ShapeStyle { fill, stroke } = crate::style::NOTE_STYLE;
+    NodeStyle {
+        fill: Some(fill.to_string()),
+        stroke: Some(stroke.to_string()),
+        ..NodeStyle::default()
+    }
+}
+
+/// Add a note card with `text` and the dotted line joining it to its
+/// state, mermaid-style: a node of its own (so it is laid out, routed,
+/// picked and dragged like any box) in the state's own box, linked by a
+/// `DottedOpen` edge that runs from the state to a `right of` card (one
+/// layer after it) and from a `left of` card to the state (one layer
+/// before it, see [`Graph::lead_nodes`]). A note on a composite links
+/// to its frame and sits in the composite's parent box.
+fn state_note(
+    g: &mut Graph,
+    stack: &[(usize, usize)],
+    sub_ids: &HashMap<String, usize>,
+    at: StateNote,
+    text: &str,
+) {
+    let target = match sub_ids.get(&at.target) {
+        Some(&si) => End::Sub(si),
+        None => End::Node(state_node(g, stack, &at.target, None, None)),
+    };
+    // The box the card joins: the state's own, or the composite's
+    // parent (the open block when the composite is not declared yet).
+    let owner = match target {
+        End::Node(v) => g.subgraphs.iter().position(|s| s.nodes.contains(&v)),
+        End::Sub(si) => match g.subgraphs.get(si) {
+            Some(s) => s.parent,
+            None => stack.last().map(|&(s, _)| s),
+        },
+    };
+    let note = g.ensure_node(&fresh_note_id(g), Some(text.to_string()), Some(Shape::Rect));
+    g.nodes[note].style = note_style();
+    if let Some(si) = owner {
+        g.subgraphs[si].nodes.push(note);
+    }
+    if at.before {
+        g.lead_nodes.push(note);
+    }
+    let card = End::Node(note);
+    let (from, to) = if at.before {
+        (card, target)
+    } else {
+        (target, card)
+    };
+    match (from, to) {
+        (End::Node(a), End::Node(b)) => g.add_edge(a, b, None, EdgeKind::DottedOpen),
+        (from, to) => g.sub_edges.push(SubEdge {
+            from,
+            to,
+            label: None,
+            kind: EdgeKind::DottedOpen,
+            ends: EdgeEnds::default(),
+            meta: EdgeMeta::default(),
+        }),
+    }
 }
 
 /// Head of a `state` declaration (everything after the keyword,
@@ -5473,6 +5962,15 @@ fn state_node(
     label: Option<String>,
     shape: Option<Shape>,
 ) -> usize {
+    // A state the source names like a card made earlier is a state of
+    // its own: the card moves to a fresh id first.
+    if let Some(card) = g.node_index(id).filter(|&i| {
+        let n = &g.nodes[i];
+        crate::style::is_note_card(&n.id, n.shape, &n.style)
+    }) {
+        let fresh = fresh_note_id(g);
+        g.rename_node(card, fresh);
+    }
     let is_new = g.node_index(id).is_none();
     let idx = g.ensure_node(
         id,
@@ -5649,6 +6147,268 @@ fn frontmatter_section<'a>(source: &'a str, section: &str) -> Vec<(usize, &'a st
         }
     }
     out
+}
+
+// ------------------------------------------------------------------
+// Theme directives
+// ------------------------------------------------------------------
+
+/// The colour theme a diagram's source asks for (report M10, P1 "theme
+/// from init/frontmatter ignored"): `theme:` and `themeVariables:`
+/// under its YAML frontmatter's `config:`, then every `%%{init: …}%%`
+/// (or `%%{initialize: …}%%`) directive in source order, a later one
+/// winning — mermaid lays directives over the frontmatter config. A
+/// theme name [`Theme::from_name`] does not know is the default theme,
+/// `Some(Theme::Flowmaid)`, as mermaid falls back to its default; the
+/// theme is `None` when nothing names one. Never fails: a directive
+/// that does not parse is skipped, as the diagram parsers skip it.
+pub(crate) fn theme_directive(source: &str) -> (Option<Theme>, ThemeVars) {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let named = |n: &str| Some(Theme::from_name(n).unwrap_or_default());
+    let mut theme = frontmatter_config_value(source, "theme").and_then(|v| named(&unquote_yaml(v)));
+    let mut vars = ThemeVars::default();
+    // Only `themeVariables`' direct children: a nested namespace
+    // (`themeVariables.sankey`) holds no theme colour.
+    let lines = frontmatter_section(source, "themeVariables");
+    if let Some(direct) = lines.iter().map(|(ind, _)| *ind).min() {
+        for (_, t) in lines.iter().filter(|(ind, _)| *ind == direct) {
+            if let Some((k, v)) = yaml_pair(t) {
+                vars.set(k, &unquote_yaml(v));
+            }
+        }
+    }
+    for body in init_directives(source) {
+        if let Some(Json::Str(name)) = json_get(&body, "theme") {
+            theme = named(name);
+        }
+        if let Some(Json::Obj(entries)) = json_get(&body, "themeVariables") {
+            for (k, v) in entries {
+                if let Json::Str(v) = v {
+                    vars.set(k, v);
+                }
+            }
+        }
+    }
+    (theme, vars)
+}
+
+/// The node label wrapping width a diagram's source asks for (report
+/// M7): `wrappingWidth` under `config.flowchart:` in its YAML
+/// frontmatter, then `"flowchart": {"wrappingWidth": N}` in every
+/// `%%{init: …}%%` directive in source order, a later one winning — the
+/// option mermaid reads for flowchart and state node labels alike.
+/// `None` when nothing sets one, or for a value that is not a positive
+/// finite number (mermaid's own then stands too).
+pub(crate) fn wrapping_width_directive(source: &str) -> Option<f64> {
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let num = |v: &str| {
+        v.trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|w| w.is_finite() && *w > 0.0)
+    };
+    let mut width = None;
+    for (k, v) in frontmatter_config(source, "flowchart") {
+        if k == "wrappingWidth" {
+            width = num(&unquote_yaml(v)).or(width);
+        }
+    }
+    for body in init_directives(source) {
+        if let Some(Json::Obj(entries)) = json_get(&body, "flowchart") {
+            if let Some(Json::Str(v)) = json_get(entries, "wrappingWidth") {
+                width = num(v).or(width);
+            }
+        }
+    }
+    width
+}
+
+/// The value of a scalar `config.<key>: value` line in YAML frontmatter
+/// — a DIRECT child of `config:` (raw: run it through
+/// [`unquote_yaml`]), `None` when there is none or it opens a block.
+fn frontmatter_config_value<'a>(source: &'a str, key: &str) -> Option<&'a str> {
+    let body = frontmatter_body(source)?;
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    let mut config_at: Option<usize> = None;
+    let mut child_at: Option<usize> = None;
+    let mut found = None;
+    for line in body {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let ind = indent_of(line);
+        if let Some(outer) = config_at {
+            if ind > outer {
+                let direct = *child_at.get_or_insert(ind);
+                if ind == direct {
+                    if let Some((k, v)) = yaml_pair(t) {
+                        if k == key && !v.trim().is_empty() {
+                            found = Some(v);
+                        }
+                    }
+                }
+                continue;
+            }
+            config_at = None;
+            child_at = None;
+        }
+        if t == "config:" {
+            config_at = Some(ind);
+        }
+    }
+    found
+}
+
+/// The configuration object of every `%%{init: {…}}%%` /
+/// `%%{initialize: {…}}%%` directive in `source`, in order. A
+/// directive may span lines (it runs to its `}%%`); other directive
+/// kinds (`%%{wrap}%%`) and bodies that do not parse are skipped.
+fn init_directives(source: &str) -> Vec<Vec<(String, Json)>> {
+    let mut out = Vec::new();
+    let mut rest = source;
+    while let Some(open) = rest.find("%%{") {
+        let after = &rest[open + 3..];
+        let Some(close) = after.find("}%%") else {
+            break;
+        };
+        let inner = after[..close].trim_start();
+        rest = &after[close + 3..];
+        let name_len = inner
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(inner.len());
+        if !matches!(&inner[..name_len], "init" | "initialize") {
+            continue;
+        }
+        let Some(value) = inner[name_len..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let mut at = 0;
+        if let Some(Json::Obj(body)) = json_value(value, &mut at) {
+            out.push(body);
+        }
+    }
+    out
+}
+
+/// A value in a directive's JSON body, read leniently as mermaid's own
+/// directive parser does: single or double quotes, bare keys, and bare
+/// words as strings (`theme: dark`). Arrays are skipped whole.
+#[derive(Debug, Clone, PartialEq)]
+enum Json {
+    Str(String),
+    Obj(Vec<(String, Json)>),
+    Other,
+}
+
+/// The value of `key` in a parsed object (the last one, as in JSON).
+fn json_get<'a>(obj: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
+    obj.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+fn json_skip_ws(s: &str, at: &mut usize) {
+    let b = s.as_bytes();
+    while b.get(*at).is_some_and(|c| c.is_ascii_whitespace()) {
+        *at += 1;
+    }
+}
+
+/// One JSON value starting at byte `*at` (whitespace first), leaving
+/// `*at` just past it; `None` where it is not one.
+fn json_value(s: &str, at: &mut usize) -> Option<Json> {
+    json_skip_ws(s, at);
+    let b = s.as_bytes();
+    match *b.get(*at)? {
+        b'{' => {
+            *at += 1;
+            let mut out = Vec::new();
+            loop {
+                json_skip_ws(s, at);
+                if b.get(*at) == Some(&b'}') {
+                    *at += 1;
+                    return Some(Json::Obj(out));
+                }
+                let key = match *b.get(*at)? {
+                    b'"' | b'\'' => json_string(s, at)?,
+                    _ => json_bare(s, at)?,
+                };
+                json_skip_ws(s, at);
+                if b.get(*at) != Some(&b':') {
+                    return None;
+                }
+                *at += 1;
+                let v = json_value(s, at)?;
+                out.push((key, v));
+                json_skip_ws(s, at);
+                match b.get(*at)? {
+                    b',' => *at += 1,
+                    b'}' => {}
+                    _ => return None,
+                }
+            }
+        }
+        b'[' => {
+            // Skip to the matching `]`, minding strings.
+            let mut depth = 0usize;
+            while let Some(&c) = b.get(*at) {
+                match c {
+                    b'"' | b'\'' => {
+                        json_string(s, at)?;
+                        continue;
+                    }
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            *at += 1;
+                            return Some(Json::Other);
+                        }
+                    }
+                    _ => {}
+                }
+                *at += 1;
+            }
+            None
+        }
+        b'"' | b'\'' => json_string(s, at).map(Json::Str),
+        _ => json_bare(s, at).map(Json::Str),
+    }
+}
+
+/// A quoted string at `*at` (either quote), backslash escapes taken
+/// literally (`\"` is `"`).
+fn json_string(s: &str, at: &mut usize) -> Option<String> {
+    let q = s[*at..].chars().next()?;
+    let mut out = String::new();
+    let mut chars = s[*at + 1..].char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == q {
+            *at += 1 + i + 1;
+            return Some(out);
+        }
+        if c == '\\' {
+            if let Some((_, e)) = chars.next() {
+                out.push(e);
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    None
+}
+
+/// A bare word at `*at` (a key or an unquoted value): everything up to
+/// whitespace or JSON punctuation; `None` when empty.
+fn json_bare(s: &str, at: &mut usize) -> Option<String> {
+    let rest = &s[*at..];
+    let len = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, ',' | ':' | '{' | '}' | '[' | ']'))
+        .unwrap_or(rest.len());
+    if len == 0 {
+        return None;
+    }
+    *at += len;
+    Some(rest[..len].to_string())
 }
 
 /// Apply one `config.sankey.<key>: <value>` pair. A value that does not
@@ -6684,6 +7444,46 @@ mod tests {
             .is_some());
     }
 
+    #[test]
+    fn classdef_default_styles_every_node_under_its_own_classes() {
+        // Mermaid's own example: `classDef default` reaches every node,
+        // including ones declared after it.
+        let g = parse(
+            "flowchart LR\n\
+             classDef default fill:#fff,stroke:#333,stroke-width:2px,color:#111\n\
+             classDef hot fill:#ffe3e3\n\
+             A --> B:::hot\n\
+             B --> C\n\
+             style C stroke:#f00\n\
+             T@{ shape: text, label: \"note\" }\n",
+        )
+        .unwrap();
+        let st = |id: &str| g.nodes[g.node_index(id).unwrap()].style.clone();
+        let a = st("A");
+        assert_eq!(a.fill.as_deref(), Some("#fff"));
+        assert_eq!(a.stroke.as_deref(), Some("#333"));
+        assert_eq!(a.stroke_width, Some(2.0));
+        assert_eq!(a.color.as_deref(), Some("#111"));
+        // A node's own class wins where it says something, the default
+        // fills in the rest (mermaid compiles default, then classes).
+        let b = st("B");
+        assert_eq!(b.fill.as_deref(), Some("#ffe3e3"));
+        assert_eq!(b.stroke.as_deref(), Some("#333"));
+        // A `style` line wins over the default.
+        let c = st("C");
+        assert_eq!(c.stroke.as_deref(), Some("#f00"));
+        assert_eq!(c.fill.as_deref(), Some("#fff"));
+        // Bare text keeps no box, only the default's ink.
+        let t = st("T");
+        assert_eq!(t.fill.as_deref(), Some(BORDERLESS_PAINT));
+        assert_eq!(t.stroke.as_deref(), Some(BORDERLESS_PAINT));
+        assert_eq!(t.color.as_deref(), Some("#111"));
+        // Without a default class nothing changes: unstyled nodes keep
+        // the shape theme.
+        let g = parse("flowchart LR\nA --> B\n").unwrap();
+        assert_eq!(g.nodes[0].style, NodeStyle::default());
+    }
+
     /// (kind, start glyph, resolved end glyph, label) of the one
     /// edge in `flowchart LR\nA <op> B`.
     fn one_edge(op: &str) -> (EdgeKind, Option<Marker>, Option<Marker>, Option<String>) {
@@ -7150,6 +7950,48 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_block_keeps_its_nodes_from_later_blocks() {
+        // mermaid's first block to CLOSE keeps a node: mentioning W1 in
+        // the outer block after the nested one ended (the advanced
+        // showcase's `W1 & W2 --> Users`, `Gate ==> Q`) leaves it in
+        // `workers`, which used to be emptied and then not drawn.
+        let g = parse(
+            "flowchart TD\n\
+             subgraph outer\n\
+             G --> Users\n\
+             subgraph workers\n\
+             Q --> W1\n\
+             Q --> W2\n\
+             end\n\
+             G ==> Q\n\
+             W1 & W2 --> Users\n\
+             end\n\
+             subgraph later\n\
+             W1 --> X\n\
+             end\n",
+        )
+        .unwrap();
+        let sub = |id: &str| g.subgraphs.iter().find(|s| s.id == id).unwrap();
+        let ids = |id: &str| -> Vec<&str> {
+            sub(id)
+                .nodes
+                .iter()
+                .map(|&v| g.nodes[v].id.as_str())
+                .collect()
+        };
+        assert_eq!(ids("workers"), ["Q", "W1", "W2"]);
+        assert_eq!(ids("outer"), ["G", "Users"]);
+        // A sibling block opened later cannot take it either.
+        assert_eq!(ids("later"), ["X"]);
+        // An enclosing block that is still open gives a node up to the
+        // nested block mentioning it (that one closes first).
+        let g = parse("flowchart TD\nsubgraph o\nA --> B\nsubgraph i\nB\nend\nend\n").unwrap();
+        let b = g.node_index("B").unwrap();
+        assert_eq!(g.subgraphs[1].nodes, [b]);
+        assert!(!g.subgraphs[0].nodes.contains(&b));
+    }
+
+    #[test]
     fn edges_to_and_from_a_subgraph() {
         let g = parse(
             "flowchart TD\n\
@@ -7339,13 +8181,105 @@ mod tests {
     }
 
     #[test]
-    fn state_notes_are_skipped_and_v1_header_works() {
+    fn state_notes_become_cards_and_v1_header_works() {
         let g = state(
-            "stateDiagram\nA --> B\nnote right of A : hi\n\
-             note left of B\nmulti\nline\nend note\nB --> A",
+            "stateDiagram\nA --> B\nnote right of A : hi <br/> there\n\
+             note left of B\nmulti\n  line\nEND NOTE\nB --> A",
         );
+        // Two states, two note cards; two transitions, two note links.
+        assert_eq!(g.nodes.len(), 4);
+        assert_eq!(g.edges.len(), 4);
+        let card = |text: &str| {
+            let v = g.nodes.iter().position(|n| n.label == text).unwrap();
+            let n = &g.nodes[v];
+            assert!(n.id.starts_with("__note_"), "{}", n.id);
+            assert_eq!(n.shape, Shape::Rect);
+            let note = crate::style::NOTE_STYLE;
+            assert_eq!(n.style.fill.as_deref(), Some(note.fill));
+            assert_eq!(n.style.stroke.as_deref(), Some(note.stroke));
+            v
+        };
+        let (a, b) = (g.node_index("A").unwrap(), g.node_index("B").unwrap());
+        let link = |from: usize, to: usize| {
+            let e = g.edges.iter().find(|e| e.from == from && e.to == to);
+            let e = e.expect("a note link");
+            assert_eq!((e.kind, e.label.as_deref()), (EdgeKind::DottedOpen, None));
+        };
+        // `right of`: the state links to its card (after it on the flow);
+        // `left of`: the card links to the state (before it).
+        let hi = card("hi\nthere");
+        link(a, hi);
+        let multi = card("multi\nline");
+        link(multi, b);
+        assert_eq!(g.lead_nodes, vec![multi]);
+    }
+
+    #[test]
+    fn state_notes_join_their_states_box() {
+        let g = state(
+            "stateDiagram-v2\nstate Outer {\nX --> Y\nnote right of X : in\n}\n\
+             note left of Y : from outside\nnote right of Outer : on the box\n\
+             state Later {\nZ --> W\n}\nnote left of Later : ahead",
+        );
+        let at = |text: &str| g.nodes.iter().position(|n| n.label == text).unwrap();
+        // A note on a member sits in the member's box, wherever the
+        // note line is.
+        let members = &g.subgraphs[0].nodes;
+        assert!(members.contains(&at("in")) && members.contains(&at("from outside")));
+        // A note on a composite links to its frame from the parent box.
+        let boxed = at("on the box");
+        assert!(g.subgraphs.iter().all(|s| !s.nodes.contains(&boxed)));
+        let sub = |v: usize| {
+            g.sub_edges
+                .iter()
+                .find(|e| e.from == End::Node(v) || e.to == End::Node(v))
+                .expect("a note link to a frame")
+        };
+        let e = sub(boxed);
+        assert_eq!((e.from, e.to), (End::Sub(0), End::Node(boxed)));
+        assert_eq!(e.kind, EdgeKind::DottedOpen);
+        let ahead = at("ahead");
+        let e = sub(ahead);
+        assert_eq!((e.from, e.to), (End::Node(ahead), End::Sub(1)));
+        assert!(g.lead_nodes.contains(&ahead));
+    }
+
+    #[test]
+    fn state_note_forms_mermaid_ignores_stay_harmless() {
+        // A floating note used to open a block that swallowed the rest
+        // of the diagram; it is now a free card named by its alias.
+        let g = state("stateDiagram-v2\nnote \"free text\" as N1\nA --> B\nN1 --> A");
+        let n1 = &g.nodes[g.node_index("N1").unwrap()];
+        assert_eq!((n1.label.as_str(), n1.shape), ("free text", Shape::Rect));
+        assert!(n1.style.fill.is_some());
+        assert_eq!(g.edges.len(), 2, "the lines after it still parse");
+        // Note forms with no state to attach to are skipped as before,
+        // a block one up to its `end note`.
+        let g =
+            state("stateDiagram-v2\nnote over A : x\nnote over A\nA --> Gone\nend note\nA --> B");
         assert_eq!(g.nodes.len(), 2);
-        assert_eq!(g.edges.len(), 2);
+        assert_eq!(g.edges.len(), 1);
+        // A block note never closed keeps what it swallowed, visibly.
+        let g = state("stateDiagram-v2\nA --> B\nnote right of B\nB --> C");
+        assert!(g.nodes.iter().any(|n| n.label == "B --> C"));
+        assert!(g.node_index("C").is_none());
+        // Card ids never collide with a state the source already named.
+        let g = state("stateDiagram-v2\n__note_1 --> X\nnote right of X : n");
+        assert_eq!(g.nodes.len(), 3);
+        assert_eq!(g.nodes[g.node_index("__note_1").unwrap()].label, "__note_1");
+        // ... nor one it names after the card took that id: the card moves.
+        let g = state("stateDiagram-v2\nX --> Y\nnote right of X : n\nY --> __note_2");
+        assert_eq!(g.nodes.len(), 4, "X, Y, the card and the state __note_2");
+        let named = &g.nodes[g.node_index("__note_2").unwrap()];
+        assert_eq!(
+            (named.label.as_str(), named.shape),
+            ("__note_2", Shape::Rounded)
+        );
+        let card = g.nodes.iter().position(|n| n.label == "n").unwrap();
+        assert!(g.nodes[card].id.starts_with("__note_") && g.nodes[card].id != "__note_2");
+        assert_eq!(g.node_index(&g.nodes[card].id), Some(card));
+        let y = g.node_index("Y").unwrap();
+        assert!(g.edges.iter().any(|e| e.from == y && e.to != card));
     }
 
     #[test]
@@ -7379,6 +8313,121 @@ mod tests {
         }
         // The flowchart-only entry point gets the same courtesy.
         assert!(parse("\u{feff}A --> B").is_ok());
+    }
+
+    /// Report M10 + P1 "theme from init/frontmatter ignored": the theme
+    /// a source names, and its `themeVariables`, are read from both
+    /// places mermaid takes them, directives winning.
+    #[test]
+    fn theme_directive_reads_init_and_frontmatter() {
+        use crate::style::{Theme, ThemeVars};
+        let theme = |src: &str| theme_directive(src).0;
+        assert_eq!(theme("flowchart TD\nA --> B"), None);
+        assert_eq!(
+            theme("%%{init: {\"theme\": \"dark\"}}%%\nflowchart TD\nA --> B"),
+            Some(Theme::Dark)
+        );
+        assert_eq!(
+            theme("%%{ init : { 'theme' : 'forest' } }%%\npie\n\"a\" : 1"),
+            Some(Theme::Forest)
+        );
+        assert_eq!(
+            theme("%%{initialize: {theme: neutral}}%%\nA --> B"),
+            Some(Theme::Neutral)
+        );
+        assert_eq!(
+            theme("%%{init: {\"theme\": \"default\"}}%%\nA --> B"),
+            Some(Theme::Mermaid)
+        );
+        // A name mermaid does not know is its default theme: ours.
+        assert_eq!(
+            theme("%%{init: {\"theme\": \"redux\"}}%%\nA --> B"),
+            Some(Theme::Flowmaid)
+        );
+        // Other directives, and bodies that are no JSON, name none.
+        assert_eq!(theme("%%{wrap}%%\nA --> B"), None);
+        assert_eq!(theme("%%{init: {\"theme\": }}%%\nA --> B"), None);
+        assert_eq!(theme("%%{init: \"dark\"}%%\nA --> B"), None);
+        // An unclosed directive is skipped rather than read to the end.
+        assert_eq!(theme("%%{init: {\"theme\": \"dark\"}\nA --> B"), None);
+        // Multi-line, with a nested config beside the theme.
+        let ml =
+            "%%{\n  init: {\n    'theme': 'base',\n    'flowchart': {'curve': 'linear'},\n    \
+                  'themeVariables': {\n      'primaryColor': '#BB2528',\n      \
+                  'lineColor': 'rgb(0, 128, 0)',\n      'fontSize': '16px'\n    }\n  }\n}%%\n\
+                  flowchart TD\nA --> B";
+        let (t, v) = theme_directive(ml);
+        assert_eq!(t, Some(Theme::Mermaid));
+        assert_eq!(v.primary, Some([0xbb, 0x25, 0x28]));
+        assert_eq!(v.line, Some([0, 128, 0]));
+        assert_eq!(v.primary_border, None);
+
+        // Frontmatter: `config.theme` and `config.themeVariables`.
+        let fm = "---\ntitle: T\nconfig:\n  theme: forest\n  themeVariables:\n    \
+                  primaryColor: \"#ffcc00\" # gold\n    background: '#fafafa'\n    sankey:\n      \
+                  lineColor: \"#123456\"\n  flowchart:\n    theme: dark\n---\nflowchart TD\nA --> B";
+        let (t, v) = theme_directive(fm);
+        assert_eq!(t, Some(Theme::Forest), "only config's own `theme:` counts");
+        assert_eq!(v.primary, Some([0xff, 0xcc, 0x00]));
+        assert_eq!(v.background, Some([0xfa, 0xfa, 0xfa]));
+        assert_eq!(v.line, None, "a nested namespace holds no theme colour");
+        // A directive beats the frontmatter, variable by variable.
+        let both = "---\nconfig:\n  theme: forest\n  themeVariables:\n    \
+                    primaryColor: \"#ffcc00\"\n    background: '#fafafa'\n---\n\
+                    %%{init: {\"theme\": \"dark\", \"themeVariables\": {\"background\": \"#000\"}}}%%\n\
+                    flowchart TD\nA --> B";
+        let (t, v) = theme_directive(both);
+        assert_eq!(t, Some(Theme::Dark));
+        assert_eq!(v.background, Some([0, 0, 0]));
+        assert_eq!(
+            v.primary,
+            Some([0xff, 0xcc, 0x00]),
+            "kept from the frontmatter"
+        );
+        assert_eq!(
+            theme_directive("\u{feff}%%{init: {'theme':'dark'}}%%\nA-->B").0,
+            Some(Theme::Dark)
+        );
+        assert_eq!(
+            theme_directive("---\nconfig:\n  theme:\n---\nA-->B"),
+            (None, ThemeVars::default())
+        );
+    }
+
+    /// A directive written over several lines (mermaid's usual layout
+    /// for `themeVariables`) used to be read as diagram statements.
+    #[test]
+    fn multi_line_directives_parse_for_every_diagram_type() {
+        let dir = "%%{\n  init: {\n    \"theme\": \"dark\"\n  }\n}%%\n";
+        for body in [
+            "flowchart TD\nA --> B",
+            "erDiagram\nA ||--o{ B : has",
+            "classDiagram\nAnimal <|-- Dog",
+            "sequenceDiagram\nA->>B: hi",
+            "pie\n\"a\" : 1",
+            "stateDiagram-v2\n[*] --> A",
+            "mindmap\n  root\n    child",
+            "journey\n  section S\n    Task: 5: Me",
+            "gitGraph\n  commit",
+            "timeline\n  2020 : a",
+            "sankey-beta\nA,B,1",
+            "architecture-beta\n  service a(server)[A]",
+        ] {
+            let src = format!("{dir}{body}");
+            assert!(
+                parse_document(&src).is_ok(),
+                "{body}: {:?}",
+                parse_document(&src).err()
+            );
+        }
+        // Text after the closing `}%%` stays; line numbers stay true.
+        let g = parse("%%{init:\n {}\n}%% \nA --> B\nB --> C").unwrap();
+        assert_eq!(g.nodes.len(), 3);
+        let e = parse("%%{init:\n {}\n}%%\nA --> B\nB -->").unwrap_err();
+        assert_eq!(e.line, 5, "{e}");
+        // An unclosed directive is left to the parsers, as before: its
+        // first line is a `%%` comment.
+        assert_eq!(parse("%%{init: {\nA --> B").unwrap().nodes.len(), 2);
     }
 
     #[test]

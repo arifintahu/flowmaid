@@ -47,7 +47,9 @@ pub enum Shape {
     /// stateDiagram `[*]` as a transition target — the final
     /// pseudostate (ring with a filled core).
     StateEnd,
-    /// stateDiagram `<<fork>>` / `<<join>>` — a thin filled bar.
+    /// stateDiagram `<<fork>>` / `<<join>>` — a thin filled bar, laid
+    /// across the flow and stretched to span its branches by the scene
+    /// builders.
     ForkBar,
 }
 
@@ -391,6 +393,61 @@ pub struct Graph {
     pub acc_descr: Option<String>,
     /// Mermaid `click` links and tooltips, keyed by node index.
     pub links: BTreeMap<usize, NodeLink>,
+    /// Gap between layers for a synthetic graph that needs more than
+    /// the flowchart's (class diagrams: room for a label, two
+    /// cardinalities and an end glyph on one short edge); `None` = the
+    /// default.
+    pub(crate) rank_gap: Option<f64>,
+    /// Per edge (index-parallel with `edges`; missing = 0): room a
+    /// short edge's label keeps from each of its ends on top of the
+    /// usual clearance — class diagrams put an end glyph and a
+    /// cardinality there, which in LR / RL lie along the same axis as
+    /// the label.
+    pub(crate) label_end_room: Vec<f64>,
+    /// Per edge (index-parallel with `edges`; missing = none): the
+    /// subgraph box each end (`[from, to]`) is cut back to when drawn —
+    /// a clustered scene's stand-in for an edge that ends on a whole box
+    /// (`K0 --> K1` between state composites). The layout keeps such an
+    /// edge's label room in the gap between those borders, where it is
+    /// drawn, though its stand-in runs on to members deeper inside.
+    pub(crate) frame_cut: Vec<[Option<usize>; 2]>,
+    /// Keep every layer's leaves on their layer: no leaf staggering
+    /// when the drawing is a ribbon. Class diagrams set it — a
+    /// hierarchy's children read as one row under their parent (as
+    /// mermaid draws them), and a staggered second row interleaves its
+    /// legs with the first row's on the parent's face, crossing them.
+    pub(crate) flat_leaves: bool,
+    /// Rank every source one layer above its nearest target, as dagre's
+    /// network simplex does, instead of on the first layer (longest
+    /// path's choice). Class diagrams set it: a note — a source linked
+    /// to its class — then sits just above its class, and a class
+    /// pointing at one deep in the hierarchy sits next to it.
+    pub(crate) tight_sources: bool,
+    /// Sources ranked one layer before their nearest target instead of
+    /// on the first layer: a state `note left of X` card (mermaid's
+    /// dagre ranks it just ahead of X; longest-path layering would park
+    /// it at the top however deep X sits).
+    pub(crate) lead_nodes: Vec<usize>,
+    /// The stroke width a synthetic graph's own painter strokes every
+    /// edge with (class and ER diagrams), carried onto each scene edge
+    /// from the start ([`crate::scene::SceneEdge`]'s `paint_width`) so
+    /// the layout and routing stages already see edges the flowchart
+    /// painter will not draw: no straight glyph stubs, no arrow trims.
+    /// `None` = a flowchart (or state) graph.
+    pub(crate) edge_paint_width: Option<f64>,
+    /// The width node labels wrap at when not [`crate::layout::WRAP_WIDTH`]
+    /// (`flowchart.wrappingWidth` from an init directive or the
+    /// frontmatter); see [`Graph::wrapping_width`].
+    wrap_width: Option<f64>,
+    /// Labels never wrap: set by [`Graph::set_wrapping_width`]`(None)`
+    /// (class and ER graphs, whose painters lay their own text out).
+    no_wrap: bool,
+    /// The markdown body each markdown node label was lowered from, by
+    /// node index (`A["`…`"]`, a metadata `label`): lowering breaks its
+    /// lines at the wrapping width, so [`Graph::set_wrapping_width`]
+    /// lowers it again and `to_mermaid` writes the markdown back as
+    /// written ([`Graph::md_label`]).
+    md_labels: BTreeMap<usize, String>,
     index: HashMap<String, usize>,
 }
 
@@ -613,6 +670,80 @@ fn decode_href_entities(s: &str) -> String {
 }
 
 impl Graph {
+    /// The width (px, at [`crate::layout::TEXT_CALIBRATION`]) a node label
+    /// without a line break of its own wraps at
+    /// ([`crate::layout::wrap_label`], report M7):
+    /// [`crate::layout::WRAP_WIDTH`] unless the diagram sets
+    /// `%%{init: {"flowchart": {"wrappingWidth": N}}}%%` or
+    /// `wrappingWidth: N` under `config.flowchart` in its frontmatter;
+    /// `None` when labels keep the lines they were written with
+    /// ([`Graph::set_wrapping_width`]). A plain node label itself never
+    /// changes: the scene shows the wrapped lines (`SceneNode::label`)
+    /// and sizes the nodes for them. A markdown label's lines are broken
+    /// as it is lowered, at this width.
+    pub fn wrapping_width(&self) -> Option<f64> {
+        if self.no_wrap {
+            None
+        } else {
+            Some(self.wrap_width.unwrap_or(crate::layout::WRAP_WIDTH))
+        }
+    }
+
+    /// Set the width node labels wrap at ([`Graph::wrapping_width`]);
+    /// `None` (or a width that is not a positive finite number) keeps
+    /// every label on the lines it was written with, as flowmaid did
+    /// before labels wrapped. A markdown node label (``"`…`"``), whose
+    /// lines are broken as it is lowered, is lowered again at the new
+    /// width — unless its label was changed since.
+    pub fn set_wrapping_width(&mut self, width: Option<f64>) {
+        let md: Vec<usize> = (0..self.nodes.len())
+            .filter(|&v| self.md_label(v).is_some())
+            .collect();
+        self.set_wrap(width);
+        for v in md {
+            let low =
+                crate::markdown::lower_text(&self.md_labels[&v], self.wrapping_width(), false);
+            self.nodes[v].label = low;
+        }
+    }
+
+    /// The markdown body node `v`'s label was lowered from, while the
+    /// label is still that body lowered at the graph's width (a label
+    /// set some other way since has none).
+    pub(crate) fn md_label(&self, v: usize) -> Option<&str> {
+        let body = self.md_labels.get(&v)?;
+        let node = self.nodes.get(v)?;
+        (crate::markdown::lower_text(body, self.wrapping_width(), false) == node.label)
+            .then_some(body.as_str())
+    }
+
+    /// Record (`Some`) or forget (`None`) the markdown body node `v`'s
+    /// label was just lowered from ([`Graph::md_label`]).
+    pub(crate) fn set_md_label(&mut self, v: usize, body: Option<String>) {
+        match body {
+            Some(b) => {
+                self.md_labels.insert(v, b);
+            }
+            None => {
+                self.md_labels.remove(&v);
+            }
+        }
+    }
+
+    /// [`Graph::set_wrapping_width`]'s width alone.
+    fn set_wrap(&mut self, width: Option<f64>) {
+        match width.filter(|w| w.is_finite() && *w > 0.0) {
+            Some(w) => {
+                self.wrap_width = Some(w);
+                self.no_wrap = false;
+            }
+            None => {
+                self.wrap_width = None;
+                self.no_wrap = true;
+            }
+        }
+    }
+
     /// Look up a node by id; create it if missing.
     /// The latest label/shape overrides earlier ones (Mermaid behaviour).
     pub fn ensure_node(&mut self, id: &str, label: Option<String>, shape: Option<Shape>) -> usize {
@@ -665,6 +796,17 @@ impl Graph {
     pub fn node_index(&self, id: &str) -> Option<usize> {
         self.index.get(id).copied()
     }
+
+    /// Give node `i` the id `id` (free, else nothing changes): the parser
+    /// moves a generated `__note_*` card off an id the source then names.
+    pub(crate) fn rename_node(&mut self, i: usize, id: String) {
+        if self.index.contains_key(&id) || i >= self.nodes.len() {
+            return;
+        }
+        self.index.remove(&self.nodes[i].id);
+        self.index.insert(id.clone(), i);
+        self.nodes[i].id = id;
+    }
 }
 
 /// One parsed Mermaid document of any supported diagram type.
@@ -693,6 +835,14 @@ pub enum Document {
 pub struct ClassDiagram {
     pub classes: Vec<Class>,
     pub relations: Vec<ClassRel>,
+    /// Layout direction from mermaid's `direction TB|BT|LR|RL` line
+    /// (default top-down; an unknown one is ignored, as in mermaid).
+    /// Relations rank in SOURCE order along it:
+    /// the left operand of `A <|-- B` sits before (above, in TB) the
+    /// right one, so parents and wholes lead, as in UML and mermaid.
+    pub direction: Direction,
+    /// `note "text"` / `note for Class "text"` lines, in source order.
+    pub notes: Vec<ClassNote>,
     /// Accessible title from mermaid's `accTitle:` statement — replaces
     /// the default `<title>` / `aria-label` of the SVG. `None` = absent
     /// or empty.
@@ -714,10 +864,30 @@ impl ClassDiagram {
                 name: name.to_string(),
                 fields: Vec::new(),
                 methods: Vec::new(),
+                annotations: Vec::new(),
+                generic: None,
+                lollipop: false,
             });
             self.index.insert(name.to_string(), i);
             i
         }
+    }
+
+    /// Add a lollipop interface named `name` (see [`Class::lollipop`])
+    /// and return its index. Every call adds a new one, as each
+    /// `bar ()-- foo` line does in mermaid: it is not entered under its
+    /// name, so [`ClassDiagram::ensure_class`] / [`ClassDiagram::class_index`]
+    /// never return it and a class may share its name.
+    pub fn add_lollipop(&mut self, name: &str) -> usize {
+        self.classes.push(Class {
+            name: name.to_string(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            annotations: Vec::new(),
+            generic: None,
+            lollipop: true,
+        });
+        self.classes.len() - 1
     }
 
     pub fn class_index(&self, name: &str) -> Option<usize> {
@@ -726,11 +896,115 @@ impl ClassDiagram {
 }
 
 /// A class box: name header + fields compartment + methods compartment.
+/// Create one with [`ClassDiagram::ensure_class`] (the struct is
+/// `#[non_exhaustive]`, so later versions may add fields).
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Class {
+    /// The class id: what relations, notes and members refer to
+    /// (`Box` for `class Box~T~`).
     pub name: String,
     pub fields: Vec<Member>,
     pub methods: Vec<Member>,
+    /// Stereotypes without the guillemets, in source order: `interface`
+    /// from `<<interface>>` inside the class block or a standalone
+    /// `<<interface>> Name` line. Drawn as `«interface»` above the name.
+    pub annotations: Vec<String>,
+    /// Generic parameter from `class Box~T~` (`T`), shown as `Box<T>`;
+    /// `None` = not generic.
+    pub generic: Option<String>,
+    /// A lollipop interface (`bar` in `bar ()-- foo`, made by
+    /// [`ClassDiagram::add_lollipop`]): drawn as its name alone, no
+    /// box, beside the small circle its relation ends in. `name` is
+    /// then only the text shown.
+    pub lollipop: bool,
+}
+
+impl Class {
+    /// The header text: the name, plus `<T>` for a generic class.
+    pub fn display_name(&self) -> String {
+        match &self.generic {
+            Some(t) => format!("{}<{}>", self.name, generics_to_angles(t)),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// Mermaid's generic notation with angle brackets, by mermaid's own
+/// rule (`parseGenericTypes`): within each comma-separated piece the
+/// first and last `~` pair up, repeatedly, so `List~int~` reads
+/// `List<int>` and `List~List~int~~` reads `List<List<int>>`; two
+/// pieces holding one `~` each rejoin across their comma, so
+/// `Map~K, V~` reads `Map<K, V>`. A lone `~` stays as written.
+pub(crate) fn generics_to_angles(s: &str) -> String {
+    if s.matches('~').count() < 2 {
+        return s.to_string();
+    }
+    let pair = |piece: &str| -> String {
+        let mut chars: Vec<char> = piece.chars().collect();
+        // An odd count that starts with `~` keeps that leading one.
+        let skip = usize::from(
+            chars.iter().filter(|&&c| c == '~').count() % 2 == 1 && chars.first() == Some(&'~'),
+        );
+        loop {
+            let first = chars
+                .iter()
+                .skip(skip)
+                .position(|&c| c == '~')
+                .map(|i| i + skip);
+            let last = chars.iter().rposition(|&c| c == '~');
+            match (first, last) {
+                (Some(a), Some(b)) if a < b => {
+                    chars[a] = '<';
+                    chars[b] = '>';
+                }
+                _ => break,
+            }
+        }
+        chars.into_iter().collect()
+    };
+    let pieces: Vec<&str> = s.split(',').collect();
+    let mut out: Vec<String> = Vec::with_capacity(pieces.len());
+    let mut i = 0;
+    while i < pieces.len() {
+        let one = |p: &str| p.matches('~').count() == 1;
+        if one(pieces[i]) && i + 1 < pieces.len() && one(pieces[i + 1]) {
+            out.push(pair(&format!("{},{}", pieces[i], pieces[i + 1])));
+            i += 2;
+        } else {
+            out.push(pair(pieces[i]));
+            i += 1;
+        }
+    }
+    out.join(",")
+}
+
+/// A `note` in a class diagram: a yellow card, linked by a dotted line
+/// to its class when written `note for Class "text"`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ClassNote {
+    /// Note text; `\n` and `<br/>` in the source are line breaks.
+    pub text: String,
+    /// Index into [`ClassDiagram::classes`] for `note for Class`;
+    /// `None` = a free-standing note (also `note for` a class the
+    /// diagram never declares: the note does not create it).
+    pub class: Option<usize>,
+}
+
+impl ClassNote {
+    /// A note showing `text` — its display text, line breaks as `\n`
+    /// (the parser folds the source's `\n` and `<br/>` into them) —
+    /// linked to `class` (an index into [`ClassDiagram::classes`], as
+    /// `note for Class "text"` resolves) or free-standing (`None`, as
+    /// `note "text"`). This is how the parser builds its notes; push it
+    /// onto [`ClassDiagram::notes`].
+    pub fn new(text: impl Into<String>, class: Option<usize>) -> ClassNote {
+        ClassNote {
+            text: text.into(),
+            class,
+        }
+    }
 }
 
 /// One field or method row.
@@ -765,8 +1039,13 @@ impl Visibility {
 }
 
 /// A relationship between two classes. Normalised so the end glyph
-/// (triangle / diamond / arrow) always sits at the `to` end.
+/// (triangle / diamond / arrow / lollipop circle) always sits at the
+/// `to` end; [`ClassRel::head_left`] remembers which operand the source
+/// wrote first, which the layout ranks by. A two-way relation
+/// (`A <|--|> B`, `A *--> B`) also has a glyph at the `from` end:
+/// [`ClassRel::from_kind`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ClassRel {
     pub from: usize,
     pub to: usize,
@@ -776,6 +1055,50 @@ pub struct ClassRel {
     pub from_card: Option<String>,
     pub to_card: Option<String>,
     pub label: Option<String>,
+    /// The source wrote the decorated end on the LEFT (`Animal <|--
+    /// Dog`, `Order *-- Line`, `A <-- B`), so the source order is
+    /// `to` → `from`. Mermaid ranks by source order (left operand
+    /// first), which puts parents, interfaces and wholes above their
+    /// children in a top-down diagram; see [`ClassRel::source_order`].
+    pub head_left: bool,
+    /// The glyph at the `from` end of a two-way relation, whose `kind`
+    /// is the glyph at `to` (`A <|--|> B`, `A *--> B`, `A o..o B`);
+    /// `None` = only the `to` end is decorated. The parser keeps a
+    /// two-way relation in source order: `from` is the left operand
+    /// and [`ClassRel::head_left`] is `false`.
+    pub from_kind: Option<RelKind>,
+}
+
+impl ClassRel {
+    /// A relation `from` → `to` of `kind` with its glyph at `to`, as
+    /// `B --|> A` would parse: solid unless `kind` is realization or
+    /// dependency, no cardinalities, no label, no glyph at `from`,
+    /// source order `from` first. The fields are public; adjust them
+    /// after.
+    pub fn new(from: usize, to: usize, kind: RelKind) -> ClassRel {
+        ClassRel {
+            from,
+            to,
+            kind,
+            dashed: matches!(kind, RelKind::Realization | RelKind::Dependency),
+            from_card: None,
+            to_card: None,
+            label: None,
+            head_left: false,
+            from_kind: None,
+        }
+    }
+
+    /// `(left, right)` class indexes as the source wrote them —
+    /// `(to, from)` when [`ClassRel::head_left`], else `(from, to)`.
+    /// The layout ranks the left operand first.
+    pub fn source_order(&self) -> (usize, usize) {
+        if self.head_left {
+            (self.to, self.from)
+        } else {
+            (self.from, self.to)
+        }
+    }
 }
 
 /// UML relationship type (determines line style + end glyph).
@@ -795,6 +1118,10 @@ pub enum RelKind {
     Dependency,
     /// `--` — plain line.
     Link,
+    /// `()--` — a small hollow circle: the lollipop of an interface
+    /// (`bar ()-- foo`, where `bar` is a [`Class::lollipop`]), or one
+    /// end of a two-way relation (`A ()--* B`).
+    Lollipop,
 }
 
 /// Sequence diagram (`sequenceDiagram` header). Items keep source

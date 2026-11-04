@@ -20,10 +20,10 @@
 //!   drags use `scene::route_partial` with the compact scene as base
 //!   (bare `route()` would free-route the fold turns away).
 
-use crate::layout::{intrinsic_size, GAP_L};
+use crate::layout::GAP_L;
 use crate::model::{Direction, Edge, EdgeKind, Graph};
 use crate::scene::{
-    flip_scene, grow_scene, parallel_offsets, scene_sized, shift_scene, Bbox, Scene, SceneEdge,
+    flip_scene, grow_canvas, parallel_offsets, scene_sized, shift_scene, Bbox, Scene, SceneEdge,
     MARGIN,
 };
 
@@ -124,13 +124,15 @@ pub struct CompactScene {
 /// Compact layout with intrinsic node sizes (the [`crate::scene::scene`]
 /// counterpart).
 pub fn scene_compact(g: &Graph, opts: &CompactOptions) -> CompactScene {
-    let sizes: Vec<(f64, f64)> = g.nodes.iter().map(intrinsic_size).collect();
+    let sizes: Vec<(f64, f64)> = crate::layout::node_sizes(g);
     scene_compact_sized(g, &sizes, opts)
 }
 
 /// Compact layout with caller-provided node sizes (the
 /// [`crate::scene::scene_sized`] counterpart).
 pub fn scene_compact_sized(g: &Graph, sizes: &[(f64, f64)], opts: &CompactOptions) -> CompactScene {
+    // The fork/join bars' fitted sizes, as `scene_sized` draws them.
+    let sizes = &crate::scene::fit_bars(g, sizes)[..];
     let base = scene_sized(g, sizes);
     let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
     let flow_extent = if horizontal { base.width } else { base.height };
@@ -481,6 +483,7 @@ fn compose(
                     ends: e.ends,
                     meta: e.meta.clone(),
                     label: None,
+                    paint_width: None,
                 };
             }
             let gutter = band_of(e.from).min(band_of(e.to));
@@ -494,7 +497,7 @@ fn compose(
     sc.nodes = nodes;
     sc.edges = edges;
     let mut bb = Bbox::new();
-    grow_scene(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+    grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
     let (minx, maxx, miny, maxy) = bb.finish();
     shift_scene(&mut sc, MARGIN - minx, MARGIN - miny);
     sc.width = (maxx - minx) + 2.0 * MARGIN;
@@ -583,6 +586,7 @@ fn fold_connector(
         ends: e.ends,
         meta: e.meta.clone(),
         label,
+        paint_width: None,
     }
 }
 

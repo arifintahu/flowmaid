@@ -15,7 +15,13 @@
 //! l = layer / depth); the renderer maps them to final x,y
 //! according to the diagram direction (TD/LR/BT/RL).
 
+use crate::clearance::{FRAME_SEP, NODE_SEP, TIGHT_RUN_MIN};
+use crate::labels::{FAN_FAR, FAN_SIBLING_GAP, LABEL_SIDE_AIR, LABEL_STRADDLE, STROKE_PAD};
 use crate::model::{Direction, EdgeKind, Graph, Node, Shape};
+use crate::ports::PORT_INSET;
+use crate::scene::{port_lean, ARROW_MARKER_PX};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 
 /// Position & size of one node in abstract coordinates.
@@ -50,10 +56,26 @@ pub const PAD_X: f64 = 16.0;
 pub const BASE_H: f64 = 38.0;
 /// Minimum node width.
 pub const MIN_W: f64 = 54.0;
+/// Side of an unlabelled diamond — a stateDiagram `<<choice>>` (mermaid
+/// draws it 28×28). The decision-diamond minimum exists to fit text in
+/// the middle; with no text it would only inflate an empty branch point
+/// (80×64.6) and push its outgoing ports apart.
+pub const CHOICE_SIZE: f64 = 28.0;
+/// Intrinsic (width, height) of a fork/join bar, before
+/// `scene::fit_bars` lays it across the flow and stretches it over its
+/// branches.
+pub(crate) const BAR_SIZE: (f64, f64) = (60.0, 8.0);
+
+/// Is a node of this shape and label a compact branch point: an
+/// unlabelled diamond (a state `<<choice>>`, a flowchart `A{ }`), drawn
+/// [`CHOICE_SIZE`] square?
+pub(crate) fn is_branch_point(shape: Shape, label: &str) -> bool {
+    shape == Shape::Diamond && label.trim().is_empty()
+}
 // Mermaid's dagre defaults (nodeSpacing / rankSpacing ≈ 50) — labels
 // no longer ride between ranks (they own dummy slots), so the extra
 // breathing room the old 62/84 reserved is dead space now.
-const GAP_B: f64 = 50.0; // gap between REAL nodes within a layer
+pub(crate) const GAP_B: f64 = 50.0; // gap between REAL nodes within a layer (fork bars too)
 pub(crate) const GAP_L: f64 = 60.0; // gap between layers (fold DP glue too)
 const MARGIN: f64 = 28.0;
 /// Gap contribution of an edge DUMMY within a layer (dagre's
@@ -123,9 +145,6 @@ const CENTRE_KEY_STEP: f64 = 0.01;
 /// slides into (D4): it moves only as far as that band, not to the
 /// exact middle.
 const CENTRE_SLIDE_BAND: f64 = 0.15;
-/// How far a back-edge bow clears the nodes it passes, before half its
-/// label (the scene's `edge_points` bow clearance).
-const BOW_CLEAR: f64 = 24.0;
 /// Area ratio by which a top-level node must outsize every other
 /// top-level node, and every other node of its layer, to count as the
 /// largest object that D3/D4 centre (G3). Equal or near-equal boxes have
@@ -160,7 +179,693 @@ pub(crate) const LABEL_PAD_W: f64 = 14.0;
 pub(crate) const LABEL_BOX_H: f64 = 20.0;
 /// Room a label kept between adjacent layers leaves to each end node
 /// once its gap had to grow for it.
-const LABEL_CLEAR: f64 = 6.0;
+pub(crate) const LABEL_CLEAR: f64 = 6.0;
+
+/// Room (px) a labelled edge between adjacent TD / BT layers keeps
+/// between its label and either end (report M3, §2.6): an arrowhead and
+/// a stub as long again as the label is tall, so the S the edge draws
+/// to its target bends above or below the label instead of under it,
+/// and the head never touches the chip. With the gap growing only when
+/// the label would not fit at all, a 20 px chip swallowed a third of
+/// the 60 px gap and the edge read as two hooks (long-labels, demo).
+/// 72 px for a one-line label, as mermaid's label rank gives it.
+pub(crate) const LABEL_RUN: f64 = ARROW_MARKER_PX + 15.0;
+
+/// Room (px) back from the far end of a compact branch point's fan
+/// line that its arrowhead takes from a label: [`ARROW_MARKER_PX`] plus
+/// [`LABEL_CLEAR`], and as much again, since the label stage measures
+/// the head back to the first sample of the drawn curve that far from
+/// its tip.
+const FAN_HEAD_ROOM: f64 = ARROW_MARKER_PX + 2.0 * LABEL_CLEAR;
+
+/// Gap (px, border to border along the flow) between a compact branch
+/// point and the far end of an edge of its fan, for a label reaching
+/// `beyond` past its centre toward that end: the label stage keeps such
+/// a label only past [`FAN_FAR`] of its line (where the fan's branches
+/// have spread apart), clear of the far end's arrowhead
+/// ([`FAN_HEAD_ROOM`]).
+fn fan_gap(beyond: f64) -> f64 {
+    (beyond + FAN_HEAD_ROOM) / (1.0 - FAN_FAR)
+}
+
+/// Report M3, B7 review r3 #1: the room (px) an LR / RL gap keeps along
+/// the flow past the label of a styled edge across it (dotted, thick,
+/// `linkStyle`-painted: [`crate::scene::label_stub`]) — each of its end
+/// glyphs (one at least), and on either side of the chip
+/// [`LABEL_CLEAR`] plus the run of stroke the style reads on; 0 for a
+/// plain edge, whose gap keeps the plain head room. The label stage
+/// keeps the chip off those runs.
+fn styled_room(e: &crate::model::Edge) -> f64 {
+    let stub = crate::scene::label_stub(e.kind, &e.meta);
+    if stub <= 0.0 {
+        return 0.0;
+    }
+    end_glyphs(e) as f64 * ARROW_MARKER_PX + 2.0 * (LABEL_CLEAR + stub)
+}
+
+/// How many end glyphs (arrowheads, circles, crosses) edge `e` draws,
+/// one at least: the gap room an LR / RL label leaves along its line is
+/// counted per glyph ([`lr_label_room`], [`styled_room`]).
+fn end_glyphs(e: &crate::model::Edge) -> usize {
+    let marks = usize::from(e.ends.start_marker(e.kind).is_some())
+        + usize::from(e.ends.end_marker(e.kind).is_some());
+    marks.max(1)
+}
+
+/// Report M3: the room (px) an LR / RL gap keeps along the flow past the
+/// label of an edge across it — each of its end glyphs (one at least)
+/// and [`LABEL_CLEAR`] on either side of the chip, or a styled edge's
+/// [`styled_room`] where that is more. A double-headed edge (`<-->`)
+/// keeps both heads' room (B7 review r4 #4): sized for one, its label
+/// had no spot clear of both heads on its line and stepped above it.
+fn lr_label_room(e: &crate::model::Edge) -> f64 {
+    (2.0 * LABEL_CLEAR + end_glyphs(e) as f64 * ARROW_MARKER_PX).max(styled_room(e))
+}
+
+/// One line of a compact branch point's fan between two adjacent TD/BT
+/// layers, in breadth: from where it leaves the point to the port at its
+/// far end, with its label's width if it has one.
+#[derive(Clone, Copy)]
+struct FanLine {
+    point: usize,
+    from: f64,
+    to: f64,
+    width: Option<f64>,
+}
+
+/// Breadth of a fan line `share` (0..=1) of the way along the flow: the
+/// scene draws a line between adjacent layers as an S (both control
+/// points half-way along the flow), whose depth runs `1.5t - 1.5t^2 +
+/// t^3` and breadth `3t^2 - 2t^3` of the way.
+fn fan_line_at(line: &FanLine, share: f64) -> f64 {
+    let share = share.clamp(0.0, 1.0);
+    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+    for _ in 0..32 {
+        let t = (lo + hi) / 2.0;
+        if 1.5 * t - 1.5 * t * t + t * t * t < share {
+            lo = t;
+        } else {
+            hi = t;
+        }
+    }
+    line.from + (line.to - line.from) * (3.0 * hi * hi - 2.0 * hi * hi * hi)
+}
+
+/// Per edge: how far the outermost of the parallel edges it belongs to
+/// (one node pair, `par` = `scene::parallel_offsets`) sits off their
+/// middle; 0 for an edge with no parallel twin.
+fn parallel_reach(g: &Graph, par: &[f64]) -> Vec<f64> {
+    let pair = |ei: usize| {
+        let e = &g.edges[ei];
+        (e.from.min(e.to), e.from.max(e.to))
+    };
+    let mut reach: BTreeMap<(usize, usize), f64> = BTreeMap::new();
+    for (ei, off) in par.iter().enumerate() {
+        let r = reach.entry(pair(ei)).or_insert(0.0);
+        *r = r.max(off.abs());
+    }
+    (0..par.len()).map(|ei| reach[&pair(ei)]).collect()
+}
+
+/// Where a compact branch point's fan line meets a boxy far end, off the
+/// end's centre: [`port_lean`] toward the point (`toward`: its breadth
+/// less the end's), shifted by its parallel offset `off`. Parallel lines
+/// to one end (the outermost `reach` off their middle) keep their
+/// spacing, as the port stage spaces their ends (`ports::assign`): their
+/// shared lean only goes as far as keeps the outermost [`PORT_INSET`]
+/// in from the box's corner.
+fn fan_end_lean(shape: Shape, size: (f64, f64), toward: f64, off: f64, reach: f64) -> f64 {
+    if reach <= 0.0 {
+        return port_lean(shape, size, toward, off);
+    }
+    let span = (size.0 / 2.0 - PORT_INSET - reach).max(0.0);
+    port_lean(shape, size, toward, 0.0).clamp(-span, span) + off
+}
+
+/// Every (note card, fork/join bar) pair a state note links (see
+/// [`crate::style::is_note_card`]).
+fn bar_cards(g: &Graph) -> Vec<(usize, usize)> {
+    let card = |v: usize| {
+        let n = &g.nodes[v];
+        crate::style::is_note_card(&n.id, n.shape, &n.style)
+    };
+    let bar = |v: usize| g.nodes[v].shape == Shape::ForkBar;
+    g.edges
+        .iter()
+        .filter_map(|e| match (card(e.from), card(e.to)) {
+            (true, false) if bar(e.to) => Some((e.from, e.to)),
+            (false, true) if bar(e.from) => Some((e.to, e.from)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Per layered node, its neighbours one way (`preds` or `succs`).
+type Links<'a> = Cow<'a, [Vec<usize>]>;
+
+/// `preds` / `succs` without the links between a fork/join bar and a
+/// state note card (see [`crate::style::is_note_card`]) one layer apart;
+/// borrowed when the graph has none.
+fn unlink_bar_cards<'a>(
+    g: &Graph,
+    preds: &'a [Vec<usize>],
+    succs: &'a [Vec<usize>],
+) -> (Links<'a>, Links<'a>) {
+    let pairs = bar_cards(g);
+    if pairs.is_empty() {
+        return (Cow::Borrowed(preds), Cow::Borrowed(succs));
+    }
+    let (mut p, mut s) = (preds.to_vec(), succs.to_vec());
+    for (a, b) in pairs {
+        for (u, v) in [(a, b), (b, a)] {
+            s[u].retain(|&w| w != v);
+            p[v].retain(|&w| w != u);
+        }
+    }
+    (Cow::Owned(p), Cow::Owned(s))
+}
+
+/// Most a gap grows (px, past the least it needs anyway) to stack the
+/// labels of a compact branch point's fan.
+const FAN_GAP_MAX: f64 = 4.0 * GAP_L;
+
+/// Most a fan's labels grow their gap past the plain labelled gap
+/// (`ext + 2 * LABEL_RUN`, report M3) in [`hub_label_room`]: a fan too
+/// crowded for that keeps the plain gap (its labels then find their own
+/// clear spots, as before).
+const HUB_LABEL_GROW_MAX: f64 = 48.0;
+
+/// Step (px) [`hub_label_room`] grows a trial gap by.
+const HUB_LABEL_STEP: f64 = 2.0;
+
+/// A fan's curves in [`hub_label_room`]: `(port, far end, edge)`.
+type FanCurves = Vec<(f64, f64, usize)>;
+
+/// Per lower layer: `(upper end, lower end, gap)` — the least border to
+/// border gap at which a labelled edge across one gap, drawn as the
+/// builder draws it (an S whose controls sit mid-gap), keeps its label
+/// centred on its curve's middle clear of the other curves of each fan
+/// it is part of (B7 review r1 #6, report M3: a hub's labels sat in the
+/// half near the head, on the bend: `express` 5.7 px off its head's
+/// base, where at the middle its box met `Pack`'s curve). A fan is the
+/// edges between one node and the next layer, its ports modelled as the
+/// ports stage spreads a side ([`crate::ports::PORT_EVEN_MAX`], ordered
+/// by their far ends); the label clears another curve by
+/// [`STROKE_PAD`]. Only gaps that need more than the plain labelled gap,
+/// by at most [`HUB_LABEL_GROW_MAX`], get an entry. The label stage
+/// prefers such a label's middle (`labels::place`).
+fn hub_label_room(
+    g: &Graph,
+    back: &[bool],
+    alayer: &[usize],
+    bpos: &[f64],
+    absize: &[f64],
+    nlayers: usize,
+    horizontal: bool,
+) -> Vec<Vec<(usize, usize, f64)>> {
+    let mut out: Vec<Vec<(usize, usize, f64)>> = vec![Vec::new(); nlayers];
+    // Along LR / RL a label lies along its line, a whole width long, and
+    // the labelled gap already holds it with the head (report M3); the
+    // label stage slides it along its line off the others.
+    if horizontal {
+        return out;
+    }
+    let n = g.nodes.len();
+    let short = |ei: usize| {
+        let e = &g.edges[ei];
+        e.from != e.to
+            && e.from < n
+            && e.to < n
+            && !back[ei]
+            && !matches!(e.kind, EdgeKind::Invisible)
+            && alayer[e.from].abs_diff(alayer[e.to]) == 1
+    };
+    // Parallel twins stack their own labels. Edges per unordered pair of
+    // ends, counted once: a hub's whole fan is asked about, so a scan of
+    // every edge per edge would be quadratic.
+    let mut pairs: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+    for f in &g.edges {
+        *pairs
+            .entry((f.from.min(f.to), f.from.max(f.to)))
+            .or_insert(0) += 1;
+    }
+    let twin = |ei: usize| {
+        let e = &g.edges[ei];
+        pairs[&(e.from.min(e.to), e.from.max(e.to))] > 1
+    };
+    // The fan on one side of node `v` (facing down the flow or up it):
+    // its curves `(port, far end, edge)` as the ports stage spreads them,
+    // or `None` when the side holds fewer than two ends or parallel twins.
+    // It depends on the side alone, so it is built once per side and
+    // shared by all the side's labelled edges (a 1000-edge hub asked it a
+    // thousand times).
+    let fan = |v: usize, down: bool| -> Option<FanCurves> {
+        // Every end on v's side facing the gap, by its far end.
+        let mut side: Vec<(f64, usize)> = g
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(j, f)| {
+                let far = if f.from == v { f.to } else { f.from };
+                (f.from == v || f.to == v)
+                    && f.from != f.to
+                    && far < n
+                    && !back[*j]
+                    && (alayer[far] > alayer[v]) == down
+                    && alayer[far] != alayer[v]
+            })
+            .map(|(j, f)| (bpos[if f.from == v { f.to } else { f.from }], j))
+            .collect();
+        if side.len() < 2 {
+            return None;
+        }
+        // Parallel twins leave their ports a twin offset apart and
+        // stack their own labels: the even comb is not their model.
+        let mut fars: Vec<usize> = side
+            .iter()
+            .map(|&(_, j)| {
+                let f = &g.edges[j];
+                if f.from == v {
+                    f.to
+                } else {
+                    f.from
+                }
+            })
+            .collect();
+        fars.sort_unstable();
+        if fars.windows(2).any(|w| w[0] == w[1]) {
+            return None;
+        }
+        side.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let k = side.len();
+        let pitch = ((absize[v] - 2.0 * PORT_INSET) / (k + 1) as f64)
+            .clamp(crate::ports::PORT_SPACING, crate::ports::PORT_EVEN_MAX);
+        let port = |i: usize| bpos[v] + (i as f64 - (k - 1) as f64 / 2.0) * pitch;
+        Some(
+            side.iter()
+                .enumerate()
+                .filter(|(_, &(_, j))| short(j))
+                .map(|(i, &(far, j))| (port(i), far, j))
+                .collect(),
+        )
+    };
+    let mut fans: std::collections::HashMap<(usize, bool), Option<FanCurves>> =
+        std::collections::HashMap::new();
+    for (ei, e) in g.edges.iter().enumerate() {
+        let Some(lbl) = &e.label else { continue };
+        // A curve the user picked (`curve:` / `interpolate`) is not the
+        // builder's S.
+        if !short(ei) || twin(ei) || e.meta.curve.is_some() {
+            continue;
+        }
+        // Half extents across the flow and along it.
+        let (ha, hl) = ((text_width(lbl) + LABEL_PAD_W) / 2.0, LABEL_BOX_H / 2.0);
+        let floor = 2.0 * hl + 2.0 * LABEL_RUN;
+        let mut need = floor;
+        for v in [e.from, e.to] {
+            let other = if v == e.from { e.to } else { e.from };
+            let down = alayer[other] > alayer[v];
+            let curves = fans.entry((v, down)).or_insert_with(|| fan(v, down));
+            let Some(curves) = curves.as_ref() else {
+                continue;
+            };
+            let Some(&(p, b, _)) = curves.iter().find(|c| c.2 == ei) else {
+                continue;
+            };
+            // The label's box at its curve's middle, grown by the stroke
+            // pad, across the flow.
+            let (x0, x1) = (
+                (p + b) / 2.0 - ha - STROKE_PAD,
+                (p + b) / 2.0 + ha + STROKE_PAD,
+            );
+            // An S runs between its two ends across the flow, so only a
+            // curve whose ends straddle or meet the box's span can cross
+            // it (the margin keeps rounding from deciding a near miss).
+            let near: Vec<(f64, f64)> = curves
+                .iter()
+                .filter(|&&(q, f, j)| j != ei && q.max(f) + 1e-6 >= x0 && q.min(f) - 1e-6 <= x1)
+                .map(|&(q, f, _)| (q, f))
+                .collect();
+            let clear = |gap: f64| {
+                // No other curve of the fan crosses the box at its
+                // curve's middle.
+                let (y0, y1) = (gap / 2.0 - hl - STROKE_PAD, gap / 2.0 + hl + STROKE_PAD);
+                let (s0, s1) = (s_curve_blend(gap, y0), s_curve_blend(gap, y1));
+                near.iter().all(|&(q, f)| {
+                    let (a, c) = (q + (f - q) * s0, q + (f - q) * s1);
+                    a.max(c) < x0 || a.min(c) > x1
+                })
+            };
+            let mut gap = need;
+            while gap <= floor + HUB_LABEL_GROW_MAX && !clear(gap) {
+                gap += HUB_LABEL_STEP;
+            }
+            if gap <= floor + HUB_LABEL_GROW_MAX {
+                need = need.max(gap);
+            }
+        }
+        if need > floor {
+            let (lo, hi) = if alayer[e.from] < alayer[e.to] {
+                (e.from, e.to)
+            } else {
+                (e.to, e.from)
+            };
+            out[alayer[hi]].push((lo, hi, need));
+        }
+    }
+    out
+}
+
+/// How far (0 at its start, 1 at its end) across the flow the S the
+/// builder draws across a gap `gap` deep, its controls mid-gap, has run
+/// at depth `y`. It depends on the depths alone, so a fan's curves share
+/// it: the S from `p` to `f` runs at `p + (f - p) * s_curve_blend(..)`.
+fn s_curve_blend(gap: f64, y: f64) -> f64 {
+    let depth = |t: f64| gap * (1.5 * t * (1.0 - t) + t * t * t);
+    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+    let y = y.clamp(0.0, gap);
+    for _ in 0..30 {
+        let mid = (lo + hi) / 2.0;
+        if depth(mid) < y {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let t = (lo + hi) / 2.0;
+    3.0 * t * t - 2.0 * t * t * t
+}
+
+/// Least gap (px, at least `need`) between two TD/BT layers that lets
+/// the label stage stack the labels of the compact branch points' fans
+/// `lines` between them, as it does (`labels::stack_fans`): per point, in
+/// breadth order, each label takes the first row (one label box plus
+/// [`LABEL_CLEAR`] apart, back from [`FAN_HEAD_ROOM`]) past [`FAN_FAR`]
+/// where it lies [`FAN_SIBLING_GAP`] clear of the point's labels in that
+/// row and clear of the point's other lines. When no growth makes room
+/// for every label on its line (a sibling runs within a box of it all
+/// the way: two transitions to one state), a label with no row on its
+/// line may take one just beside it, as the label stage then does. A
+/// gap no growth makes room in stays `need`.
+fn fan_rows_gap(lines: &[FanLine], need: f64) -> f64 {
+    if lines.iter().all(|l| l.width.is_none()) {
+        return need;
+    }
+    [false, true]
+        .into_iter()
+        .find_map(|beside| fan_rows_fit(lines, need, beside))
+        .unwrap_or(need)
+}
+
+/// The least gap, from `need` grown by at most [`FAN_GAP_MAX`], that
+/// fits the labels of `lines` in rows as [`fan_rows_gap`] describes,
+/// letting a label with no clear row on its line sit beside it when
+/// `beside`; `None` if no such gap does.
+fn fan_rows_fit(lines: &[FanLine], need: f64, beside: bool) -> Option<f64> {
+    let pitch = LABEL_BOX_H + LABEL_CLEAR;
+    let fits = |gap: f64| {
+        let mut points: Vec<usize> = lines.iter().map(|l| l.point).collect();
+        points.sort_unstable();
+        points.dedup();
+        points.into_iter().all(|p| {
+            let mut fan: Vec<&FanLine> = lines.iter().filter(|l| l.point == p).collect();
+            fan.sort_by(|a, b| a.to.total_cmp(&b.to));
+            // Per row: the label spans placed in it.
+            let mut rows: Vec<Vec<(f64, f64)>> = Vec::new();
+            fan.iter().all(|l| {
+                let Some(w) = l.width else { return true };
+                let shares: Vec<(usize, f64)> = (0..)
+                    .map_while(|r: usize| {
+                        let depth = FAN_HEAD_ROOM + LABEL_BOX_H / 2.0 + r as f64 * pitch;
+                        let share = 1.0 - depth / gap;
+                        (share >= FAN_FAR).then_some((r, share))
+                    })
+                    .collect();
+                // The label's span `off` across from its line in row
+                // `r`: (clear of the other lines, and then taken if clear
+                // of its row's labels too).
+                let mut take = |r: usize, share: f64, off: f64| {
+                    let b = fan_line_at(l, share) + off;
+                    let (x0, x1) = (b - w / 2.0, b + w / 2.0);
+                    // The other lines where the box's near edge lies,
+                    // closest to it there; beside its line, none nearer
+                    // than its own.
+                    let near = share - LABEL_BOX_H / 2.0 / gap;
+                    let room = (STROKE_PAD + LABEL_CLEAR).max(off.abs() - w / 2.0);
+                    let clear = fan.iter().filter(|o| !std::ptr::eq(**o, *l)).all(|o| {
+                        let ob = fan_line_at(o, near);
+                        ob < x0 - room || ob > x1 + room
+                    });
+                    if rows.len() <= r {
+                        rows.resize(r + 1, Vec::new());
+                    }
+                    let free = rows[r]
+                        .iter()
+                        .all(|&(a, z)| z + FAN_SIBLING_GAP <= x0 || x1 + FAN_SIBLING_GAP <= a);
+                    if clear && free {
+                        rows[r].push((x0, x1));
+                    }
+                    (clear, clear && free)
+                };
+                let mut lined = false;
+                for &(r, share) in &shares {
+                    let (clear, taken) = take(r, share, 0.0);
+                    if taken {
+                        return true;
+                    }
+                    lined |= clear;
+                }
+                // Beside it only when no row on its line is clear of the
+                // other lines: away from the nearer one first, then
+                // toward it; LABEL_SIDE_AIR off, else half off.
+                if !beside || lined {
+                    return false;
+                }
+                let toward = fan
+                    .iter()
+                    .filter(|o| !std::ptr::eq(**o, *l))
+                    .map(|o| o.to - l.to)
+                    .min_by(|a, b| a.abs().total_cmp(&b.abs()))
+                    .unwrap_or(0.0);
+                let side = if toward > 0.0 { -1.0 } else { 1.0 };
+                let offs = [w / 2.0 + LABEL_SIDE_AIR, w / 2.0 - LABEL_STRADDLE];
+                shares.iter().any(|&(r, share)| {
+                    [side, -side]
+                        .into_iter()
+                        .any(|s| offs.into_iter().any(|o| take(r, share, s * o).1))
+                })
+            })
+        })
+    };
+    let least = need.max(fan_gap(LABEL_BOX_H / 2.0));
+    let mut gap = least;
+    while gap <= least + FAN_GAP_MAX {
+        if fits(gap) {
+            return Some(gap);
+        }
+        gap += LABEL_CLEAR / 2.0;
+    }
+    None
+}
+
+/// Breadths the coordinate stage spaces nodes by: `absize`, with the
+/// far ends of a TD/BT compact branch point's fan widened when its
+/// labels are too wide for rows (`fan_rows_gap` finds no gap where each
+/// sits on its own line clear of the others' lines), so they can sit
+/// side by side as mermaid lays them out (its labels are nodes). The
+/// estimate packs the far ends side by side in their layer's order, the
+/// point centred over them; each widened end gets its label's width,
+/// [`FAN_SIBLING_GAP`] to its neighbour and room for both ends' lines
+/// to lean (see `scene::anchor`), less the node gap. Parallel lines to
+/// one end (two transitions to one state) put their labels beside them
+/// instead: when those find no spot, that end alone is widened, by
+/// [`FAN_TWIN_STEP`]s, until they do (see [`fan_twin_room`]). The boxes
+/// keep their size. `None` when no fan needs it.
+#[allow(clippy::too_many_arguments)]
+fn fan_label_room(
+    g: &Graph,
+    back: &[bool],
+    layers: &[Vec<usize>],
+    alayer: &[usize],
+    absize: &[f64],
+    alsize: &[f64],
+    n: usize,
+    horizontal: bool,
+) -> Option<Vec<f64>> {
+    let branch = |v: usize| is_branch_point(g.nodes[v].shape, &g.nodes[v].label);
+    if horizontal || !(0..g.nodes.len()).any(branch) {
+        return None;
+    }
+    let par = crate::scene::parallel_offsets(g);
+    let reach = parallel_reach(g, &par);
+    // Per (point, far layer): its labelled short fan lines.
+    let mut fans: BTreeMap<(usize, usize), Vec<FanLabel>> = BTreeMap::new();
+    for (ei, e) in g.edges.iter().enumerate() {
+        if e.from == e.to || back[ei] || matches!(e.kind, EdgeKind::Invisible) {
+            continue;
+        }
+        let (p, far) = match (branch(e.from), branch(e.to)) {
+            (true, false) => (e.from, e.to),
+            (false, true) => (e.to, e.from),
+            _ => continue,
+        };
+        let Some(lbl) = &e.label else { continue };
+        if alayer[p].abs_diff(alayer[far]) != 1 {
+            continue;
+        }
+        let w = text_width(lbl) + LABEL_PAD_W;
+        fans.entry((p, alayer[far]))
+            .or_default()
+            .push((far, w, par[ei], reach[ei]));
+    }
+    // How far a line leans off its far end's centre at most.
+    let flat = |v: usize| match g.nodes[v].shape {
+        Shape::Diamond
+        | Shape::Circle
+        | Shape::DoubleCircle
+        | Shape::StateStart
+        | Shape::StateEnd
+        | Shape::ForkBar => 0.0,
+        shape => port_lean(shape, (absize[v], alsize[v]), f64::MAX, 0.0).abs(),
+    };
+    let mut out: Option<Vec<f64>> = None;
+    for ((p, li), fan) in fans {
+        let mut ends: Vec<usize> = fan.iter().map(|l| l.0).collect();
+        ends.sort_unstable();
+        ends.dedup();
+        if ends.len() < 2 {
+            continue;
+        }
+        let layer = &layers[li];
+        // The ends reached by parallel lines.
+        let twins: Vec<usize> = ends
+            .iter()
+            .copied()
+            .filter(|&v| fan.iter().filter(|l| l.0 == v).count() > 1)
+            .collect();
+        // The fan's lines with the far ends spaced by `sep`.
+        let lines = |sep: &[f64]| -> Vec<FanLine> {
+            let mut pos = vec![0.0; layer.len()];
+            for i in 1..layer.len() {
+                pos[i] = pos[i - 1] + pair_sep(layer[i - 1], layer[i], n, sep, None, None, None);
+            }
+            let at = |v: usize| layer.iter().position(|&w| w == v).map(|i| pos[i]);
+            let bp = if twins.is_empty() {
+                let (lo, hi) = ends
+                    .iter()
+                    .filter_map(|&v| at(v))
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |m, b| {
+                        (m.0.min(b), m.1.max(b))
+                    });
+                (lo + hi) / 2.0
+            } else {
+                // The coordinate stage aligns the point with the median
+                // of its lines' far ends: an end reached twice pulls it
+                // that much nearer.
+                let mut all: Vec<f64> = fan.iter().filter_map(|l| at(l.0)).collect();
+                all.sort_by(f64::total_cmp);
+                let k = all.len();
+                if k == 0 {
+                    0.0
+                } else {
+                    (all[(k - 1) / 2] + all[k / 2]) / 2.0
+                }
+            };
+            fan.iter()
+                .filter_map(|&(v, w, off, reach)| {
+                    let b = at(v)?;
+                    let lean = if flat(v) > 0.0 {
+                        let size = (absize[v], alsize[v]);
+                        fan_end_lean(g.nodes[v].shape, size, bp - b, off, reach)
+                    } else {
+                        off
+                    };
+                    Some(FanLine {
+                        point: p,
+                        from: bp + (b - bp).clamp(-CHOICE_SIZE / 4.0, CHOICE_SIZE / 4.0),
+                        to: b + lean,
+                        // Between two twins a label has no clear spot.
+                        width: (off.abs() >= reach).then_some(w),
+                    })
+                })
+                .collect()
+        };
+        let now = lines(absize);
+        if fan_rows_fit(&now, 0.0, false).is_some()
+            || !twins.is_empty() && fan_rows_fit(&now, 0.0, true).is_some()
+        {
+            continue;
+        }
+        if twins.is_empty() {
+            let sep = out.get_or_insert_with(|| absize.to_vec());
+            for &v in &ends {
+                let w = fan
+                    .iter()
+                    .filter(|l| l.0 == v)
+                    .map(|l| l.1)
+                    .fold(0.0, f64::max);
+                sep[v] = sep[v].max(w + FAN_SIBLING_GAP + 2.0 * flat(v) - GAP_B);
+            }
+        } else if let Some(room) =
+            fan_twin_room(out.as_deref().unwrap_or(absize), &twins, &fan, &lines)
+        {
+            out = Some(room);
+        }
+    }
+    out
+}
+
+/// A labelled line of a compact branch point's fan, as
+/// [`fan_label_room`] estimates it: (far end, label width, parallel
+/// offset, parallel reach; see [`fan_end_lean`]).
+type FanLabel = (usize, f64, f64, f64);
+
+/// Step (px) by which [`fan_twin_room`] widens a far end.
+const FAN_TWIN_STEP: f64 = LABEL_CLEAR;
+
+/// Rows of labels past the first that [`fan_twin_room`] lets a fan's gap
+/// grow by before it widens the far ends further instead.
+const FAN_TWIN_ROWS: f64 = 2.0;
+
+/// `sep` with the far ends `twins` (each reached by parallel lines of
+/// the fan `fan`) widened by the fewest [`FAN_TWIN_STEP`]s that let the
+/// fan's labels fit in rows, the twins' beside their lines (`lines`
+/// draws the fan for a spacing), in a gap of at most [`FAN_TWIN_ROWS`]
+/// more rows than one; failing that, the fewest that fit at all. The
+/// ends grow by at most twice the widest of their labels, one label
+/// either side. `None` when even that leaves no room.
+fn fan_twin_room(
+    sep: &[f64],
+    twins: &[usize],
+    fan: &[FanLabel],
+    lines: &dyn Fn(&[f64]) -> Vec<FanLine>,
+) -> Option<Vec<f64>> {
+    let most = twins
+        .iter()
+        .map(|&v| {
+            fan.iter()
+                .filter(|l| l.0 == v)
+                .map(|l| l.1)
+                .fold(0.0, f64::max)
+        })
+        .fold(0.0, f64::max);
+    let steps = (2.0 * most / FAN_TWIN_STEP).ceil() as usize;
+    let compact = fan_gap(LABEL_BOX_H / 2.0) + FAN_TWIN_ROWS * (LABEL_BOX_H + LABEL_CLEAR);
+    let mut first: Option<Vec<f64>> = None;
+    let mut room = sep.to_vec();
+    for k in 1..=steps {
+        for &v in twins {
+            room[v] = sep[v] + k as f64 * FAN_TWIN_STEP;
+        }
+        match fan_rows_fit(&lines(&room), 0.0, true) {
+            Some(gap) if gap <= compact => return Some(room),
+            Some(_) if first.is_none() => first = Some(room.clone()),
+            _ => {}
+        }
+    }
+    first
+}
 
 /// Line height for multi-line labels (`<br/>` → newline).
 pub const LINE_H: f64 = 17.0;
@@ -193,6 +898,11 @@ pub(crate) fn title_extra(title: &str) -> f64 {
 pub fn text_width(s: &str) -> f64 {
     s.split('\n')
         .map(|l| {
+            // No tag and no `$$` fence: one plain run (what `spans`
+            // would return), measured without building it.
+            if !l.contains(['<', '$']) {
+                return line_width(l);
+            }
             spans(l)
                 .iter()
                 .map(|(t, b, _)| line_width(t) * if *b { 1.06 } else { 1.0 })
@@ -352,22 +1062,155 @@ pub(crate) fn wrap_text(s: &str, max_w: f64, scale: f64) -> String {
             out.push(line.to_string());
             continue;
         }
-        let mut cur = String::new();
-        for word in line.split(' ').filter(|w| !w.is_empty()) {
-            if cur.is_empty() {
-                cur.push_str(word);
-                continue;
-            }
-            let cand = format!("{cur} {word}");
-            if text_width(&cand) * scale > max_w {
-                out.push(std::mem::replace(&mut cur, word.to_string()));
-            } else {
-                cur = cand;
-            }
-        }
-        out.push(cur);
+        let words: Vec<&str> = line.split(' ').filter(|w| !w.is_empty()).collect();
+        let starts = crate::wrap::greedy(words.len(), max_w, |i, j| {
+            text_width(&words[i..j].join(" ")) * scale
+        });
+        out.extend(lines_at(&words, &starts));
     }
     out.join("\n")
+}
+
+/// `words` joined into the lines starting at `starts` (see
+/// [`crate::wrap`]), one space between words.
+fn lines_at(words: &[&str], starts: &[usize]) -> Vec<String> {
+    starts
+        .iter()
+        .enumerate()
+        .map(|(k, &s)| words[s..starts.get(k + 1).copied().unwrap_or(words.len())].join(" "))
+        .collect()
+}
+
+/// Width (px, at [`TEXT_CALIBRATION`]) a node label without a line break
+/// of its own wraps at by default ([`wrap_label`], report M7): mermaid's
+/// documented `flowchart.wrappingWidth` default. Mermaid 12.2.0 draws its
+/// node labels narrower, at 120 px of its 14 px text (the size
+/// flowmaid's estimate is calibrated at; measured on flowchart and
+/// state nodes alike), but at 120 px or 150 px a dense drawing's three-
+/// and four-word labels turn into two-line blocks that reshuffle its
+/// layering — dense-td's canvas went 4 249 -> 6 687 px wide and its
+/// drawn crossings 93 -> 214 — while at 200 px only real sentences wrap
+/// (long-labels' 410 px title and 361 px question), and the dense
+/// fixtures barely move. A diagram that wants mermaid 12's look sets
+/// `%%{init: {"flowchart": {"wrappingWidth": 120}}}%%`, or
+/// `wrappingWidth: 120` under `config.flowchart` in its frontmatter
+/// ([`Graph::wrapping_width`]).
+pub const WRAP_WIDTH: f64 = 200.0;
+
+/// Node `node`'s label as it shows when labels wrap at `width` px
+/// (`measure`: a line's width at [`TEXT_CALIBRATION`], as for
+/// [`intrinsic_size_with`]; report M7). A label that breaks its own
+/// lines (`<br/>`, a markdown string's newlines — already `\n`) or fits
+/// comes back as it is; any other is broken at its spaces (and between
+/// CJK characters, which break without them) into as few lines as keep
+/// each within `width`, the lines evened out so no word is left
+/// stranded on the last. `<b>` / `<i>` markup is kept, re-opened on
+/// each line it spans. A word wider than `width` is never split (mermaid
+/// does the same): its line sets the width the others may fill to, and
+/// a lone word beside it joins it.
+///
+/// Shapes that grow both ways with their text — decision diamonds,
+/// circles — wrap at `width` / [`DIAMOND_ASPECT_MAX`]: a rhombus is 1.6
+/// times as wide as its text, so a decision is then no wider than a box
+/// wrapping at `width` (and a long label no longer swells a circle).
+/// A diamond that wraps takes as many lines as make its rhombus the
+/// smallest, never flatter than [`DIAMOND_ASPECT_MAX`]
+/// ([`intrinsic_size_wrapped`]); one whose label fits keeps its compact
+/// one-line rhombus. The label in the model never changes: this is what
+/// [`intrinsic_size_wrapped`] sizes the node for, and what the scene's
+/// node label and the SVG show.
+pub fn wrap_label(node: &Node, width: f64, measure: impl Fn(&str) -> f64) -> String {
+    fit_label(node, Some(width), &measure).text
+}
+
+/// A node label as [`wrap_label`] lays it out.
+#[derive(Clone)]
+pub(crate) struct Fit {
+    /// The lines as drawn (`\n`-separated markup).
+    pub(crate) text: String,
+    /// The label was too long for its shape's wrapping width (wrapped,
+    /// or a word too long to wrap): a diamond then keeps within
+    /// [`DIAMOND_ASPECT_MAX`] ([`intrinsic_size_wrapped`]).
+    long: bool,
+}
+
+/// Most lines a wrapping diamond takes past what its width needs, in
+/// search of its smallest rhombus ([`fit_label`]).
+const DIAMOND_DEEPEN_MAX: usize = 3;
+
+/// [`wrap_label`] at `width` (`None`: never wrap), and whether the
+/// label was long for its shape.
+pub(crate) fn fit_label(node: &Node, width: Option<f64>, measure: &dyn Fn(&str) -> f64) -> Fit {
+    let label = node.label.as_str();
+    let keep = |long| Fit {
+        text: label.to_string(),
+        long,
+    };
+    // `$$…$$` math reads as one italic run without its fences
+    // ([`spans`]): kept whole rather than rebuilt without them.
+    let Some(width) = width.filter(|_| !label.contains('\n') && !label.contains("$$")) else {
+        return keep(false);
+    };
+    let width = match node.shape {
+        Shape::Diamond | Shape::Circle | Shape::DoubleCircle => width / DIAMOND_ASPECT_MAX,
+        _ => width,
+    };
+    if measure(label) <= width {
+        return keep(false);
+    }
+    let text = if label.contains('<') {
+        wrap_runs(node.shape, &spans(label), width, measure)
+    } else {
+        wrap_runs(node.shape, &[(label, false, false)], width, measure)
+    };
+    Fit { text, long: true }
+}
+
+/// The styled runs of a one-line label wrapped at `width` for a node
+/// of shape `shape` ([`fit_label`]), as `\n`-separated markup.
+fn wrap_runs<S: AsRef<str>>(
+    shape: Shape,
+    runs: &[(S, bool, bool)],
+    width: f64,
+    measure: &dyn Fn(&str) -> f64,
+) -> String {
+    let toks = crate::wrap::Tokens::new(runs);
+    let w = toks.widths(measure);
+    let mut starts = crate::wrap::wrap(&w, width);
+    if shape == Shape::Diamond && starts.len() > 1 {
+        // The rhombus `intrinsic_size_wrapped` draws round lines starting
+        // at `st` (its width, and its height at its text's): fewer,
+        // wider lines make it flat. The question takes a line more while
+        // that keeps it within [`DIAMOND_ASPECT_MAX`] at its text's
+        // height — a narrower, deeper block fills a rhombus better than
+        // a wide one; when no depth up to [`DIAMOND_DEEPEN_MAX`] lines
+        // more does, the one whose capped rhombus is smallest.
+        let rhombus = |st: &[usize]| {
+            let dw = ((w.widest_line(st) + 24.0) * 1.6).max(80.0);
+            (dw, (BASE_H + (st.len() - 1) as f64 * LINE_H) * 1.7)
+        };
+        let fits = |(dw, dh): (f64, f64)| dw <= dh * DIAMOND_ASPECT_MAX;
+        let area = |(dw, dh): (f64, f64)| dw * dh.max(dw / DIAMOND_ASPECT_MAX);
+        let room = width.max(w.widest_line(&starts));
+        let k0 = starts.len();
+        let mut best = (area(rhombus(&starts)), starts.clone());
+        let mut k = k0;
+        while !fits(rhombus(&starts)) && k < k0 + DIAMOND_DEEPEN_MAX {
+            k += 1;
+            let Some(st) = crate::wrap::into_lines(w.len(), k, room, |i, j| w.line(i, j)) else {
+                break;
+            };
+            let a = area(rhombus(&st));
+            if a < best.0 {
+                best = (a, st.clone());
+            }
+            starts = st;
+        }
+        if !fits(rhombus(&starts)) {
+            starts = best.1;
+        }
+    }
+    toks.lines(&starts).join("\n")
 }
 
 /// Width of a single line (Helvetica at [`TEXT_CALIBRATION`] px)
@@ -404,11 +1247,34 @@ fn line_width(s: &str) -> f64 {
 /// the estimated widest-line width, and the number of label lines.
 ///
 /// Uses the built-in Helvetica estimate ([`text_width`]). Embedders
-/// whose renderer uses a REAL font should use [`intrinsic_size_with`]
-/// and feed the sizes to `scene::scene_sized` — that is the documented
-/// path for accurate node boxes (issue #14).
+/// whose renderer uses a REAL font should size nodes with
+/// [`intrinsic_size_wrapped`] (or [`intrinsic_size_with`] at the default
+/// width) and feed the sizes, with the same measure, to
+/// `scene::scene_sized_with` / `scene::route_sized_with` — that is the
+/// documented path for accurate node boxes (issue #14), whose label
+/// lines are the ones the boxes were sized for.
 pub fn intrinsic_size(node: &Node) -> (f64, f64) {
     intrinsic_size_with(node, text_width)
+}
+
+/// Height (px) a cylinder adds over its text for its caps.
+const CYLINDER_CAPS_H: f64 = 16.0;
+/// Deepest (px) a cylinder's cap ellipse gets ([`cylinder_cap_ry`]): 2 px
+/// past the old fixed 8. Mermaid's lid keeps deepening (15 px on a
+/// 200 px drum), but here a deeper lid curves the flanks in so far that
+/// an over-full side's corner ports (met as the box's) float off them:
+/// dense-lr's 12-edge hub, 6.8 px at 13.5.
+const CYLINDER_RY_MAX: f64 = 10.0;
+
+/// Half height (px) of a cylinder's cap ellipse on a node `w` px wide:
+/// mermaid's `rx / (2.5 + w / 50)` (`rx = w / 2`), so a narrow drum
+/// gets a shallower lid (7.5 px on the narrowest node), up to
+/// [`CYLINDER_RY_MAX`] from about 80 px wide. The node keeps its size
+/// ([`intrinsic_size_with`]: [`CYLINDER_CAPS_H`] over its text), and the
+/// painters take at most a quarter of a host-sized node's height.
+pub(crate) fn cylinder_cap_ry(w: f64) -> f64 {
+    let w = w.max(0.0);
+    ((w / 2.0) / (2.5 + w / 50.0)).min(CYLINDER_RY_MAX)
 }
 
 /// [`intrinsic_size`] with an injectable text measurer: `measure`
@@ -419,9 +1285,31 @@ pub fn intrinsic_size(node: &Node) -> (f64, f64) {
 /// the same public constants ([`PAD_X`], [`BASE_H`], [`MIN_W`],
 /// [`LINE_H`]) the engine uses.
 pub fn intrinsic_size_with(node: &Node, measure: impl Fn(&str) -> f64) -> (f64, f64) {
-    let tw = node.label.split('\n').map(&measure).fold(0.0, f64::max);
+    intrinsic_size_wrapped(node, Some(WRAP_WIDTH), measure)
+}
+
+/// [`intrinsic_size_with`] for labels that wrap at `wrapping_width`
+/// ([`Graph::wrapping_width`]: `None` keeps every label on the lines it
+/// was written with): the node sized for its label as [`wrap_label`]
+/// breaks it. For a diagram's own width, as its scene lays it out:
+/// `intrinsic_size_wrapped(&g.nodes[v], g.wrapping_width(), measure)`
+/// — and pass the same `measure` to `scene::scene_sized_with` /
+/// `scene::route_sized_with`, so the lines the scene hands out for each
+/// node are the ones its box was sized for.
+pub fn intrinsic_size_wrapped(
+    node: &Node,
+    wrapping_width: Option<f64>,
+    measure: impl Fn(&str) -> f64,
+) -> (f64, f64) {
+    fit_size(node, &fit_label(node, wrapping_width, &measure), &measure)
+}
+
+/// The size of node `node` drawn with its label laid out as `fit`.
+pub(crate) fn fit_size(node: &Node, fit: &Fit, measure: &dyn Fn(&str) -> f64) -> (f64, f64) {
+    let label = fit.text.as_str();
+    let tw = label.split('\n').map(measure).fold(0.0, f64::max);
     // Height grows with extra label lines beyond the first.
-    let extra = (line_count(&node.label) - 1) as f64 * LINE_H;
+    let extra = (line_count(label) - 1) as f64 * LINE_H;
     let base_h = BASE_H + extra;
     match node.shape {
         Shape::Rect | Shape::Rounded => ((tw + 2.0 * PAD_X).max(MIN_W), base_h),
@@ -433,10 +1321,30 @@ pub fn intrinsic_size_with(node: &Node, measure: impl Fn(&str) -> f64) -> (f64, 
         }
         // Hexagon points eat horizontal space.
         Shape::Hexagon => ((tw + 2.0 * PAD_X + 28.0).max(MIN_W + 28.0), base_h),
-        // Cylinder caps add vertical room.
-        Shape::Cylinder => ((tw + 2.0 * PAD_X).max(MIN_W), base_h + 16.0),
-        // Diamonds need extra room so the text fits in the middle.
-        Shape::Diamond => (((tw + 24.0) * 1.6).max(80.0), base_h * 1.7),
+        // Cylinder caps add vertical room (two of the narrowest caps: a
+        // wider drum's deeper lid takes from its body, and its label
+        // drops below the lid, see `scene::CYLINDER_LABEL_DROP`).
+        Shape::Cylinder => ((tw + 2.0 * PAD_X).max(MIN_W), base_h + CYLINDER_CAPS_H),
+        // A diamond with nothing to say is a branch point (a state
+        // `<<choice>>`, or a flowchart `A{ }`): compact, mermaid-style.
+        Shape::Diamond if is_branch_point(node.shape, &node.label) => (CHOICE_SIZE, CHOICE_SIZE),
+        // Diamonds need extra room so the text fits in the middle. One
+        // whose label was too long for it ([`fit_label`]: wrapped, or a
+        // word too long to) is never flatter than [`DIAMOND_ASPECT_MAX`]
+        // (report §2.12: 616 x 65 on long-labels), while a short label
+        // keeps its compact one-line rhombus (report §6).
+        Shape::Diamond => {
+            let w = ((tw + 24.0) * 1.6).max(80.0);
+            let h = base_h * 1.7;
+            (
+                w,
+                if fit.long {
+                    h.max(w / DIAMOND_ASPECT_MAX)
+                } else {
+                    h
+                },
+            )
+        }
         Shape::Circle => {
             let d = (tw + 24.0).max(52.0).max(base_h);
             (d, d)
@@ -448,13 +1356,94 @@ pub fn intrinsic_size_with(node: &Node, measure: impl Fn(&str) -> f64) -> (f64, 
         // stateDiagram pseudostates: fixed size, no label.
         Shape::StateStart => (14.0, 14.0),
         Shape::StateEnd => (18.0, 18.0),
-        Shape::ForkBar => (60.0, 8.0),
+        Shape::ForkBar => BAR_SIZE,
     }
 }
 
 pub fn layout(g: &Graph) -> LayoutResult {
-    let sizes: Vec<(f64, f64)> = g.nodes.iter().map(intrinsic_size).collect();
-    layout_sized(g, &sizes)
+    layout_sized(g, &node_sizes(g))
+}
+
+/// Widest a decision diamond gets for its height: a 1.6 : 1 rhombus.
+pub const DIAMOND_ASPECT_MAX: f64 = 1.6;
+
+/// Every node's label as drawn and its intrinsic size, with the
+/// built-in text estimate, each label wrapped once at the graph's width
+/// ([`wrap_label`], [`intrinsic_size_wrapped`]): what `scene()`,
+/// `route()`, `route_partial()` and the compact fold lay out.
+pub(crate) fn node_texts(g: &Graph) -> (Vec<String>, Vec<(f64, f64)>) {
+    let ww = g.wrapping_width();
+    WRAP_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() > WRAP_MEMO_MAX {
+            memo.clear();
+        }
+        g.nodes
+            .iter()
+            .map(|n| {
+                // What the wrap depends on besides the text: the width, and
+                // whether the shape wraps narrower (round) or deepens (a
+                // diamond, see `fit_label`).
+                let how = (
+                    ww.map_or(u64::MAX, f64::to_bits),
+                    match n.shape {
+                        Shape::Diamond => 2u8,
+                        Shape::Circle | Shape::DoubleCircle => 1,
+                        _ => 0,
+                    },
+                );
+                let fit = match memo
+                    .get(n.label.as_str())
+                    .and_then(|v| v.iter().find(|(k, _)| *k == how))
+                {
+                    Some((_, fit)) => fit.clone(),
+                    None => {
+                        let fit = fit_label(n, ww, &text_width);
+                        memo.entry(n.label.clone())
+                            .or_default()
+                            .push((how, fit.clone()));
+                        fit
+                    }
+                };
+                let size = fit_size(n, &fit, &text_width);
+                (fit.text, size)
+            })
+            .unzip()
+    })
+}
+
+/// Most labels [`WRAP_MEMO`] holds before it starts over.
+const WRAP_MEMO_MAX: usize = 4096;
+
+/// A wrapping key: the graph's width (bits; `u64::MAX` for none) and the
+/// shape's wrapping class.
+type WrapKey = (u64, u8);
+
+thread_local! {
+    /// Node labels [`node_texts`] already wrapped with the built-in
+    /// estimate, by their text: every `route` / `route_partial` frame of
+    /// a drag lays out the same labels as the one before, and wrapping a
+    /// long label costs more than the edges round it. A memo of
+    /// [`fit_label`] — the answer is the same either way, so output stays
+    /// deterministic — dropped whole once it holds [`WRAP_MEMO_MAX`]
+    /// labels.
+    static WRAP_MEMO: std::cell::RefCell<std::collections::HashMap<String, Vec<(WrapKey, Fit)>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Every node's intrinsic size ([`node_texts`]).
+pub(crate) fn node_sizes(g: &Graph) -> Vec<(f64, f64)> {
+    node_texts(g).1
+}
+
+/// Every node's label as drawn when lines are measured by `measure`:
+/// wrapped at the graph's width ([`wrap_label`]).
+pub(crate) fn node_labels(g: &Graph, measure: &dyn Fn(&str) -> f64) -> Vec<String> {
+    let ww = g.wrapping_width();
+    g.nodes
+        .iter()
+        .map(|n| fit_label(n, ww, measure).text)
+        .collect()
 }
 
 /// Same as [`layout`] but with caller-provided node sizes (width,
@@ -515,7 +1504,12 @@ fn layout_core(
     );
     let groups: Vec<RankGroup> = rank_only.to_vec();
     let rk = rank(g, &groups);
-    let layer = rk.layer.clone();
+    let mut layer = rk.layer.clone();
+    if g.tight_sources {
+        if let Some(tight) = tighten_sources(g, &groups, &rk, &layer) {
+            layer = tight;
+        }
+    }
     // The search judges candidates on drawn crossings and hits; a graph
     // past the budget skips it and never pays for those measures.
     let search = within_search_budget(g);
@@ -535,7 +1529,7 @@ fn layout_core(
     if !search {
         return (st.best.lo, st.best.groups);
     }
-    if st.best.lo.total_b > RIBBON_ENTRY * st.best.lo.total_l {
+    if st.best.lo.total_b > RIBBON_ENTRY * st.best.depth {
         narrow(g, sizes, node_cluster, &mut st);
     }
     centre_largest(g, sizes, node_cluster, &mut st);
@@ -594,7 +1588,7 @@ impl State {
 /// at least STAGGER_MIN_GAIN while the drawn crossings stay within
 /// NARROW_CROSS_SLACK of the start, so narrowing never tangles.
 fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, st: &mut State) {
-    let ribbon = |p: &Placement| p.lo.total_b > ASPECT_TARGET * p.lo.total_l;
+    let ribbon = |p: &Placement| p.lo.total_b > ASPECT_TARGET * p.depth;
     let cap = crossing_budget(st.best.crossings);
     let packed_opts = Opts {
         compact: true,
@@ -701,10 +1695,11 @@ fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, 
     }
     // 3. Leaf staggering (graphviz `unflatten -l`): half the leaves of
     // the broadest layer step one layer out, so a fan of 12 boxes
-    // becomes two offset rows.
+    // becomes two offset rows — unless the graph keeps its leaves
+    // flat (`Graph::flat_leaves`).
     let mut tried: Vec<usize> = Vec::new();
     for _ in 0..STAGGER_MAX_ROUNDS {
-        if !ribbon(&st.best) {
+        if g.flat_leaves || !ribbon(&st.best) {
             break;
         }
         let Some((li, props)) = stagger_proposals(
@@ -1106,6 +2101,34 @@ fn rank(g: &Graph, rank_only: &[RankGroup]) -> Ranking {
         }
     }
 
+    // --- 3. Lead nodes (a state `note left of X`) one layer before
+    // their nearest target, as dagre's tight ranking puts them: the
+    // pass above parks every source on layer 0. Only a source moves, so
+    // no other node's layer depends on it; through a rank-only hub the
+    // target is the nearest member the hub ranks below it.
+    // A rank-only group linking into the node (a transition into its
+    // composite) only keeps it below the group's sources: the floor.
+    for &v in g.lead_nodes.iter().filter(|&&v| v < n) {
+        let into = |u: usize| adj[u].iter().any(|&(w, ei)| w == v && !back[ei]);
+        let has_in = (0..n).any(into);
+        let floor = (n..nx).filter(|&h| into(h)).map(|h| layer[h]).max();
+        let reach = |w: usize| -> Option<usize> {
+            if w < n {
+                Some(layer[w])
+            } else {
+                adj[w].iter().map(|&(t, _)| layer[t]).min()
+            }
+        };
+        let to = adj[v]
+            .iter()
+            .filter(|&&(_, ei)| !back[ei])
+            .filter_map(|&(w, _)| reach(w))
+            .min();
+        if let Some(to) = to.filter(|&t| !has_in && t > layer[v] + 1) {
+            layer[v] = (to - 1).max(floor.unwrap_or(0));
+        }
+    }
+
     layer.truncate(n);
     Ranking {
         back,
@@ -1337,6 +2360,9 @@ struct Placement {
     ckeys: Vec<(usize, f64)>,
     /// Estimated drawn breadth span ([`drawn_breadth`]).
     ext: (f64, f64),
+    /// The depth the ribbon tests read (G12): the judged layer lines'
+    /// (see `place`'s `layer_lines`).
+    depth: f64,
 }
 
 /// Steps 3 to 5 for one layering: dummy chains, ordering and
@@ -1379,6 +2405,9 @@ fn place(
     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
     // Per original edge: dummy chain in the edge's own from→to order.
     let mut edge_chain: Vec<Vec<usize>> = vec![Vec::new(); g.edges.len()];
+    // Adjacent pairs linked so far only by a 2-cycle's return edge,
+    // which stands in for the first forward edge of the pair.
+    let mut return_only: std::collections::HashSet<(usize, usize)> = Default::default();
     for (ei, e) in g.edges.iter().enumerate() {
         if e.from == e.to {
             continue; // self-loop — no layered path
@@ -1392,9 +2421,28 @@ fn place(
         };
         let (llo, lhi) = (alayer[lo], alayer[hi]);
         if lhi <= llo + 1 {
+            // A 2-cycle's return edge runs beside its twin across the
+            // gap: one link between the pair, not a second pull —
+            // whichever of the two is written first. A doubled link
+            // made BK's median land on the pair and pulled the node off
+            // the middle of its fan: lr's Service Layer sat level with
+            // Redis Cache instead of centred on Database / Redis when
+            // `CACHE --> SVC` came first (report Q8). Parallel FORWARD
+            // edges keep one link each: a twin pair then runs straight
+            // down its own column, which the twin curves and their
+            // labels are drawn for (deduplicated, a choice's
+            // `low`/`medium` twins slanted across the fan).
             if llo < lhi {
-                succs[lo].push(hi);
-                preds[hi].push(lo);
+                if back[ei] {
+                    if !succs[lo].contains(&hi) {
+                        succs[lo].push(hi);
+                        preds[hi].push(lo);
+                        return_only.insert((lo, hi));
+                    }
+                } else if !return_only.remove(&(lo, hi)) {
+                    succs[lo].push(hi);
+                    preds[hi].push(lo);
+                }
             }
             continue; // same or adjacent layer — no dummies
         }
@@ -1484,8 +2532,9 @@ fn place(
     // the one that must stay ordered for deterministic node numbering).
     let mut cluster_span: std::collections::BTreeMap<usize, (usize, usize)> =
         std::collections::BTreeMap::new();
-    // Extra layer-slot room per real node for title strips (see below).
-    let mut lextra = vec![0.0f64; n];
+    // Extra layer-slot room per real node for title strips, before and
+    // after it along the layer axis (see below).
+    let mut lextra = vec![(0.0f64, 0.0f64); n];
     // Per real node: frame reach (towards lower, higher layers).
     let mut reach = vec![(0.0f64, 0.0f64); n];
     if let Some(nc) = node_cluster {
@@ -1511,10 +2560,14 @@ fn place(
         // border-top nodes; the inflated slot is the compact stand-in),
         // so labels between ranks never land on the header text. Only
         // the slot grows — the node keeps its real size, so edges still
-        // end on its visible border. In LR/RL the strip lies across the
-        // breadth axis instead and is reserved there (compaction). In BT
-        // the layers are drawn bottom-up, so a box's screen top is its
-        // HIGHEST layer.
+        // end on its visible border — and only on the strip's side: the
+        // screen top's (report M8, §2.8). A slot grown on both sides
+        // left a strip's worth of dead room under every box's first row
+        // (86 px from it to the next where any other gap is 60). In
+        // LR/RL the strip lies across the breadth axis instead and is
+        // reserved there (compaction). In BT the layers are drawn
+        // bottom-up, so a box's screen top is its HIGHEST layer, the
+        // side after it along the layer axis.
         if !horizontal {
             let bt = matches!(g.direction, Direction::BT);
             for v in 0..n {
@@ -1525,7 +2578,7 @@ fn place(
                         extra += header[c];
                     }
                 }
-                lextra[v] = extra * 2.0;
+                lextra[v] = if bt { (0.0, extra) } else { (extra, 0.0) };
             }
         }
         // How far the frames a node opens / closes reach past it along
@@ -1687,9 +2740,37 @@ fn place(
         }
     }
     layers = best_layers;
+    // A note card beside a fork/join bar goes past the bar's branches
+    // in its layer, on its own side (after them for `right of`, before
+    // them for `left of`): between two branches it would push them
+    // apart under the bar spanning them.
+    for (card, bar) in bar_cards(g) {
+        let lv = &mut layers[alayer[card]];
+        let branch = |v: &usize| *v != card && (preds[bar].contains(v) || succs[bar].contains(v));
+        let (Some(first), Some(last)) = (lv.iter().position(branch), lv.iter().rposition(branch))
+        else {
+            continue;
+        };
+        let Some(at) = lv.iter().position(|&v| v == card) else {
+            continue;
+        };
+        let to = if g.lead_nodes.contains(&card) {
+            first.min(at)
+        } else {
+            last.max(at)
+        };
+        let v = lv.remove(at);
+        lv.insert(to, v);
+    }
     for lv in &layers {
         for (i, &v) in lv.iter().enumerate() {
             pos[v] = i as f64;
+        }
+    }
+    if clustered && !bar_cards(g).is_empty() {
+        let keys = cluster_keys(&layers, &apath, &border_side);
+        for lv in layers.iter_mut() {
+            enforce_contiguity(lv, &apath, &border_side, &mut pos, &keys);
         }
     }
     // A subgraph [`centre_largest`] moves: its key changes, every layer
@@ -1705,8 +2786,10 @@ fn place(
     // (G3), one crossing-neutral swap at a time. Like the rest of the
     // search it is skipped past the budget: on a layer of k nodes the
     // walk is up to k/2 swaps, each re-counting two gaps.
+    // A bar's note card stays beside the bar's branches (above).
     let big = if opts.judge {
         largest_free_node(sizes, node_cluster, &layers, &alayer)
+            .filter(|&v| bar_cards(g).iter().all(|&(card, _)| card != v))
     } else {
         None
     };
@@ -1722,20 +2805,55 @@ fn place(
         );
     }
     // --- 4. Coordinates ---
+    // A state's note card beside a fork/join bar is no branch of it: the
+    // bar centres over its branches (as `scene::fit_bars` sizes it) and
+    // the card takes the room beside them, so their link does not pull
+    // either. It still orders the layers.
+    let (cpreds, csuccs) = unlink_bar_cards(g, &preds, &succs);
+    let (preds_c, succs_c) = (&cpreds[..], &csuccs[..]);
     // Breadth positions (b axis) via Brandes-Köpf: four vertical
     // alignments (up/down × left/right), each compacted independently,
     // then combined by the per-node median. This is dagre's coordinate
     // assignment — it pins each long edge's dummy chain into a straight
     // vertical run and centres nodes over their aligned neighbours.
+    // The far ends of a compact branch point's fan whose labels need
+    // to sit side by side get the room (see `fan_label_room`).
+    let spaced = fan_label_room(g, back, &layers, &alayer, &absize, &alsize, n, horizontal);
+    // A self-looped node keeps its loop's reach (and NODE_SEP) from its
+    // high-side neighbour, where the scene draws the loop (report P0
+    // #13: a channel beside it ran through the loop's apex). A
+    // separation size counts on both sides; a node with no high-side
+    // neighbour needs none. The node's own half of the gap between
+    // neighbours (`pair_sep`: GAP_B / 2) already lies past its side, so
+    // only what the loop reaches beyond it widens the node (stress's
+    // `A ==> D` channel ran 54 px past the loop's apex, the canvas 72 px
+    // wider than it needed).
+    let loops = crate::scene::loop_reach(g);
+    let spaced = if loops.iter().any(|&r| r > 0.0) {
+        let mut sep = spaced.unwrap_or_else(|| absize.clone());
+        for lay in &layers {
+            for w in lay.windows(2) {
+                let v = w[0];
+                if v < n && loops[v] > 0.0 {
+                    let past = (loops[v] + NODE_SEP - GAP_B / 2.0).max(0.0);
+                    sep[v] = sep[v].max(absize[v] + 2.0 * past);
+                }
+            }
+        }
+        Some(sep)
+    } else {
+        spaced
+    };
+    let bsep: &[f64] = spaced.as_deref().unwrap_or(&absize);
     let mut bpos = coordinates_bk(
         n,
         na,
         nlayers,
         &layers,
-        &preds,
-        &succs,
+        preds_c,
+        succs_c,
         &alayer,
-        &absize,
+        bsep,
         if clustered { Some(&apath) } else { None },
         if clustered { Some(&border_side) } else { None },
         if clustered && horizontal {
@@ -1748,10 +2866,10 @@ fn place(
         compact_breadth(
             n,
             &layers,
-            &preds,
-            &succs,
+            preds_c,
+            succs_c,
             &alayer,
-            &absize,
+            bsep,
             if clustered { Some(&apath) } else { None },
             if clustered { Some(&border_side) } else { None },
             if clustered && horizontal {
@@ -1768,12 +2886,12 @@ fn place(
     let chains_b = |bpos: &[f64]| -> (f64, f64) {
         drawn_breadth(
             g,
-            back,
             node_cluster,
             &absize,
+            &alsize,
             &alayer,
             bpos,
-            edge_chain.iter().flatten().copied(),
+            &edge_chain,
         )
     };
     // A node already on a straight run with a neighbour stays: sliding it
@@ -1805,11 +2923,11 @@ fn place(
         };
         let half = absize[v] / 2.0;
         let lo = match s.checked_sub(1).map(|i| lay[i]) {
-            Some(l) => bpos[l] + pair_sep(l, v, n, &absize, ap, bs, hb),
+            Some(l) => bpos[l] + pair_sep(l, v, n, bsep, ap, bs, hb),
             None => ext.0 + half,
         };
         let hi = match lay.get(s + 1) {
-            Some(&r) => bpos[r] - pair_sep(v, r, n, &absize, ap, bs, hb),
+            Some(&r) => bpos[r] - pair_sep(v, r, n, bsep, ap, bs, hb),
             None => ext.1 - half,
         };
         // Only as far as needed: into the middle CENTRE_SLIDE_BAND of
@@ -1832,8 +2950,6 @@ fn place(
     // not meet: their pads and title strips stack up with nesting depth,
     // which can outgrow the gap, so a layer moves down until the frames
     // reaching across clear by FRAME_GAP.
-    let mut lcoord = vec![0.0f64; nlayers];
-    let mut cursor = MARGIN;
     let reach_of = |li: usize, side: usize| -> f64 {
         layers[li]
             .iter()
@@ -1844,22 +2960,213 @@ fn place(
     // An edge between ADJACENT layers has no dummy to reserve its
     // label a slot: the label sits mid-gap, between the two borders.
     // Per upper layer: (lower end, upper end, label extent along the
-    // layer axis, end room) for each labelled such edge — in LR/RL that
-    // extent is the label's width, which easily outgrows GAP_L. The end
-    // room (`Edge::end_room`, both ends summed: ER crow's feet) is gap
-    // the label may not take, so an edge carrying any also gets an
-    // entry without a label (extent 0): its glyphs must fit facing
-    // each other.
-    let mut short_labels: Vec<Vec<(usize, usize, f64, f64)>> = vec![Vec::new(); nlayers];
+    // layer axis, end room, whether a compact branch point's fan holds
+    // it) for each labelled such edge — in LR/RL that extent is the
+    // label's width, which easily outgrows GAP_L. The end room
+    // (`Edge::end_room`, both ends summed: ER crow's feet) is gap the
+    // label may not take, so an edge carrying any also gets an entry
+    // without a label (extent 0): its glyphs must fit facing each other.
+    // Last, the room past its label an LR / RL gap keeps (its glyphs and
+    // clearances, or a styled edge's stroke runs: `lr_label_room`). An
+    // end given as `None` is
+    // a frame border the edge is cut back to (`Graph::frame_cut`), on
+    // the farthest frame closing / opening on that layer.
+    type ShortLabel = (Option<usize>, Option<usize>, f64, f64, bool, f64);
+    let mut short_labels: Vec<Vec<ShortLabel>> = vec![Vec::new(); nlayers];
     // Per upper layer: (breadth centre, breadth extent, layer extent,
     // end room).
     let mut short_across: Vec<Vec<(f64, f64, f64, f64)>> = vec![Vec::new(); nlayers];
+    // Per upper layer: the lines of compact branch points' fans
+    // (exactly one end such a point, as the label stage tells them)
+    // between it and the layer before, labelled or not (see `FanLine`).
+    let mut fan_lines: Vec<Vec<FanLine>> = vec![Vec::new(); nlayers];
+    let branch = |v: usize| is_branch_point(g.nodes[v].shape, &g.nodes[v].label);
+    // Two transitions between one pair leave and reach it PARALLEL_GAP
+    // apart (as `scene::anchor` spreads their ports).
+    let par = if (0..g.nodes.len()).any(branch) {
+        crate::scene::parallel_offsets(g)
+    } else {
+        Vec::new()
+    };
+    let par_reach = parallel_reach(g, &par);
+    // A back-edge's lane leaves its source and enters its target by a
+    // leg across the gap beside that end, `crate::lanes::LANE_STUB` out
+    // (one `LANE_STAGGER` more per lane nested round it there), from a
+    // port at the edge of the side's usable span (one `LANE_STAGGER`
+    // further in per twin lane) to the lane past the node. A label
+    // centred in that gap on an edge of the same node, reaching across
+    // that span edge, keeps that leg's depth clear at both ends of the
+    // gap, or it lies on the legs (x6-rl-loops: `forward` over both
+    // `Gamma -> Alpha` lanes). Per labelled short edge: the room the
+    // legs take, summed for both ends of the gap. Only in LR / RL, where
+    // the label lies along the flow and fills the gap's length; a TD /
+    // BT label is a row tall and slides along its line past the legs.
+    let lane_par = if horizontal && par.is_empty() && back.iter().any(|&b| b) {
+        crate::scene::parallel_offsets(g)
+    } else {
+        par.clone()
+    };
+    let lane_legs = |ei: usize, lo: usize, hi: usize, across: f64| -> f64 {
+        if !horizontal {
+            return 0.0;
+        }
+        let e = &g.edges[ei];
+        let off = lane_par.get(ei).copied().unwrap_or(0.0);
+        let centre = (bpos[lo] + bpos[hi]) / 2.0 + off;
+        let (c0, c1) = (centre - across / 2.0, centre + across / 2.0);
+        let mut deepest = 0.0f64;
+        for v in [lo, hi] {
+            // Lanes with a leg on `v`'s side facing this gap: into `lo`
+            // (its downstream side), out of `hi` (its upstream side).
+            let legs: Vec<usize> = g
+                .edges
+                .iter()
+                .enumerate()
+                .filter(|&(bj, b)| {
+                    back[bj]
+                        && b.from != b.to
+                        && alayer[b.from].abs_diff(alayer[b.to]) > 1
+                        && if v == lo { b.to == v } else { b.from == v }
+                })
+                .map(|(bj, _)| bj)
+                .collect();
+            if legs.is_empty() || (e.from != v && e.to != v) {
+                continue;
+            }
+            let p = Placed {
+                b: bpos[v],
+                l: 0.0,
+                bsize: absize[v],
+                lsize: alsize[v],
+                layer: alayer[v],
+            };
+            let span = crate::lanes::port_span(g.nodes[v].shape, &p);
+            // Twin lanes (same far end) step their ports inward.
+            let twins = legs
+                .iter()
+                .map(|&bj| {
+                    let far = |b: &crate::model::Edge| if b.from == v { b.to } else { b.from };
+                    legs.iter()
+                        .filter(|&&bk| far(&g.edges[bk]) == far(&g.edges[bj]))
+                        .count()
+                })
+                .max()
+                .unwrap_or(1);
+            let inward = (twins - 1) as f64 * crate::lanes::LANE_STAGGER;
+            if c1 > span.1 - inward || c0 < span.0 + inward {
+                let depth =
+                    crate::lanes::LANE_STUB + (legs.len() - 1) as f64 * crate::lanes::LANE_STAGGER;
+                deepest = deepest.max(depth);
+            }
+        }
+        2.0 * deepest
+    };
     for (ei, e) in g.edges.iter().enumerate() {
-        let room = e.end_room.0 + e.end_room.1;
-        if e.label.is_none() && room <= 0.0 {
+        let short = alayer[e.from].abs_diff(alayer[e.to]) == 1;
+        // A stand-in for an edge that ends on a whole box (`K0 --> K1`,
+        // `Graph::frame_cut`) is drawn only between the borders it is cut
+        // back to; when those face each other across one gap its label
+        // lies there, though the stand-in runs on to members deeper
+        // inside (or back up, as a back-edge's does). Without room there
+        // two composites stacked 18 px apart had their labels cover the
+        // whole edge and its head (B7 review r4 #2). A stand-in whose
+        // own ends are adjacent is measured as any short edge, below.
+        if let Some(cut) = g
+            .frame_cut
+            .get(ei)
+            .filter(|c| c[0].is_some() || c[1].is_some())
+        {
+            if let (Some(lbl), false) = (
+                &e.label,
+                e.from == e.to || matches!(e.kind, EdgeKind::Invisible) || short,
+            ) {
+                let (lo, hi, lo_cut, hi_cut) = if alayer[e.from] < alayer[e.to] {
+                    (e.from, e.to, cut[0], cut[1])
+                } else {
+                    (e.to, e.from, cut[1], cut[0])
+                };
+                // The layer the border faces from: a box left on its
+                // last layer, entered on its first.
+                let lo_l = lo_cut
+                    .and_then(|c| cluster_span.get(&c))
+                    .map_or(alayer[lo], |s| s.1);
+                let hi_l = hi_cut
+                    .and_then(|c| cluster_span.get(&c))
+                    .map_or(alayer[hi], |s| s.0);
+                if hi_l == lo_l + 1 {
+                    let w = text_width(lbl) + LABEL_PAD_W;
+                    let ext = if horizontal { w } else { LABEL_BOX_H };
+                    let room = e.end_room.0 + e.end_room.1;
+                    let end = |v: usize, c: Option<usize>| c.is_none().then_some(v);
+                    short_labels[hi_l].push((
+                        end(lo, lo_cut),
+                        end(hi, hi_cut),
+                        ext,
+                        room,
+                        false,
+                        lr_label_room(e),
+                    ));
+                    // No row of its own among the gap's labels: where the
+                    // drawn run lies across the gap is up to the frames'
+                    // ports, not the stand-in's members, and a composite's
+                    // 2-cycle labels (`Idle --> Busy`, `Busy --> Idle`)
+                    // already stand beside their lines, as drawn before.
+                }
+                continue;
+            }
+        }
+        // A back-edge between adjacent layers is drawn across their gap
+        // (`crate::lanes`: nothing lies between its ends), its label
+        // there too: the gap fits it like a forward edge's (a 2-cycle's
+        // two labels side by side).
+        if e.from == e.to || (back[ei] && !short) || matches!(e.kind, EdgeKind::Invisible) {
             continue;
         }
-        if e.from == e.to || back[ei] || matches!(e.kind, EdgeKind::Invisible) {
+        let fan = match (branch(e.from), branch(e.to)) {
+            _ if back[ei] => None,
+            (true, false) => Some((e.from, e.to)),
+            (false, true) => Some((e.to, e.from)),
+            _ => None,
+        };
+        if let (Some((p, far)), true, false) = (fan, short, horizontal) {
+            // Near its far end a fan's line runs at that end's port,
+            // leaning toward the point on a box (see `scene::anchor`).
+            let off = par.get(ei).copied().unwrap_or(0.0);
+            let reach = par_reach.get(ei).copied().unwrap_or(0.0);
+            let lean = match g.nodes[far].shape {
+                Shape::Diamond
+                | Shape::Circle
+                | Shape::DoubleCircle
+                | Shape::StateStart
+                | Shape::StateEnd
+                | Shape::ForkBar => off,
+                shape => fan_end_lean(
+                    shape,
+                    (absize[far], alsize[far]),
+                    bpos[p] - bpos[far],
+                    off,
+                    reach,
+                ),
+            };
+            // It leaves the small diamond's border on the way to the far
+            // end's centre: about a quarter of the diamond off its centre
+            // for a slanted line.
+            let toward = bpos[far] - bpos[p];
+            fan_lines[alayer[e.from].max(alayer[e.to])].push(FanLine {
+                point: p,
+                from: bpos[p] + toward.clamp(-CHOICE_SIZE / 4.0, CHOICE_SIZE / 4.0),
+                to: bpos[far] + lean,
+                // A line with parallel twins on both sides has no spot
+                // clear of them for its label: no gap makes one.
+                width: e
+                    .label
+                    .as_ref()
+                    .filter(|_| off.abs() >= reach)
+                    .map(|l| text_width(l) + LABEL_PAD_W),
+            });
+        }
+        let room = e.end_room.0 + e.end_room.1;
+        if e.label.is_none() && room <= 0.0 {
             continue;
         }
         let (lo, hi) = if alayer[e.from] < alayer[e.to] {
@@ -1871,7 +3178,7 @@ fn place(
             continue;
         }
         let Some(lbl) = &e.label else {
-            short_labels[alayer[hi]].push((lo, hi, 0.0, room));
+            short_labels[alayer[hi]].push((Some(lo), Some(hi), 0.0, room, false, 0.0));
             continue;
         };
         let w = text_width(lbl) + LABEL_PAD_W;
@@ -1880,7 +3187,19 @@ fn place(
         } else {
             (LABEL_BOX_H, w)
         };
-        short_labels[alayer[hi]].push((lo, hi, ext, room));
+        // The label sits mid-gap, so room a class diagram keeps at
+        // either end of a labelled edge (`Graph::label_end_room`: glyph
+        // and cardinalities) is kept at both.
+        let label_room = 2.0 * g.label_end_room.get(ei).copied().unwrap_or(0.0);
+        let room = (room + label_room).max(lane_legs(ei, lo, hi, across));
+        short_labels[alayer[hi]].push((
+            Some(lo),
+            Some(hi),
+            ext,
+            room,
+            fan.is_some(),
+            lr_label_room(e),
+        ));
         // In LR/RL a row along the layer axis costs a label's whole
         // width, and the scene never uses it: colliding labels there
         // slide apart ACROSS the flow (they are only LABEL_BOX_H tall),
@@ -1897,6 +3216,10 @@ fn place(
     // the labels then slide along their own (slanted) curves to reach
     // a row, which never lands them exactly side by side. One row =
     // nothing overlaps = no requirement, so only colliding gaps grow.
+    // (Siblings that would read as one phrase are kept apart where the
+    // labels are placed, `labels::label_siblings`: the midpoint spans
+    // here are not where a hub's labels end up, and reserving sibling
+    // rows from them only grew a busy hub's gap.)
     let gap_need: Vec<f64> = short_across
         .iter_mut()
         .map(|spans| {
@@ -1921,55 +3244,214 @@ fn place(
                 + room
                 + 2.0 * LABEL_CLEAR * (rows.len() + 1) as f64
         })
+        .zip(&fan_lines)
+        .map(|(need, lines)| fan_rows_gap(lines, need))
         .collect();
-    let mut prev_lh = 0.0;
-    for li in 0..nlayers {
-        let lh = layers[li]
-            .iter()
-            .map(|&v| alsize[v] + lextra.get(v).copied().unwrap_or(0.0))
-            .fold(0.0f64, f64::max);
-        if clustered && li > 0 {
-            let at = lcoord[li - 1] + reach_of(li - 1, 1) + reach_of(li, 0) + FRAME_GAP;
-            if at > cursor + lh / 2.0 {
-                cursor = at - lh / 2.0;
+    let hub_need = if g.edge_paint_width.is_none() {
+        hub_label_room(g, back, &alayer, &bpos, &absize, nlayers, horizontal)
+    } else {
+        vec![Vec::new(); nlayers]
+    };
+    let gap_l = g.rank_gap.unwrap_or(GAP_L);
+    // Per lower layer: the least distance between its line and the one
+    // before it for every edge crossing a frame border in that gap to
+    // cross it clear of its lateral run (B7 review r1 #2, #3; report M8).
+    // A free curve drawn across a gap runs flattest midway between its
+    // ends, and the router's channel legs run there too; a box's title
+    // strip (with its pad) puts the box's border [`FRAME_PAD`] + header
+    // above its first row, which with the strip no longer doubled (M8)
+    // left the border 3 px off mid-gap: advanced's `Gate ==> Job Queue`
+    // rode 122 px along Async Workers' top (and was rerouted into an L
+    // inside it). Such a gap keeps the outermost border an edge's run
+    // crosses — a box entered or left, title strip or pad —
+    // [`FRAME_SEP`] off the run's middle, on the border's own side, when
+    // the run's ends lie more than [`TIGHT_RUN_MIN`] apart sideways (a
+    // steeper run crosses the border too steeply to ride it: Client ->
+    // Platform's straight drop keeps the gap). A border one pad deep
+    // never needs it (2 pads and 2 seps are under GAP_L); flowchart and
+    // state drawings only. (Borders a run only passes beside are left
+    // alone: keeping clear of those too re-laid dense-td 200 px deeper
+    // and bench-75 wider, and their routers then rode more borders.)
+    let cross_need: Vec<f64> = {
+        let mut need = vec![0.0f64; nlayers];
+        if clustered && g.edge_paint_width.is_none() {
+            let span_of = |c: usize| cluster_span.get(&c).copied();
+            let hdr_lo = matches!(g.direction, Direction::TD);
+            let hdr_hi = matches!(g.direction, Direction::BT);
+            for (ei, e) in g.edges.iter().enumerate() {
+                if e.from == e.to || matches!(e.kind, EdgeKind::Invisible) {
+                    continue;
+                }
+                // The edge's path down the layers (its chain is stored
+                // in from -> to order).
+                let chain = &edge_chain[ei];
+                let path: Vec<usize> = if alayer[e.from] <= alayer[e.to] {
+                    std::iter::once(e.from)
+                        .chain(chain.iter().copied())
+                        .chain(std::iter::once(e.to))
+                        .collect()
+                } else {
+                    std::iter::once(e.to)
+                        .chain(chain.iter().rev().copied())
+                        .chain(std::iter::once(e.from))
+                        .collect()
+                };
+                for w in path.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    let l = alayer[a];
+                    // A back-edge's skip is drawn in a lane.
+                    if alayer[b] != l + 1 || (bpos[a] - bpos[b]).abs() <= TIGHT_RUN_MIN {
+                        continue;
+                    }
+                    // How far past each end the outermost border it
+                    // crosses lies: the boxes left closing on `a`'s
+                    // layer and entered opening on `b`'s, a pad each and
+                    // the title strip on the screen-top side.
+                    let depth = |at: usize, from: usize, open: bool| -> f64 {
+                        apath[at]
+                            .iter()
+                            .filter(|c| !apath[from].contains(c))
+                            .filter(|&&c| {
+                                span_of(c)
+                                    .is_some_and(|s| if open { s.0 == l + 1 } else { s.1 == l })
+                            })
+                            .map(|&c| {
+                                let strip = if open { hdr_lo } else { hdr_hi };
+                                FRAME_PAD + if strip { header[c] } else { 0.0 }
+                            })
+                            .sum()
+                    };
+                    let d = depth(a, b, false).max(depth(b, a, true));
+                    if d > 0.0 {
+                        let ends = alsize[a] / 2.0 + alsize[b] / 2.0;
+                        need[l + 1] = need[l + 1].max(ends + 2.0 * (d + FRAME_SEP));
+                    }
+                }
             }
         }
-        // A label that would cover its own ends grows the gap until it
-        // clears both by LABEL_CLEAR; a label that already fits leaves
-        // the gap — and the whole layout — exactly as it was. An end
-        // whose frame closes / opens on its layer is reached past that
-        // frame's border (the layer's farthest one), not its own box:
-        // a label on the border line would hide it. End room counts as
-        // part of the ends: the label (or, without one, the other
-        // end's glyph) clears it by LABEL_CLEAR too.
-        for &(s, t, ext, room) in &short_labels[li] {
-            let lo_side = if reach[s].1 > 0.0 {
-                reach_of(li - 1, 1)
-            } else {
-                alsize[s] / 2.0
-            };
-            let hi_side = if reach[t].0 > 0.0 {
-                reach_of(li, 0)
-            } else {
-                alsize[t] / 2.0
-            };
-            let ends = lcoord[li - 1] + (lo_side + hi_side);
-            let at = cursor + lh / 2.0;
-            if at - ends < ext + room {
-                cursor = cursor.max(ends + room + ext + 2.0 * LABEL_CLEAR - lh / 2.0);
+        need
+    };
+    // The layer lines and the depth they span. `judged`: as the layout
+    // search judges a candidate (crossings, node hits, the ribbon tests)
+    // — a title strip's slot grown on both sides, a labelled gap only as
+    // deep as its label needs — which the drawing no longer takes (report
+    // M3, M8): the room those two keep or give back makes the drawing
+    // deeper or shallower without its layers being any fewer, and must
+    // not decide a layering or an ordering. (Judged on the drawn depth,
+    // dense-td — a 4.06 : 1 ribbon — went 3.9 : 1 with the head room and
+    // stayed 6 768 px broad, and with the strips' dead room gone its
+    // stacked candidates' skeletons, a row nearer, cut 8 more boxes.)
+    let layer_lines = |judged: bool| -> (Vec<f64>, f64) {
+        let mut lcoord = vec![0.0f64; nlayers];
+        let mut cursor = MARGIN;
+        let mut prev_after = 0.0;
+        for li in 0..nlayers {
+            // The layer's slot: how far it reaches before its line (the
+            // line sits `before` past the slot's start) and after it —
+            // its tallest node's halves plus any title strip on the
+            // strip's side (on both, `judged`).
+            let (before, after) = layers[li]
+                .iter()
+                .map(|&v| {
+                    let (x0, x1) = lextra.get(v).copied().unwrap_or((0.0, 0.0));
+                    if judged {
+                        let half = (alsize[v] + 2.0 * (x0 + x1)) / 2.0;
+                        (half, half)
+                    } else {
+                        (alsize[v] / 2.0 + x0, alsize[v] / 2.0 + x1)
+                    }
+                })
+                .fold((0.0f64, 0.0f64), |a, b| (a.0.max(b.0), a.1.max(b.1)));
+            if clustered && li > 0 {
+                let at = lcoord[li - 1] + reach_of(li - 1, 1) + reach_of(li, 0) + FRAME_GAP;
+                if at > cursor + before {
+                    cursor = at - before;
+                }
             }
-        }
-        if li > 0 && gap_need[li] > 0.0 {
-            let prev = lcoord[li - 1] + prev_lh / 2.0;
-            if cursor - prev < gap_need[li] {
-                cursor = prev + gap_need[li];
+            // A label that would cover its own ends grows the gap until
+            // it clears both by LABEL_CLEAR; a label that already fits
+            // leaves the gap — and the whole layout — exactly as it was.
+            // An end whose frame closes / opens on its layer is reached
+            // past that frame's border (the layer's farthest one), not
+            // its own box: a label on the border line would hide it. End
+            // room counts as part of the ends: the label (or, without
+            // one, the other end's glyph) clears it by LABEL_CLEAR too.
+            for &(s, t, ext, room, fan, lr_room) in &short_labels[li] {
+                let lo_side = match s {
+                    Some(s) if reach[s].1 <= 0.0 => alsize[s] / 2.0,
+                    _ => reach_of(li - 1, 1),
+                };
+                let hi_side = match t {
+                    Some(t) if reach[t].0 <= 0.0 => alsize[t] / 2.0,
+                    _ => reach_of(li, 0),
+                };
+                let ends = lcoord[li - 1] + (lo_side + hi_side);
+                let at = cursor + before;
+                // In a drawing the flowchart painter draws, a labelled
+                // gap keeps its label clear of the arrowhead too (report
+                // M3, §2.6): across TD / BT a [`LABEL_RUN`] on either
+                // side; along LR / RL, where the label is a whole width
+                // long, the head (each head of a double-headed edge) and
+                // a clearance on both sides — the label stage centres such
+                // a label on the run clear of its head
+                // (`labels::head_clear_spot`), so the clearance falls at
+                // both ends of the chip (`lr_label_room`). A styled edge's gap
+                // (dotted, thick, `linkStyle`-painted) keeps a run of its
+                // stroke in sight past those clearances too
+                // (`styled_room`), or the chip covers all but a dash of
+                // it and its style no longer reads. (Growing every LR
+                // gap by a `LABEL_RUN` either side re-laid dense-lr and
+                // drew wide-labels flatter than `MAX_ASPECT`.) (Class
+                // and ER scenes keep their glyph room in `room` and the
+                // plain rule.)
+                let flow = ext > 0.0 && g.edge_paint_width.is_none() && !judged;
+                let need = match (flow, horizontal) {
+                    (true, false) => Some(ext + 2.0 * LABEL_RUN),
+                    (true, true) => Some(ext + lr_room),
+                    (false, _) => None,
+                };
+                match need {
+                    Some(need) if at - ends < room + need => {
+                        cursor = cursor.max(ends + room + need - before);
+                    }
+                    // The plain rule grows a gap only where the label
+                    // does not fit at all.
+                    None if at - ends < ext + room => {
+                        cursor = cursor.max(ends + room + ext + 2.0 * LABEL_CLEAR - before);
+                    }
+                    _ => {}
+                }
+                if fan && at - ends < fan_gap(ext / 2.0) {
+                    cursor = cursor.max(ends + fan_gap(ext / 2.0) - before);
+                }
             }
+            // A hub fan's label clears its siblings' curves at its own
+            // curve's middle (`hub_label_room`), from box border to box
+            // border.
+            if !judged {
+                for &(s, t, need) in &hub_need[li] {
+                    let ends = lcoord[li - 1] + (alsize[s] + alsize[t]) / 2.0;
+                    if cursor + before - ends < need {
+                        cursor = ends + need - before;
+                    }
+                }
+            }
+            if li > 0 && gap_need[li] > 0.0 {
+                let prev = lcoord[li - 1] + prev_after;
+                if cursor - prev < gap_need[li] {
+                    cursor = prev + gap_need[li];
+                }
+            }
+            if !judged && li > 0 && cross_need[li] > 0.0 {
+                cursor = cursor.max(lcoord[li - 1] + cross_need[li] - before);
+            }
+            prev_after = after;
+            lcoord[li] = cursor + before;
+            cursor += before + after + gap_l;
         }
-        prev_lh = lh;
-        lcoord[li] = cursor + lh / 2.0;
-        cursor += lh + GAP_L;
-    }
-    let total_l = cursor - GAP_L + MARGIN;
+        (lcoord, cursor - gap_l + MARGIN)
+    };
+    let (lcoord, total_l) = layer_lines(false);
 
     // Normalise so the diagram starts at MARGIN (real-node extent).
     let mut minb = f64::INFINITY;
@@ -2009,11 +3491,22 @@ fn place(
                 .collect()
         })
         .collect();
+    // The search judges the candidate on its judged layer lines (see
+    // `layer_lines`).
+    let (jl, depth) = if opts.judge {
+        layer_lines(true)
+    } else {
+        (Vec::new(), total_l)
+    };
     let (crossings, hits, ext) = if opts.judge {
+        let paths: Vec<Vec<(f64, f64)>> = edge_chain
+            .iter()
+            .map(|chain| chain.iter().map(|&d| (bpos[d], jl[alayer[d]])).collect())
+            .collect();
         (
-            drawn_crossings(g, &edge_paths, |v| (bpos[v], lcoord[alayer[v]])),
-            node_hits(g, back, &edge_paths, |v| {
-                (bpos[v], lcoord[alayer[v]], absize[v], alsize[v])
+            drawn_crossings(g, &paths, |v| (bpos[v], jl[alayer[v]])),
+            node_hits(g, back, &paths, |v| {
+                (bpos[v], jl[alayer[v]], absize[v], alsize[v])
             }),
             chains_b(&bpos),
         )
@@ -2052,6 +3545,7 @@ fn place(
         hits,
         ckeys,
         ext,
+        depth,
     }
 }
 
@@ -2146,17 +3640,17 @@ fn centre_in_layer(
 
 /// Estimated breadth span `(lo, hi)` of what the scene will draw: every
 /// node with one FRAME_PAD per subgraph around it, every channel dummy
-/// (label slots included), and the sideways bow of every back-edge,
-/// which clears the nodes on the layers it spans by BOW_CLEAR plus half
-/// its label, on the side nearer its ends (as the scene draws it).
+/// (label slots included), and the lane of every back-edge, planned by
+/// the scene's own rule ([`back_lanes`]).
+#[allow(clippy::too_many_arguments)]
 fn drawn_breadth(
     g: &Graph,
-    back: &[bool],
     node_cluster: Option<&[Vec<usize>]>,
     absize: &[f64],
+    alsize: &[f64],
     alayer: &[usize],
     bpos: &[f64],
-    dummies: impl Iterator<Item = usize>,
+    edge_chain: &[Vec<usize>],
 ) -> (f64, f64) {
     let n = g.nodes.len();
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -2165,43 +3659,168 @@ fn drawn_breadth(
         lo = lo.min(bpos[v] - absize[v] / 2.0 - pad);
         hi = hi.max(bpos[v] + absize[v] / 2.0 + pad);
     }
-    for d in dummies {
+    for &d in edge_chain.iter().flatten() {
         lo = lo.min(bpos[d] - absize[d] / 2.0);
         hi = hi.max(bpos[d] + absize[d] / 2.0);
     }
-    for (ei, e) in g.edges.iter().enumerate() {
-        if !back[ei] || e.from == e.to || matches!(e.kind, EdgeKind::Invisible) {
-            continue;
-        }
-        let (l0, l1) = (
-            alayer[e.from].min(alayer[e.to]),
-            alayer[e.from].max(alayer[e.to]),
-        );
-        if l0 == l1 {
-            continue;
-        }
-        let (mut el, mut er) = (f64::INFINITY, f64::NEG_INFINITY);
-        for v in (0..n).filter(|&v| alayer[v] >= l0 && alayer[v] <= l1) {
-            el = el.min(bpos[v] - absize[v] / 2.0);
-            er = er.max(bpos[v] + absize[v] / 2.0);
-        }
-        let clear = BOW_CLEAR
-            + e.label
-                .as_ref()
-                .map_or(0.0, |l| text_width(l) + LABEL_PAD_W)
-                / 2.0;
-        let mid = (bpos[e.from] + bpos[e.to]) / 2.0;
-        if er + clear - mid <= mid - (el - clear) {
-            hi = hi.max(er + clear);
-        } else {
-            lo = lo.min(el - clear);
-        }
+    let at: Vec<Placed> = (0..n)
+        .map(|v| Placed {
+            b: bpos[v],
+            l: alayer[v] as f64,
+            bsize: absize[v],
+            lsize: alsize[v],
+            layer: alayer[v],
+        })
+        .collect();
+    let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
+    for (ei, lane) in back_lanes(g, &at, node_cluster, edge_chain, |d| {
+        (bpos[d], alayer[d] as f64)
+    }) {
+        let half = crate::lanes::label_breadth(g.edges[ei].label.as_deref(), horizontal) / 2.0;
+        lo = lo.min(lane.x - half);
+        hi = hi.max(lane.x + half);
     }
     if lo > hi {
         (0.0, 0.0)
     } else {
         (lo, hi)
     }
+}
+
+/// The lane of every back-edge that gets one (`(edge, lane)`; a state
+/// note card's link never does), by
+/// the rule [`crate::lanes`] states — the scene draws them, and the
+/// layout centres the drawing on them, from this one function. `at`
+/// holds every node with its LAYER INDEX as its `l` (whatever the
+/// caller's layer coordinates, the decisions are taken on the layers):
+/// what reaches into a back-edge's band is every node on a layer
+/// strictly between its ends, and a node on an end's own layer longer
+/// along the flow than that end by twice [`crate::lanes::LANE_REACH`]
+/// (it reaches that far past the end's side, nodes being centred on
+/// their layer). Inside subgraphs
+/// (`node_cluster`), the members of the innermost box holding both ends
+/// are its obstacles and the rest is foreign ([`crate::lanes::Want`]).
+/// The lane is judged for crossings against the skeletons of the other
+/// edges (end centres and channel points, `dummy(d)` = a dummy's
+/// (breadth, layer) — `edge_chain` lists each edge's), on the layers.
+pub(crate) fn back_lanes(
+    g: &Graph,
+    at: &[Placed],
+    node_cluster: Option<&[Vec<usize>]>,
+    edge_chain: &[Vec<usize>],
+    dummy: impl Fn(usize) -> (f64, f64),
+) -> Vec<(usize, crate::lanes::Lane)> {
+    use crate::lanes::{
+        blocks_direct, direct_port, label_breadth, plan, port_span, Skeleton, Want, LANE_CLEAR,
+    };
+    let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
+    let drawn = |e: &crate::model::Edge| e.from != e.to && !matches!(e.kind, EdgeKind::Invisible);
+    // A state note card's link elbows round as `scene::note_elbow` draws
+    // it, or crosses the gap: never a lane.
+    let card = |v: usize| {
+        let n = &g.nodes[v];
+        crate::style::is_note_card(&n.id, n.shape, &n.style)
+    };
+    let backs: Vec<usize> = (0..g.edges.len())
+        .filter(|&ei| {
+            let e = &g.edges[ei];
+            drawn(e) && at[e.to].layer < at[e.from].layer && !card(e.from) && !card(e.to)
+        })
+        .collect();
+    if backs.is_empty() {
+        return Vec::new();
+    }
+    let loops = crate::scene::loop_reach(g);
+    let skeletons: Vec<Skeleton> = g
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| drawn(e) && at[e.to].layer >= at[e.from].layer)
+        .map(|(ei, e)| {
+            let mut pts = vec![(at[e.from].b, at[e.from].l)];
+            pts.extend(edge_chain.get(ei).into_iter().flatten().map(|&d| dummy(d)));
+            pts.push((at[e.to].b, at[e.to].l));
+            Skeleton::new((e.from, e.to), pts)
+        })
+        .collect();
+    let shared = |e: &crate::model::Edge| -> Vec<usize> {
+        node_cluster.map_or_else(Vec::new, |nc| {
+            nc[e.from]
+                .iter()
+                .zip(&nc[e.to])
+                .take_while(|(x, y)| x == y)
+                .map(|(x, _)| *x)
+                .collect()
+        })
+    };
+    let wants: Vec<Want> = backs
+        .iter()
+        .map(|&ei| {
+            let e = &g.edges[ei];
+            let (a, b) = (&at[e.from], &at[e.to]);
+            let box_of = shared(e);
+            let (mut obstacles, mut foreign) = (Vec::new(), Vec::new());
+            let (mut between, mut beside) = (Vec::new(), Vec::new());
+            let reach = 2.0 * crate::lanes::LANE_REACH;
+            for (v, p) in at.iter().enumerate() {
+                if v == e.from || v == e.to {
+                    continue;
+                }
+                // A self-loop beside the node is in the way too.
+                let span = (p.b - p.bsize / 2.0, p.b + p.bsize / 2.0 + loops[v]);
+                if p.layer > b.layer && p.layer < a.layer {
+                    between.push(span);
+                } else if p.layer == a.layer && p.lsize > a.lsize + reach {
+                    beside.push((span, true));
+                } else if p.layer == b.layer && p.lsize > b.lsize + reach {
+                    beside.push((span, false));
+                } else {
+                    continue;
+                }
+                if node_cluster.map_or(true, |nc| nc[v].starts_with(&box_of)) {
+                    obstacles.push(span);
+                } else {
+                    foreign.push(span);
+                }
+            }
+            let label = label_breadth(e.label.as_deref(), horizontal);
+            let (sa, sb) = (g.nodes[e.from].shape, g.nodes[e.to].shape);
+            let ports = (direct_port(sa, a, b.b), direct_port(sb, b, a.b));
+            Want {
+                key: (a.layer - b.layer) as f64,
+                band: (b.layer as f64, a.layer as f64),
+                obstacles,
+                foreign,
+                blocked: blocks_direct(&between, &beside, ports, label / 2.0),
+                clear: LANE_CLEAR + label / 2.0,
+                label_half: label / 2.0,
+                spans: [port_span(sa, a), port_span(sb, b)],
+                ends: (e.from, e.to),
+            }
+        })
+        .collect();
+    let lanes = plan(&wants, |i, x, placed| {
+        let e = &g.edges[backs[i]];
+        let (a, b) = (&at[e.from], &at[e.to]);
+        let path = crate::lanes::judged_path(x, wants[i].spans, a.l, b.l, a.l - 0.5, b.l + 0.5);
+        // A planned lane's legs a little nearer its ends than this one's
+        // (on the layers both would sit mid-gap, on top of each other, and
+        // never properly cross): a leg across the gap then crosses the
+        // other lane running through it.
+        let planned = crate::lanes::planned_skeletons(&wants, placed, i, |j, xj| {
+            let f = &g.edges[backs[j]];
+            let (pa, pb) = (&at[f.from], &at[f.to]);
+            crate::lanes::judged_path(xj, wants[j].spans, pa.l, pb.l, pa.l - 0.4, pb.l + 0.4)
+        });
+        let ends = (e.from, e.to);
+        crate::lanes::crossings(&path, ends, wants[i].spans, &skeletons)
+            + crate::lanes::crossings(&path, ends, wants[i].spans, &planned)
+    });
+    backs
+        .iter()
+        .zip(lanes)
+        .filter_map(|(&ei, lane)| lane.map(|l| (ei, l)))
+        .collect()
 }
 
 /// Edge-node pairs where the straight skeleton of a drawn forward edge
@@ -2555,7 +4174,9 @@ fn coordinates_bk(
     }
 
     // Adjacent-layer neighbour sets (back/invisible links that skip a
-    // layer are excluded — BK only reasons about layer±1 segments).
+    // layer are excluded — BK only reasons about layer±1 segments). A
+    // 2-cycle lists its pair once (see the layering above); parallel
+    // forward edges are listed once per edge on purpose (report Q8).
     let mut up: Vec<Vec<usize>> = vec![Vec::new(); na];
     let mut down: Vec<Vec<usize>> = vec![Vec::new(); na];
     for v in 0..na {
@@ -3257,11 +4878,14 @@ mod tests {
     /// `Edge::end_room` (ER crow's feet) widens a gap between adjacent
     /// layers by just enough for the room, the label and LABEL_CLEAR
     /// either side — and an edge without room or label leaves the gap
-    /// exactly as it was.
+    /// exactly as it was. (An ER scene, whose painter strokes its own
+    /// edges: a flowchart's labelled gap also keeps head room, see
+    /// `a_labelled_gap_keeps_its_label_off_the_head`.)
     #[test]
     fn end_room_widens_an_adjacent_gap_for_glyphs_and_label() {
         let gap = |room: (f64, f64), label: Option<&str>, dir: Direction| {
             let mut g = Graph::default();
+            g.edge_paint_width = Some(1.5);
             g.direction = dir;
             let a = g.ensure_node("A", None, None);
             let b = g.ensure_node("B", None, None);
@@ -3299,6 +4923,394 @@ mod tests {
         );
     }
 
+    /// Report M3 (§2.6): in a flowchart a gap between adjacent layers
+    /// carrying a label grows to hold the label, an arrowhead and a stub
+    /// either side of it — 72 px down the page for a one-line label
+    /// (the 60 px gap used to stay, the chip swallowing a third of it) —
+    /// and along LR the label's width, the head and a clearance either
+    /// side; a gap with an unlabelled edge stays [`GAP_L`].
+    #[test]
+    fn a_labelled_gap_keeps_its_label_off_the_head() {
+        let gap = |label: Option<&str>, dir: Direction| {
+            let mut g = Graph::default();
+            g.direction = dir;
+            let a = g.ensure_node("A", None, None);
+            let b = g.ensure_node("B", None, None);
+            g.add_edge(a, b, label.map(str::to_string), EdgeKind::Arrow);
+            let lo = layout_sized(&g, &[(80.0, 40.0), (80.0, 40.0)]);
+            let (pa, pb) = (&lo.nodes[0], &lo.nodes[1]);
+            (pb.l - pb.lsize / 2.0) - (pa.l + pa.lsize / 2.0)
+        };
+        for dir in [Direction::TD, Direction::BT, Direction::LR, Direction::RL] {
+            assert_eq!(gap(None, dir), GAP_L, "{dir:?}");
+        }
+        for dir in [Direction::TD, Direction::BT] {
+            let g = gap(Some("yes"), dir);
+            assert!((g - (LABEL_BOX_H + 2.0 * LABEL_RUN)).abs() < 1e-9, "{g}");
+            assert!(g >= 72.0, "{dir:?}: {g}");
+        }
+        let w = text_width("a long branch label") + LABEL_PAD_W;
+        for dir in [Direction::LR, Direction::RL] {
+            let g = gap(Some("a long branch label"), dir);
+            let want = w + 2.0 * LABEL_CLEAR + ARROW_MARKER_PX;
+            assert!((g - want).abs() < 1e-9, "{dir:?}: {g} for {want}");
+        }
+    }
+
+    /// B7 review r4 #4, #7: along LR a double-headed edge's labelled gap
+    /// keeps room for both heads (sized for one, `<-->`'s label had no
+    /// spot clear of both on its line and stepped above it), and a
+    /// `linkStyle` width that repeats the plain one leaves a plain gap
+    /// (it grew every labelled LR gap by about 30 px).
+    #[test]
+    fn an_lr_gap_counts_both_heads_and_ignores_a_plain_width() {
+        let gap = |src: &str| {
+            let g = crate::parser::parse(src).unwrap();
+            let sc = crate::scene::scene(&g);
+            let (a, b) = (&sc.nodes[0], &sc.nodes[1]);
+            let e = &sc.edges[0];
+            let (_, c, _) = e.label.as_ref().unwrap();
+            ((b.x - b.w / 2.0) - (a.x + a.w / 2.0), c.1 - e.bezier[0].1)
+        };
+        let w = text_width("both ways here") + LABEL_PAD_W;
+        let (two, off) = gap("flowchart LR\n  A[Alpha] <-->|both ways here| B[Beta]\n");
+        let want = w + 2.0 * LABEL_CLEAR + 2.0 * ARROW_MARKER_PX;
+        assert!((two - want).abs() < 1e-9, "{two} for {want}");
+        assert!(off.abs() < 1e-9, "the label stays on its line: {off}");
+        let (one, _) = gap("flowchart LR\n  A[Alpha] -->|both ways here| B[Beta]\n");
+        assert!((one - (want - ARROW_MARKER_PX)).abs() < 1e-9, "{one}");
+        let (plain_w, _) = gap(
+            "flowchart LR\n  A[Alpha] -->|both ways here| B[Beta]\n  linkStyle default stroke-width:2px\n",
+        );
+        assert_eq!(plain_w, one);
+        let (wide, _) = gap(
+            "flowchart LR\n  A[Alpha] -->|both ways here| B[Beta]\n  linkStyle default stroke-width:3px\n",
+        );
+        assert!(wide > one + 20.0, "{wide} vs {one}");
+    }
+
+    /// B7 review r4 #2: a labelled edge between two composites whose
+    /// stand-in runs on to members deeper inside (here out of a nested
+    /// box) is still drawn only between the two borders, and that gap
+    /// holds its label clear of both heads as a short edge's does — it
+    /// used to stay FRAME_GAP-ish (21 px), the chips covering the whole
+    /// edge and its arrowhead. Both labels lie in the gap, off the heads.
+    #[test]
+    fn a_labelled_gap_between_composites_holds_its_labels() {
+        let doc = crate::parser::parse_document(
+            "stateDiagram-v2
+  state K0 {
+    [*] --> K0_0
+    state K0N {
+      [*] --> a
+      a --> b
+    }
+    K0_0 --> K0N
+  }
+  state K1 {
+    [*] --> c
+  }
+  K0 --> K1 : g2
+  K1 --> K0 : back
+",
+        )
+        .unwrap();
+        let crate::model::Document::State(g) = doc else {
+            panic!("not a state diagram");
+        };
+        let sc = crate::scene::scene(&g);
+        let frame = |id: &str| sc.clusters.iter().find(|c| c.id == id).unwrap();
+        let (k0, k1) = (frame("K0"), frame("K1"));
+        let (top, bottom) = (k0.y + k0.h, k1.y);
+        assert!(
+            bottom - top >= LABEL_BOX_H + 2.0 * LABEL_RUN - 1e-9,
+            "gap {top} .. {bottom}"
+        );
+        for text in ["g2", "back"] {
+            let e = sc
+                .edges
+                .iter()
+                .find(|e| e.label.as_ref().is_some_and(|l| l.0 == text))
+                .unwrap();
+            let (_, c, _) = e.label.as_ref().unwrap();
+            // Inside the gap, a head's length clear of either border.
+            assert!(
+                c.1 - LABEL_BOX_H / 2.0 >= top + ARROW_MARKER_PX
+                    && c.1 + LABEL_BOX_H / 2.0 <= bottom - ARROW_MARKER_PX,
+                "{text} at {c:?} in {top} .. {bottom}"
+            );
+        }
+    }
+
+    /// Report M7: a plain node label with no break of its own wraps at
+    /// the graph's width, balanced and never mid-word; the model keeps
+    /// the text as written (so `to_mermaid` writes no breaks), the scene
+    /// shows and sizes the wrapped lines, and a label that breaks its
+    /// own lines is left alone (no towers out of `<br/>` labels).
+    #[test]
+    fn plain_labels_wrap_balanced_and_only_in_the_layout() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/long-labels.mmd"
+        ))
+        .unwrap();
+        let g = crate::parser::parse(&src).unwrap();
+        assert_eq!(g.wrapping_width(), Some(WRAP_WIDTH));
+        let title = "ADMINISTRATIVE REQUIREMENTS DOCUMENT VALIDATION";
+        assert_eq!(g.nodes[0].label, title, "the model keeps the source text");
+        let sc = crate::scene::scene(&g);
+        let shown = &sc.nodes[0].label;
+        assert_eq!(shown, "ADMINISTRATIVE\nREQUIREMENTS\nDOCUMENT VALIDATION");
+        assert_eq!(shown.replace('\n', " "), title, "no word split or lost");
+        // Sized for what it shows.
+        let (w, h) = intrinsic_size(&g.nodes[0]);
+        assert_eq!(
+            (w, h),
+            (
+                (text_width(shown) + 2.0 * PAD_X).max(MIN_W),
+                BASE_H + 2.0 * LINE_H
+            )
+        );
+        assert!(shown.split('\n').all(|l| text_width(l) <= WRAP_WIDTH));
+        // Balanced: "Return documents | to the applicant", no lone word.
+        let d = sc.nodes.iter().find(|n| n.id == "D").unwrap();
+        assert_eq!(d.label, "Return documents\nto the applicant");
+        // Short labels and explicit breaks stay as written.
+        let c = sc.nodes.iter().find(|n| n.id == "C").unwrap();
+        assert_eq!(c.label, "Issue the certificate");
+        let g2 = crate::parser::parse(
+            "flowchart TD\nA[a fairly long first line that goes on<br/>and a second one]\n\
+             B[<b>a bold run long enough to go over two lines</b> and a <i>plain</i> tail]\n\
+             C[Pneumonoultramicroscopicsilicovolcanoconiosis_is_one_very_long_word x]\n\
+             D[x Pneumonoultramicroscopicsilicovolcanoconiosis_is_one_very_long_word]\n\
+             E[Pneumonoultramicroscopicsilicovolcanoconiosis_is_one_very_long_word and a few more words]",
+        )
+        .unwrap();
+        let sc2 = crate::scene::scene(&g2);
+        assert_eq!(sc2.nodes[0].label, g2.nodes[0].label);
+        // Markup wraps too, its tags closed and re-opened on each line.
+        assert_eq!(
+            sc2.nodes[1].label,
+            "<b>a bold run long enough to go</b>\n<b>over two lines</b> and a <i>plain</i> tail"
+        );
+        assert!(sc2.nodes[1]
+            .label
+            .lines()
+            .all(|l| text_width(l) <= WRAP_WIDTH));
+        // An over-long word is never split; a lone word beside it joins
+        // its line instead of being stranded under it (or over it), and
+        // the other lines may fill up to its width.
+        for v in [2, 3] {
+            assert_eq!(sc2.nodes[v].label, g2.nodes[v].label, "one line");
+        }
+        let e: Vec<&str> = sc2.nodes[4].label.lines().collect();
+        assert_eq!(
+            e,
+            [
+                "Pneumonoultramicroscopicsilicovolcanoconiosis_is_one_very_long_word",
+                "and a few more words"
+            ]
+        );
+        // The source round-trips without the layout's breaks.
+        let text = crate::to_mermaid(&g);
+        assert!(text.contains(title) && !text.contains("<br"), "{text}");
+        // An embedder's real font wraps by its own measure.
+        let wide = |l: &str| 2.0 * text_width(l);
+        let (_, h2) = intrinsic_size_with(&g.nodes[2], wide);
+        assert_eq!(
+            h2,
+            BASE_H + LINE_H,
+            "twice as wide a font wraps the 121 px label"
+        );
+        assert_eq!(intrinsic_size_wrapped(&g.nodes[2], None, wide).1, BASE_H);
+    }
+
+    /// Report M7: the width comes from `flowchart.wrappingWidth` in an
+    /// init directive or the frontmatter (a later directive winning),
+    /// for flowcharts and state diagrams; class and ER boxes never wrap.
+    #[test]
+    fn wrapping_width_is_read_from_the_source() {
+        let long = "A[Return documents to the applicant]";
+        let lines = |src: &str| {
+            let g = crate::parser::parse(src).unwrap();
+            (
+                g.wrapping_width(),
+                crate::scene::scene(&g).nodes[0].label.lines().count(),
+            )
+        };
+        assert_eq!(
+            lines(&format!("flowchart TD\n{long}")),
+            (Some(WRAP_WIDTH), 2)
+        );
+        assert_eq!(
+            lines(&format!(
+                "%%{{init: {{\"flowchart\": {{\"wrappingWidth\": 400}}}}}}%%\nflowchart TD\n{long}"
+            )),
+            (Some(400.0), 1)
+        );
+        assert_eq!(
+            lines(&format!(
+                "---\nconfig:\n  flowchart:\n    wrappingWidth: 80\n---\nflowchart TD\n{long}"
+            )),
+            (Some(80.0), 4)
+        );
+        // Mermaid lays directives over the frontmatter; nonsense is
+        // ignored.
+        assert_eq!(
+            lines(&format!(
+                "---\nconfig:\n  flowchart:\n    wrappingWidth: 80\n---\n\
+                 %%{{init: {{\"flowchart\": {{\"wrappingWidth\": 400}}}}}}%%\nflowchart TD\n{long}"
+            ))
+            .0,
+            Some(400.0)
+        );
+        assert_eq!(
+            lines(&format!(
+                "%%{{init: {{\"flowchart\": {{\"wrappingWidth\": -3}}}}}}%%\nflowchart TD\n{long}"
+            ))
+            .0,
+            Some(WRAP_WIDTH)
+        );
+        // A configured width survives `to_mermaid`.
+        let g = crate::parser::parse(&format!(
+            "%%{{init: {{\"flowchart\": {{\"wrappingWidth\": 400}}}}}}%%\nflowchart TD\n{long}"
+        ))
+        .unwrap();
+        let back = crate::parser::parse(&crate::to_mermaid(&g)).unwrap();
+        assert_eq!(back.wrapping_width(), Some(400.0));
+        // State diagrams wrap their states alike.
+        let doc = crate::parser::parse_document(
+            "%%{init: {\"flowchart\": {\"wrappingWidth\": 80}}}%%\nstateDiagram-v2\n\
+             state \"Return documents to the applicant\" as S\n[*] --> S",
+        )
+        .unwrap();
+        let crate::model::Document::State(sg) = doc else {
+            panic!("a state diagram")
+        };
+        assert_eq!(sg.wrapping_width(), Some(80.0));
+        // Off for an embedder that asks (class and ER graphs do).
+        let mut g = crate::parser::parse(&format!("flowchart TD\n{long}")).unwrap();
+        g.set_wrapping_width(None);
+        assert_eq!(crate::scene::scene(&g).nodes[0].label.lines().count(), 1);
+        g.set_wrapping_width(Some(f64::NAN));
+        assert_eq!(g.wrapping_width(), None);
+    }
+
+    /// Report §2.12 / M7 / §6: a long decision wraps — at the graph's
+    /// width over 1.6, so it is no wider than a box wrapping there — into
+    /// a block no flatter than 1.6 : 1, while a short one keeps its
+    /// compact one-line rhombus (fanout's "All succeeded?", shapes'
+    /// "Diamond": not grown taller to the cap), and a label-less branch
+    /// point keeps its small square. A longer question never draws a
+    /// bigger rhombus than a shorter one wraps into.
+    #[test]
+    fn long_diamonds_wrap_within_the_cap_and_short_ones_stay_compact() {
+        let src = "flowchart TD\nA{ok?} --> B{Is it valid?}\n\
+                   B --> C{Are all documents complete and compliant with the rules?}\n\
+                   C --> D{Supercalifragilisticexpialidocious} --> E{ }\n\
+                   F{All succeeded?} --> G{Diamond} --> H{Payment approved?}\n\
+                   H --> I{Is the user logged in?} --> J{Retry the charge once more?}\n\
+                   J --> K{Is the payment valid for this order?}";
+        let g = crate::parser::parse(src).unwrap();
+        let sc = crate::scene::scene(&g);
+        let ww = g.wrapping_width().unwrap() / DIAMOND_ASPECT_MAX;
+        for (n, m) in sc.nodes.iter().zip(&g.nodes) {
+            let tw = text_width(&m.label);
+            if n.shape != Shape::Diamond || tw == 0.0 {
+                continue;
+            }
+            if tw <= ww {
+                // Short: one line, the rhombus fitted to it, uncapped.
+                assert_eq!(n.label, m.label, "{}", n.id);
+                assert!(
+                    (n.w - ((tw + 24.0) * 1.6).max(80.0)).abs() < 1e-9 && n.h == BASE_H * 1.7,
+                    "{}: {} x {}",
+                    n.id,
+                    n.w,
+                    n.h
+                );
+            } else {
+                assert!(
+                    n.w <= n.h * DIAMOND_ASPECT_MAX + 1e-9,
+                    "{}: {} x {}",
+                    n.id,
+                    n.w,
+                    n.h
+                );
+            }
+        }
+        let node = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+        assert_eq!((node("A").w, node("A").h), (80.0, BASE_H * 1.7));
+        for (id, w) in [("F", 192.0), ("G", 128.0)] {
+            assert!((node(id).w - w).abs() < 1e-9 && node(id).h == BASE_H * 1.7);
+        }
+        for id in ["C", "H", "I", "J", "K"] {
+            assert!(node(id).label.lines().count() > 1, "{id} wraps");
+        }
+        // A wrapped question fills its rhombus: its height is its
+        // text's, not the cap's.
+        for id in ["C", "H", "I", "J", "K"] {
+            let n = node(id);
+            let lines = n.label.lines().count() as f64;
+            assert_eq!(n.h, (BASE_H + (lines - 1.0) * LINE_H) * 1.7, "{id}");
+        }
+        assert_eq!(node("C").label.lines().count(), 4);
+        // Longer text, no smaller rhombus.
+        let area = |id: &str| node(id).w * node(id).h;
+        assert!(area("J") <= area("K"), "{} {}", area("J"), area("K"));
+        // One word too long to wrap: capped, not a sliver.
+        let d = node("D");
+        assert!((d.w / d.h - DIAMOND_ASPECT_MAX).abs() < 1e-9);
+        assert_eq!((node("E").w, node("E").h), (CHOICE_SIZE, CHOICE_SIZE));
+    }
+
+    /// Circles grow both ways with their text: a long label wraps at the
+    /// same narrower width as a diamond's (mermaid wraps both of these),
+    /// a short one keeps its line.
+    #[test]
+    fn long_circle_labels_wrap_narrower() {
+        let g = crate::parser::parse(
+            "flowchart TD\nA((A circle with a long label inside)) --> \
+             B((Is this a long circle label here)) --> C(((A double circle with a long label)))\n\
+             C --> D((short))",
+        )
+        .unwrap();
+        let sc = crate::scene::scene(&g);
+        for v in 0..3 {
+            let n = &sc.nodes[v];
+            assert_eq!(n.label.lines().count(), 2, "{}: {:?}", n.id, n.label);
+            assert!(n.w < 140.0 && n.w == n.h, "{}: {} x {}", n.id, n.w, n.h);
+        }
+        assert_eq!(sc.nodes[3].label, "short");
+    }
+
+    /// CJK text breaks between characters (mermaid breaks a long
+    /// Japanese label anywhere), never before closing punctuation or a
+    /// small kana, and never after an opening bracket.
+    #[test]
+    fn cjk_labels_break_between_characters() {
+        let g = crate::parser::parse(
+            "flowchart TD\nA[日本語のラベルはとても長いのでここで折り返されるべきでしょうか テスト]\n\
+             B[「東京」から「大阪」まで、新幹線で移動します。とても速いです。ありがとう。]",
+        )
+        .unwrap();
+        let sc = crate::scene::scene(&g);
+        for (n, m) in sc.nodes.iter().zip(&g.nodes) {
+            let lines: Vec<&str> = n.label.lines().collect();
+            assert!(lines.len() > 1, "{}: {:?}", n.id, n.label);
+            for l in &lines {
+                assert!(text_width(l) <= WRAP_WIDTH, "{l}");
+            }
+            // Nothing lost or added but the breaks (the one space kept).
+            assert_eq!(n.label.replace(['\n', ' '], ""), m.label.replace(' ', ""));
+            for (a, b) in lines.iter().zip(&lines[1..]) {
+                let first = b.chars().next().unwrap();
+                assert!(!"、。」）っゃゅょー".contains(first), "{b}");
+                assert!(!"「（".contains(a.chars().last().unwrap()), "{a}");
+            }
+        }
+    }
+
     #[test]
     fn wrap_text_is_greedy_keeps_breaks_and_never_splits_words() {
         // Fits: untouched (including inner runs of spaces).
@@ -3325,6 +5337,163 @@ mod tests {
         assert_eq!(wrap_text("x\ny", 1.0, 1.0), "x\ny");
         let at_13 = wrap_text(s, 80.0, 13.0 / TEXT_CALIBRATION);
         assert!(at_13.lines().count() <= w.lines().count());
+    }
+
+    #[test]
+    fn a_left_note_leads_its_state_inside_a_composite_entered_from_outside() {
+        // `First --> Second` keeps Second's members below First (a
+        // rank-only group into every member, the card included); that
+        // floor must not park `left of b` on Second's top layer, two
+        // layers ahead of b: the card leads b by one, beside a.
+        let src = "stateDiagram-v2\n[*] --> First\nstate First {\n[*] --> fir\n}\n\
+                   First --> Second\nstate Second {\n[*] --> a\na --> b\n}\n\
+                   note left of b : left of b";
+        let crate::model::Document::State(g) = crate::parser::parse_document(src).unwrap() else {
+            panic!("a state diagram");
+        };
+        let sc = crate::scene::scene(&g);
+        let at = |id: &str| &sc.nodes[g.node_index(id).unwrap()];
+        let card = sc.nodes.iter().find(|n| n.label == "left of b").unwrap();
+        assert!(
+            (card.y - at("a").y).abs() < 1.0,
+            "beside a: {} vs {}",
+            card.y,
+            at("a").y
+        );
+        assert!(card.y < at("b").y);
+        // Still inside Second, below First.
+        let frame = |id: &str| sc.clusters.iter().find(|c| c.id == id).unwrap();
+        let (first, second) = (frame("First"), frame("Second"));
+        assert!(card.y - card.h / 2.0 > second.y && card.y - card.h / 2.0 > first.y + first.h);
+    }
+
+    #[test]
+    fn compact_choice_fans_get_room_for_their_label_rows() {
+        // The S between adjacent layers: from `from` to `to`, half-way
+        // across at half depth.
+        let line = |to: f64, width: Option<f64>| FanLine {
+            point: 0,
+            from: 0.0,
+            to,
+            width,
+        };
+        let l = line(100.0, None);
+        assert!(fan_line_at(&l, 0.0).abs() < 1e-6);
+        assert!((fan_line_at(&l, 0.5) - 50.0).abs() < 1e-6);
+        assert!((fan_line_at(&l, 1.0) - 100.0).abs() < 1e-6);
+        // Unlabelled lines ask nothing.
+        assert_eq!(fan_rows_gap(&[l], 50.0), 50.0);
+        // Labels whose far ends lie wide apart share row 0, just past
+        // FAN_FAR; close ones need a second row, a deeper gap.
+        let one = fan_rows_gap(&[line(-150.0, Some(120.0)), line(150.0, Some(120.0))], 0.0);
+        assert_eq!(one, fan_gap(LABEL_BOX_H / 2.0));
+        let two = fan_rows_gap(&[line(-60.0, Some(120.0)), line(60.0, Some(120.0))], 0.0);
+        assert!(two > one + LABEL_BOX_H, "{two} vs {one}");
+        // A gap that is roomy already stays as it is.
+        assert_eq!(fan_rows_gap(&[line(-150.0, Some(120.0))], 400.0), 400.0);
+        // Laid out: the 4-way choice of wide labels gets its rows; the
+        // same fan out of a labelled diamond (no fan) keeps the old gap.
+        let src = |c: &str| {
+            format!(
+                "flowchart TD\nc{c} -->|priority customer| E[Express]\n\
+                 c -->|regular customer| S[Standard]\nc -->|payment pending| H[Hold]\n\
+                 c -->|fraud suspected| K[Cancel]"
+            )
+        };
+        let gap = |c: &str| {
+            let g = crate::parser::parse(&src(c)).unwrap();
+            let sc = crate::scene::scene(&g);
+            let (c, e) = (&sc.nodes[0], &sc.nodes[g.node_index("E").unwrap()]);
+            (e.y - e.h / 2.0) - (c.y + c.h / 2.0)
+        };
+        assert!(
+            gap("{ }") > gap("{ok?}"),
+            "{} vs {}",
+            gap("{ }"),
+            gap("{ok?}")
+        );
+    }
+
+    #[test]
+    fn choice_twins_and_too_wide_fans_still_get_their_room() {
+        let line = |from: f64, to: f64, width: f64| FanLine {
+            point: 0,
+            from,
+            to,
+            width: Some(width),
+        };
+        // Two lines to one state, PARALLEL_GAP apart: neither label has
+        // a row clear of the other's line, so they go beside them, and
+        // the third label takes a second row rather than crowd 'two'.
+        let twins = [
+            line(0.0, -8.0, 37.4),
+            line(0.0, 8.0, 35.8),
+            line(7.0, 89.0, 46.0),
+        ];
+        assert!(fan_rows_fit(&twins, 0.0, false).is_none());
+        let gap = fan_rows_gap(&twins, 0.0);
+        assert!(gap > fan_gap(LABEL_BOX_H / 2.0), "{gap}");
+        // Beside is a last resort: lines a label fits on keep their gap.
+        let apart = [line(0.0, -150.0, 120.0), line(0.0, 150.0, 120.0)];
+        assert_eq!(fan_rows_gap(&apart, 0.0), fan_gap(LABEL_BOX_H / 2.0));
+        // Laid out: labels wider than the room between their states
+        // spread those states (labels side by side, mermaid-style); a
+        // fan whose labels stack in rows keeps its compact spacing.
+        let spacing = |src: &str| {
+            let crate::model::Document::State(g) = crate::parser::parse_document(src).unwrap()
+            else {
+                panic!("a state diagram");
+            };
+            let sc = crate::scene::scene(&g);
+            let x = |id: &str| sc.nodes[g.node_index(id).unwrap()].x;
+            (x("C") - x("B"), x("D") - x("C"))
+        };
+        let wide = spacing(
+            "stateDiagram-v2\nstate c <<choice>>\n[*] --> A\nA --> c\n\
+             c --> B : this is a very long label for the first branch\n\
+             c --> C : and an equally long label for branch two\n\
+             c --> D : third one is also quite long indeed",
+        );
+        let w = text_width("and an equally long label for branch two") + LABEL_PAD_W;
+        assert!(wide.0 > w && wide.1 > w, "{wide:?} vs {w}");
+        let rows = spacing(
+            "stateDiagram-v2\nstate c <<choice>>\n[*] --> A\nA --> c\n\
+             c --> B : priority\nc --> C : regular\nc --> D : pending",
+        );
+        assert!(rows.0 < MIN_W + 2.0 * GAP_B, "{rows:?}");
+    }
+
+    #[test]
+    fn unlabelled_diamond_is_a_compact_choice() {
+        // A state `<<choice>>` has no text: mermaid draws it 28×28, not
+        // the 80×64.6 a decision diamond needs round its label.
+        let doc = crate::parser::parse_document(
+            "stateDiagram-v2\nstate c <<choice>>\n[*] --> c\nc --> A : yes\nc --> B : no",
+        )
+        .unwrap();
+        let crate::model::Document::State(g) = doc else {
+            panic!("a state diagram");
+        };
+        let c = &g.nodes[g.node_index("c").unwrap()];
+        assert_eq!(intrinsic_size(c), (CHOICE_SIZE, CHOICE_SIZE));
+        // Labelled diamonds keep the text-fitting rule and its minimum;
+        // a label too long for one line wraps, never flatter than
+        // DIAMOND_ASPECT_MAX (report §2.12).
+        let g = crate::parser::parse("flowchart TD\nA{ok?} --> B{a much longer question}").unwrap();
+        let (wa, ha) = intrinsic_size(&g.nodes[0]);
+        assert_eq!((wa, ha), (80.0, BASE_H * 1.7), "short label: the minimum");
+        let (wb, hb) = intrinsic_size(&g.nodes[1]);
+        let shown = wrap_label(&g.nodes[1], WRAP_WIDTH, text_width);
+        assert_eq!(shown, "a much\nlonger\nquestion");
+        let tw = text_width("question");
+        assert_eq!(wb, (tw + 24.0) * 1.6, "long label: fitted to its lines");
+        assert_eq!(hb, (BASE_H + 2.0 * LINE_H) * 1.7);
+        // The compact choice still lays out and anchors on its border.
+        let sc = crate::scene::scene(&crate::parser::parse("flowchart TD\nA{ } --> B").unwrap());
+        assert_eq!((sc.nodes[0].w, sc.nodes[0].h), (CHOICE_SIZE, CHOICE_SIZE));
+        let start = sc.edges[0].bezier[0];
+        let bottom = sc.nodes[0].y + CHOICE_SIZE / 2.0;
+        assert!((start.1 - bottom).abs() < 0.5, "edge leaves the vertex");
     }
 
     #[test]

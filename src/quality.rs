@@ -15,9 +15,12 @@
 //! crew tightens the gate.
 
 use crate::layout::{text_width, title_extra, LABEL_BOX_H, TITLE_SCALE};
-use crate::model::{Direction, Graph, Shape};
+use crate::model::{Direction, EdgeCurve, Graph, Shape};
 use crate::parser::parse_document;
-use crate::scene::{self, edge_drawn, edge_polyline, Scene, SceneEdge, SceneNode, MARGIN};
+use crate::scene::{
+    self, edge_drawn, edge_end_tangent, edge_painted_polyline, edge_stroke_width, node_outline,
+    Scene, SceneEdge, SceneNode, MARGIN,
+};
 use crate::Document;
 use std::collections::HashMap;
 
@@ -49,9 +52,9 @@ pub const ORTHO_MIN_POINTS: usize = 4;
 /// Two boxes overlap when they share more than this much depth (px)
 /// on both axes — touching borders do not count.
 pub const OVERLAP_EPS: f64 = 0.5;
-/// Arrowhead length measured back from the tip (px): the default
-/// marker is 7 stroke widths of 1.7 px, its tip at 85% of that.
-pub const ARROW_LEN: f64 = 11.0;
+/// Arrowhead length measured back from the tip (px): the painter's one
+/// head size, on every edge whatever its stroke width.
+pub const ARROW_LEN: f64 = crate::scene::ARROW_MARKER_PX;
 /// A run along one frame border counts once it is longer than this
 /// (px); shorter ones are an edge crossing or leaving the border.
 pub const BORDER_RUN_MIN: f64 = 40.0;
@@ -91,6 +94,25 @@ pub const DRAG_RUNS: usize = 3;
 /// Drag benchmark: a frame slower than this (ms, native release) is
 /// over budget — the proxy for 16 ms in wasm (G13).
 pub const DRAG_FRAME_MS: f64 = 8.0;
+/// An end glyph whose drawn heading is more than this (degrees) off
+/// square to the side of the node it lands on reads as askew (report
+/// §2.3; M1's target is ≤ 10° for nearly every end).
+pub const END_TILT_TOL: f64 = 10.0;
+/// An edge end further than this (px) from the outline its endpoint is
+/// painted with floats off it, or sinks into it (report §2.5).
+pub const END_GAP_TOL: f64 = 1.0;
+/// Two edges at least [`EDGE_SPACING`] and at most this far apart (px),
+/// running parallel, still read as one cable rather than two lines
+/// (report §2.13: bundles 12–26 px apart for 1100 px went unseen).
+pub const PARALLEL_BAND: f64 = 26.0;
+/// A parallel run within [`PARALLEL_BAND`] counts once longer than this
+/// (px): about a rank gap plus a node, so two edges that stay side by
+/// side past a whole rank.
+pub const BAND_RUN_MIN: f64 = 100.0;
+/// Control points closer than this (px) to their cubic's chord lie on
+/// it, and a leg whose ends differ by less than this on one axis runs
+/// along it: how a straight edge, an S and a bow are told apart.
+pub const STRAIGHT_TOL: f64 = 0.5;
 
 /// How a metric folds across many diagrams in a totals row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,8 +124,11 @@ pub enum Agg {
 }
 
 /// Quality numbers for one laid-out scene. Counts are "lower is
-/// better" unless noted.
+/// better" unless noted. Not exhaustive: the yardstick gains columns as
+/// it learns to see more defects; read the fields, or start from
+/// [`Metrics::default`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Metrics {
     /// Nodes / drawn non-loop edges / frames measured.
     pub nodes: usize,
@@ -119,6 +144,9 @@ pub struct Metrics {
     /// (edge, frame) pairs of the above.
     pub edge_frame_pairs: usize,
     /// Edge-edge crossing points, away from shared endpoints (G1).
+    /// Edge pairs are pruned by bounding box, which an exactly level or
+    /// plumb edge does not have: [`Metrics::x_drawn`] counts their
+    /// crossings too.
     pub edge_edge_x: usize,
     /// Edge pairs running parallel closer than [`EDGE_SPACING`] for
     /// more than [`MIN_OVERLAP_RUN`] (G1/G4).
@@ -149,7 +177,7 @@ pub struct Metrics {
     /// Longest such run (px).
     pub hug_max: f64,
     /// (edge, frame title) pairs where the edge comes within
-    /// [`CHIP_SEP`] of the title chip or the header corner it sits in
+    /// `CHIP_SEP` of the title chip or the header corner it sits in
     /// (G6).
     pub edge_chip: usize,
     /// Crossings within [`PORT_ZONE`] of an end both edges share: they
@@ -222,6 +250,81 @@ pub struct Metrics {
     pub aspect: f64,
     /// Canvas area per node (px², G12).
     pub area_per_node: f64,
+    /// End glyphs (arrowheads, crosses, circles) whose drawn heading is
+    /// more than [`END_TILT_TOL`] off square to the side they land on —
+    /// the box side (top / bottom / left / right) the tip is on, the
+    /// radius on a round node or state, either way across a frame's
+    /// border (report §2.3). The heading as painted: an arrowhead faces
+    /// along the stroke the painter cuts short under it.
+    pub end_tilt: usize,
+    /// Largest such angle (degrees, 0 = square onto the side).
+    pub end_tilt_max: f64,
+    /// Edge ends further than [`END_GAP_TOL`] from the outline their
+    /// node (or frame) is painted with — a slanted, curved or capped
+    /// side measured as drawn, not as its box (report §2.5); a
+    /// self-loop's two ends count too.
+    pub end_gaps: usize,
+    /// Largest end-to-outline distance (px).
+    pub end_gap_max: f64,
+    /// Edges backtracking sideways (across the flow) by more than
+    /// [`WIGGLE_TOL`]: hooks, hairpins and dips the flow-axis
+    /// `wiggles` cannot see (report §2.13). Reversals are read with
+    /// that tolerance; a back-edge (drawn against the flow) may
+    /// overshoot its ends' sideways span once, on one side, to get
+    /// round.
+    pub lat_wiggles: usize,
+    /// Total sideways backtracking of those edges (px): half the
+    /// sideways travel beyond the net sideways shift, less a
+    /// back-edge's one overshoot.
+    pub lat_backtrack: f64,
+    /// Edges with both ends inside a frame that leave the innermost
+    /// frame holding both ends by more than [`FRAME_INSET`] (report
+    /// §2.2 #5, §2.8).
+    pub own_frame_x: usize,
+    /// Total drawn length outside that frame (px).
+    pub own_frame_len: f64,
+    /// Edge pairs running parallel [`EDGE_SPACING`]..=[`PARALLEL_BAND`]
+    /// apart for more than [`BAND_RUN_MIN`], away from shared ends and
+    /// crossings: long cables `tight_pairs` (under [`CLEAR_GAP`]) does
+    /// not see.
+    pub band_pairs: usize,
+    /// Total length of those runs (px).
+    pub band_len: f64,
+    /// Share of the canvas covered by ink (higher = denser): node
+    /// shapes, edge label boxes and edge strokes (length × stroke
+    /// width), over `width` × `height`. Frames are containers: the
+    /// empty room they enclose is what this exposes.
+    pub ink: f64,
+    /// Edges drawn in the orthogonal idiom: axis-aligned legs with
+    /// rounded corners (a router path, a step curve) or one straight
+    /// axis-aligned stroke. The four idiom counts partition `edges`.
+    pub idiom_ortho: usize,
+    /// … as one free cubic between their ends (the adjacent-rank S, a
+    /// diagonal; report §2.1).
+    pub idiom_scubic: usize,
+    /// … as a spline through waypoints that are not an orthogonal
+    /// path (a dummy chain's curveBasis; report §2.1).
+    pub idiom_spline: usize,
+    /// … as one cubic bowing to one side of its chord, both control
+    /// points beyond it (the back-edge bow; report §2.2).
+    pub idiom_bow: usize,
+    /// Edge-edge crossing points as drawn, counted like `edge_edge_x`
+    /// but over every pair of edges: that one's box prune skips an
+    /// exactly level or plumb edge (an aligned spine), and with it the
+    /// crossings a reader sees on it (report §2.13).
+    pub x_drawn: usize,
+    /// End glyphs whose stroke meets the glyph's base — a head's length
+    /// ([`ARROW_LEN`]) back from the tip, as painted — more than
+    /// [`END_TILT_TOL`] off square to the side, as `end_tilt` judges it: a
+    /// curve still turning under the head kinks at its base however
+    /// square the head itself (report §2.3, M1: the last head length runs
+    /// straight).
+    pub end_kink: usize,
+    /// Drawn edges with ink off the canvas: a stroke as painted (half its
+    /// width out) or an end glyph's box outside the drawing's bounds
+    /// plus the padding `to_svg` gives them, i.e. clipped by the SVG's
+    /// view box (B1 review). Gated at 0.
+    pub ink_out: usize,
     /// One line per node/frame crossing, parallel overlap, close edge
     /// pair, label on a node or arrowhead, wiggle, wrong frame side and
     /// shared port, naming the elements (`from->to kind other`), for
@@ -291,6 +394,34 @@ impl Metrics {
             ("lbl_crowd", self.lbl_crowd as f64, Sum),
             ("ortho_edges", self.ortho_edges as f64, Sum),
             ("xnotches", self.xnotches as f64, Sum),
+        ]
+    }
+
+    /// Metrics added after the timing columns (report M0, §2.13: the
+    /// defects the earlier columns cannot see), printed after them —
+    /// at the very end of a row — so every earlier column keeps its
+    /// number.
+    pub fn tail_fields(&self) -> Vec<(&'static str, f64, Agg)> {
+        use Agg::*;
+        vec![
+            ("end_tilt", self.end_tilt as f64, Sum),
+            ("end_tilt_max", self.end_tilt_max, Max),
+            ("end_gaps", self.end_gaps as f64, Sum),
+            ("end_gap_max", self.end_gap_max, Max),
+            ("lat_wiggles", self.lat_wiggles as f64, Sum),
+            ("lat_backtrack", self.lat_backtrack, Sum),
+            ("own_frame_x", self.own_frame_x as f64, Sum),
+            ("own_frame_len", self.own_frame_len, Sum),
+            ("band_pairs", self.band_pairs as f64, Sum),
+            ("band_len", self.band_len, Sum),
+            ("ink", self.ink, Mean),
+            ("idiom_ortho", self.idiom_ortho as f64, Sum),
+            ("idiom_scubic", self.idiom_scubic as f64, Sum),
+            ("idiom_spline", self.idiom_spline as f64, Sum),
+            ("idiom_bow", self.idiom_bow as f64, Sum),
+            ("x_drawn", self.x_drawn as f64, Sum),
+            ("end_kink", self.end_kink as f64, Sum),
+            ("ink_out", self.ink_out as f64, Sum),
         ]
     }
 
@@ -484,6 +615,205 @@ fn node_gap(n: &SceneNode, p: Pt) -> f64 {
     }
 }
 
+/// Distance from `p` to the boundary of the closed polygon `poly`
+/// (inside or out).
+fn poly_dist(poly: &[Pt], p: Pt) -> f64 {
+    let n = poly.len();
+    (0..n)
+        .map(|i| seg_dist(p, poly[i], poly[(i + 1) % n]))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Area of the closed polygon `poly` (shoelace).
+fn poly_area(poly: &[Pt]) -> f64 {
+    let n = poly.len();
+    let twice: f64 = (0..n)
+        .map(|i| {
+            let (a, b) = (poly[i], poly[(i + 1) % n]);
+            a.0 * b.1 - b.0 * a.1
+        })
+        .sum();
+    twice.abs() / 2.0
+}
+
+/// The heading (unit vector, into the end) of the drawn polyline `pts`
+/// where it meets an end glyph's base: on the piece holding the point a
+/// head's length ([`ARROW_LEN`]) of arc back from the
+/// end at the source (`at_start`) or the target, ties going to the piece
+/// nearer the end (a stub exactly a head long is its own heading).
+/// `None` for a line shorter than a head.
+fn head_base_heading(pts: &[Pt], at_start: bool) -> Option<Pt> {
+    let mut left = ARROW_LEN;
+    let n = pts.len();
+    for k in 0..n.saturating_sub(1) {
+        // The k-th piece from the end, as (farther, nearer) point.
+        let (far, near) = if at_start {
+            (pts[k + 1], pts[k])
+        } else {
+            (pts[n - 2 - k], pts[n - 1 - k])
+        };
+        let d = dist(far, near);
+        if d >= left - 1e-6 && d > 0.0 {
+            return Some(((near.0 - far.0) / d, (near.1 - far.1) / d));
+        }
+        left -= d;
+    }
+    None
+}
+
+/// Inward unit normal of the side of the box centred at `c` with half
+/// extents `half` that `tip` lands on, judged relative to the half
+/// extents — so a diamond's or a hexagon's face counts as the box side
+/// it faces, the side an orthogonal edge enters square.
+fn box_side_in(c: Pt, half: Pt, tip: Pt) -> Pt {
+    let u = (tip.0 - c.0) / half.0.max(f64::EPSILON);
+    let v = (tip.1 - c.1) / half.1.max(f64::EPSILON);
+    if u.abs() > v.abs() {
+        (-u.signum(), 0.0)
+    } else {
+        (0.0, -v.signum())
+    }
+}
+
+/// Inward unit normal of the side of node `n` that `tip` lands on: the
+/// radius on a round node or state (an end aims at its centre), else
+/// the box side ([`box_side_in`]). On a cylinder's curved corner (within
+/// a cap's height of its top or bottom, where an end on the cap or on
+/// the flank is put onto the arc) either adjacent side counts, whichever
+/// `head` (the end's heading into the node) is squarer to. `(0, 0)` at
+/// a circle's very centre.
+fn side_in(n: &SceneNode, tip: Pt, head: Pt) -> Pt {
+    match n.shape {
+        Shape::Cylinder => {
+            let ry = crate::scene::cylinder_ry(n.w, n.h);
+            let dy = tip.1 - n.y;
+            if dy.abs() <= n.h / 2.0 - ry {
+                return box_side_in((n.x, n.y), (n.w / 2.0, n.h / 2.0), tip);
+            }
+            let cap = (0.0, -dy.signum());
+            let flank = (-(tip.0 - n.x).signum(), 0.0);
+            let dot = |u: Pt| u.0 * head.0 + u.1 * head.1;
+            if dot(flank) > dot(cap) {
+                flank
+            } else {
+                cap
+            }
+        }
+        Shape::Circle | Shape::DoubleCircle | Shape::StateStart | Shape::StateEnd => {
+            let (dx, dy) = (n.x - tip.0, n.y - tip.1);
+            let l = dx.hypot(dy);
+            if l < f64::EPSILON {
+                (0.0, 0.0)
+            } else {
+                (dx / l, dy / l)
+            }
+        }
+        _ => box_side_in((n.x, n.y), (n.w / 2.0, n.h / 2.0), tip),
+    }
+}
+
+/// How an edge is drawn (see [`Metrics::idiom_ortho`] and its
+/// siblings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Idiom {
+    Ortho,
+    SCubic,
+    Spline,
+    Bow,
+}
+
+/// The idiom edge `e` is drawn in, read off the geometry `to_svg`
+/// strokes: its waypoints (an orthogonal router path when its inner
+/// legs are axis-aligned, as `ortho_edges` counts it), a mermaid step
+/// curve, or its one cubic — straight on an axis, bowing to one side
+/// of its chord (both control points beyond it on the same side), or
+/// else a free S.
+fn idiom(e: &SceneEdge) -> Idiom {
+    let along_axis = |a: Pt, b: Pt, tol: f64| (a.0 - b.0).abs() <= tol || (a.1 - b.1).abs() <= tol;
+    let stepped = matches!(
+        e.meta.curve,
+        Some(EdgeCurve::Step | EdgeCurve::StepBefore | EdgeCurve::StepAfter)
+    );
+    let wps = &e.waypoints;
+    let n = wps.len();
+    if n >= 2 {
+        let ortho = stepped
+            || if n >= ORTHO_MIN_POINTS {
+                wps[1..n - 1]
+                    .windows(2)
+                    .all(|w| along_axis(w[0], w[1], LINE_EPS))
+            } else {
+                wps.windows(2).all(|w| along_axis(w[0], w[1], STRAIGHT_TOL))
+            };
+        return if ortho { Idiom::Ortho } else { Idiom::Spline };
+    }
+    let [p0, c1, c2, p3] = e.bezier;
+    if stepped {
+        return Idiom::Ortho;
+    }
+    if e.meta.curve.is_some_and(|c| c != EdgeCurve::Basis) {
+        // A mermaid curve through the two ends: a straight line, or a
+        // bump that is straight between ends on one axis.
+        return if along_axis(p0, p3, STRAIGHT_TOL) {
+            Idiom::Ortho
+        } else {
+            Idiom::SCubic
+        };
+    }
+    let on = |q: Pt, k: usize| {
+        if k == 0 {
+            (q.0 - p0.0).abs() <= STRAIGHT_TOL
+        } else {
+            (q.1 - p0.1).abs() <= STRAIGHT_TOL
+        }
+    };
+    if (0..2).any(|k| on(c1, k) && on(c2, k) && on(p3, k)) {
+        return Idiom::Ortho;
+    }
+    let (dx, dy) = (p3.0 - p0.0, p3.1 - p0.1);
+    let l = dx.hypot(dy);
+    if l < f64::EPSILON {
+        return Idiom::SCubic;
+    }
+    let side = |q: Pt| (dx * (q.1 - p0.1) - dy * (q.0 - p0.0)) / l;
+    let (s1, s2) = (side(c1), side(c2));
+    if s1.abs() > STRAIGHT_TOL && s2.abs() > STRAIGHT_TOL && s1.signum() == s2.signum() {
+        Idiom::Bow
+    } else {
+        Idiom::SCubic
+    }
+}
+
+/// The turning points of `v`: its first value, then the extreme of
+/// each monotone run, a change of direction read only once `v` has come
+/// back more than `tol` from the run's extreme (so sampling noise and
+/// sub-`tol` jitter turn nothing).
+fn zigzag(v: &[f64], tol: f64) -> Vec<f64> {
+    let Some(&first) = v.first() else {
+        return Vec::new();
+    };
+    let mut turns = vec![first];
+    // The current run's extreme so far and its direction (0 until `v`
+    // first strays more than `tol` from where it started).
+    let (mut ext, mut dir) = (first, 0.0f64);
+    for &x in &v[1..] {
+        if dir == 0.0 {
+            if (x - first).abs() > tol {
+                (ext, dir) = (x, (x - first).signum());
+            }
+        } else if (x - ext) * dir > 0.0 {
+            ext = x;
+        } else if (ext - x) * dir > tol {
+            turns.push(ext);
+            (ext, dir) = (x, -dir);
+        }
+    }
+    if dir != 0.0 {
+        turns.push(ext);
+    }
+    turns
+}
+
 fn dist(a: Pt, b: Pt) -> f64 {
     (a.0 - b.0).hypot(a.1 - b.1)
 }
@@ -652,6 +982,28 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
             .map(|&i| End::Node(i))
             .or_else(|| frame_idx.get(id).map(|&i| End::Frame(i)))
     };
+    // A member's edge to its own box is drawn to the box's entry member
+    // (`scene::own_box_targets`), and ends there: (member id, box id,
+    // entry member) of each.
+    let own_box: Vec<(&str, &str, usize)> = g
+        .sub_edges
+        .iter()
+        .zip(scene::own_box_targets(g))
+        .filter_map(|(e, m)| match (e.from, e.to, m) {
+            (crate::model::End::Node(v), crate::model::End::Sub(s), Some(m)) => {
+                Some((g.nodes[v].id.as_str(), g.subgraphs[s].id.as_str(), m))
+            }
+            _ => None,
+        })
+        .collect();
+    let to_of = |e: &SceneEdge| {
+        own_box
+            .iter()
+            .find(|o| o.0 == e.from && o.1 == e.to)
+            .and_then(|o| node_idx.get(g.nodes[o.2].id.as_str()))
+            .map(|&i| End::Node(i))
+            .or_else(|| end_of(&e.to))
+    };
     let frames_of = |e: Option<End>| match e {
         Some(End::Node(n)) => node_frames[n].clone(),
         Some(End::Frame(f)) => frame_chain[f].clone(),
@@ -664,8 +1016,10 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
         .enumerate()
         .filter(|(_, e)| edge_drawn(e) && e.from != e.to)
         .map(|(idx, e)| {
-            let pts = edge_polyline(e);
-            let (from, to) = (end_of(&e.from), end_of(&e.to));
+            // The stroke as painted (a cubic's straight glyph stubs
+            // included), as the casing cuts its gaps in it.
+            let pts = edge_painted_polyline(e);
+            let (from, to) = (end_of(&e.from), to_of(e));
             let mut allowed = frames_of(from);
             allowed.extend(frames_of(to));
             Measured {
@@ -696,7 +1050,7 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
 
     // Frame title chips, as `to_svg` draws them.
     let mut bb = scene::Bbox::new();
-    scene::grow_scene(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+    scene::grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
     let (minx, maxx, miny, maxy) = bb.finish();
     let chips: Vec<Rect> = (0..sc.clusters.len())
         .map(|ci| {
@@ -914,13 +1268,26 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
             m.ortho_edges += 1;
             m.details.push(format!("{}->{} ortho", me.e.from, me.e.to));
         }
+        let (count, name) = match idiom(me.e) {
+            Idiom::Ortho => (&mut m.idiom_ortho, None),
+            Idiom::SCubic => (&mut m.idiom_scubic, Some("scubic")),
+            Idiom::Spline => (&mut m.idiom_spline, Some("spline")),
+            Idiom::Bow => (&mut m.idiom_bow, Some("bow")),
+        };
+        *count += 1;
+        if let Some(name) = name {
+            m.details
+                .push(format!("{}->{} idiom {name}", me.e.from, me.e.to));
+        }
     }
 
     // Edge vs edge: crossings, parallel overlap, gaps.
     for i in 0..edges.len() {
         for j in i + 1..edges.len() {
             let (a, b) = (&edges[i], &edges[j]);
-            if !a.bb.grow(GAP_PROBE).overlaps(b.bb) {
+            // `b`'s box grown a hair: a straight axis-aligned edge has
+            // a box of no width, which overlaps nothing.
+            if !a.bb.grow(GAP_PROBE).overlaps(b.bb.grow(OVERLAP_EPS)) {
                 continue;
             }
             let shared: Vec<Rect> = a
@@ -942,13 +1309,20 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
                     }
                 }
             }
-            m.edge_edge_x += hits.len();
-            for &p in hits.iter().filter(|&&p| near_shared(p)) {
-                m.end_cross += 1;
-                m.details.push(format!(
-                    "{}->{} end_cross {}->{} at ({:.0},{:.0})",
-                    a.e.from, a.e.to, b.e.from, b.e.to, p.0, p.1
-                ));
+            m.x_drawn += hits.len();
+            // The metrics older than `x_drawn` keep their own pair prune
+            // by `b`'s bare box, so they read as they always have: an
+            // exactly level or plumb `b` is not measured against.
+            let legacy = a.bb.grow(GAP_PROBE).overlaps(b.bb);
+            if legacy {
+                m.edge_edge_x += hits.len();
+                for &p in hits.iter().filter(|&&p| near_shared(p)) {
+                    m.end_cross += 1;
+                    m.details.push(format!(
+                        "{}->{} end_cross {}->{} at ({:.0},{:.0})",
+                        a.e.from, a.e.to, b.e.from, b.e.to, p.0, p.1
+                    ));
+                }
             }
             let probe = b.bb.grow(GAP_PROBE);
             let mut run = 0.0;
@@ -963,6 +1337,7 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
                 .enumerate()
                 .any(|(k, &p)| hits[k + 1..].iter().any(|&q| dist(p, q) < TOUCH_CROSS_SKIP));
             let mut touch = if graze { 0.0 } else { f64::INFINITY };
+            let mut band = 0.0;
             for &(p, dir) in &a.dense {
                 if !probe.contains(p) || near_shared(p) {
                     continue;
@@ -989,7 +1364,21 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
                 }
                 if parallel && hits.iter().all(|&q| dist(p, q) >= TOUCH_CROSS_SKIP) {
                     touch = touch.min(best.0);
+                    if (EDGE_SPACING..=PARALLEL_BAND).contains(&best.0) {
+                        band += SAMPLE_STEP;
+                    }
                 }
+            }
+            if band > BAND_RUN_MIN {
+                m.band_pairs += 1;
+                m.band_len += band;
+                m.details.push(format!(
+                    "{}->{} band {}->{} {band:.0}px",
+                    a.e.from, a.e.to, b.e.from, b.e.to
+                ));
+            }
+            if !legacy {
+                continue;
             }
             if tight > TIGHT_RUN_MIN {
                 m.tight_pairs += 1;
@@ -1093,12 +1482,20 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
             if me.e.ends.end_marker(me.e.kind).is_some() {
                 let n = me.pts.len();
                 let tip = me.pts[n - 1];
-                let back = me.pts[..n - 1]
+                let mut back = me.pts[..n - 1]
                     .iter()
                     .rev()
                     .find(|&&p| dist(p, tip) >= ARROW_LEN)
                     .copied()
                     .unwrap_or(me.pts[0]);
+                // On a straight line the head is a head long however
+                // far apart its samples (as the label stage's box, and
+                // like it only for the flowchart painter's edges).
+                let d = dist(back, tip);
+                if d > ARROW_LEN && crate::labels::straight_head_line(me.e, &me.pts) {
+                    let k = ARROW_LEN / d;
+                    back = (tip.0 + (back.0 - tip.0) * k, tip.1 + (back.1 - tip.1) * k);
+                }
                 if r.hits_seg(back, tip) {
                     m.lbl_arrow += 1;
                     m.details
@@ -1245,6 +1642,170 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
         }
     }
 
+    // Ends against the outlines as painted, and the heading of each end
+    // glyph against the side it lands on (report M0, §2.3 / §2.5).
+    let outlines: Vec<Vec<Pt>> = sc.nodes.iter().map(node_outline).collect();
+    for me in &edges {
+        for (end, at_start) in [(me.from, true), (me.to, false)] {
+            let Some(end) = end else { continue };
+            let (tip, head) = edge_end_tangent(me.e, at_start);
+            let (gap, normal) = match end {
+                End::Node(v) => (
+                    poly_dist(&outlines[v], tip),
+                    side_in(&sc.nodes[v], tip, head),
+                ),
+                End::Frame(f) => {
+                    let r = frame_rect[f];
+                    let poly = [(r.0, r.1), (r.2, r.1), (r.2, r.3), (r.0, r.3)];
+                    let (c, half) = (
+                        ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0),
+                        ((r.2 - r.0) / 2.0, (r.3 - r.1) / 2.0),
+                    );
+                    (poly_dist(&poly, tip), box_side_in(c, half, tip))
+                }
+            };
+            let which = if at_start { "start" } else { "end" };
+            m.end_gap_max = m.end_gap_max.max(gap);
+            if gap > END_GAP_TOL {
+                m.end_gaps += 1;
+                m.details.push(format!(
+                    "{}->{} end_gap {which} on {} {gap:.1}px",
+                    me.e.from,
+                    me.e.to,
+                    owner_id(end)
+                ));
+            }
+            let glyph = if at_start {
+                me.e.ends.start_marker(me.e.kind)
+            } else {
+                me.e.ends.end_marker(me.e.kind)
+            };
+            if glyph.is_none() || head == (0.0, 0.0) || normal == (0.0, 0.0) {
+                continue;
+            }
+            // Off square, in degrees; a frame is reached from inside as
+            // well as from out, so either way across its border is square.
+            let off = |h: Pt| {
+                let c = h.0 * normal.0 + h.1 * normal.1;
+                let c = if matches!(end, End::Frame(_)) {
+                    c.abs()
+                } else {
+                    c
+                };
+                c.clamp(-1.0, 1.0).acos().to_degrees()
+            };
+            let tilt = off(head);
+            m.end_tilt_max = m.end_tilt_max.max(tilt);
+            if tilt > END_TILT_TOL {
+                m.end_tilt += 1;
+                m.details.push(format!(
+                    "{}->{} end_tilt {which} on {} {tilt:.1}deg",
+                    me.e.from,
+                    me.e.to,
+                    owner_id(end)
+                ));
+            }
+            let base = head_base_heading(&me.pts, at_start);
+            if let Some(kink) = base.map(off).filter(|&k| k > END_TILT_TOL) {
+                m.end_kink += 1;
+                m.details.push(format!(
+                    "{}->{} end_kink {which} on {} {kink:.1}deg",
+                    me.e.from,
+                    me.e.to,
+                    owner_id(end)
+                ));
+            }
+        }
+    }
+    // A self-loop leaves and re-enters its node's outline as painted too
+    // (report M6: a loop on a parallelogram's or a hexagon's flank used
+    // to start and end on its box, beside the slant).
+    for e in sc.edges.iter().filter(|e| edge_drawn(e) && e.from == e.to) {
+        let Some(&v) = node_idx.get(e.from.as_str()) else {
+            continue;
+        };
+        for (at_start, which) in [(true, "start"), (false, "end")] {
+            let gap = poly_dist(&outlines[v], edge_end_tangent(e, at_start).0);
+            m.end_gap_max = m.end_gap_max.max(gap);
+            if gap > END_GAP_TOL {
+                m.end_gaps += 1;
+                m.details.push(format!(
+                    "{}->{} end_gap {which} on {} {gap:.1}px",
+                    e.from, e.to, e.from
+                ));
+            }
+        }
+    }
+
+    // Sideways reversals (report §2.13): what `wiggles` measures along
+    // the flow, across it. A back-edge keeps its deepest excursion.
+    let across = |p: Pt| if horizontal { p.1 } else { p.0 };
+    let flow = if matches!(g.direction, Direction::BT | Direction::RL) {
+        -1.0
+    } else {
+        1.0
+    };
+    for me in &edges {
+        let lat: Vec<f64> = me.pts.iter().map(|&p| across(p)).collect();
+        let turns = zigzag(&lat, WIGGLE_TOL);
+        let (c0, c1) = (turns[0], turns[turns.len() - 1]);
+        let travel: f64 = turns.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+        // Half the sideways travel beyond the net shift: what `wiggles`
+        // takes along the flow (the lesser of the two ways' totals).
+        let mut lb = (travel - (c1 - c0).abs()) / 2.0;
+        let (p0, p1) = (me.pts[0], me.pts[me.pts.len() - 1]);
+        if (along(p1) - along(p0)) * flow < -WIGGLE_TOL {
+            // A back-edge gets round on one side: its overshoot beyond
+            // its ends' sideways span there is no wiggle.
+            let (hi, lo) = turns
+                .iter()
+                .fold((c0, c0), |b, &c| (b.0.max(c), b.1.min(c)));
+            lb -= (hi - c0.max(c1)).max(c0.min(c1) - lo);
+        }
+        if lb > WIGGLE_TOL {
+            m.lat_wiggles += 1;
+            m.lat_backtrack += lb;
+            m.details
+                .push(format!("{}->{} lat_wiggle {lb:.1}", me.e.from, me.e.to));
+        }
+    }
+
+    // Leaving the innermost frame that holds both ends (report §2.2 #5):
+    // the frames enclosing each end (a frame end's own excluded — the
+    // edge lands on its border).
+    let holders = |e: Option<End>| -> Vec<usize> {
+        match e {
+            Some(End::Node(n)) => node_frames[n].clone(),
+            Some(End::Frame(f)) => frame_chain[f].iter().copied().filter(|&c| c != f).collect(),
+            None => Vec::new(),
+        }
+    };
+    for me in &edges {
+        let (a, b) = (holders(me.from), holders(me.to));
+        let home = a
+            .iter()
+            .copied()
+            .filter(|c| b.contains(c))
+            .max_by_key(|&c| sc.clusters[c].depth);
+        let Some(home) = home else { continue };
+        let r = frame_rect[home];
+        let mut out = 0.0;
+        for w in me.dense.windows(2) {
+            let (p, q) = (w[0].0, w[1].0);
+            if r.dist(((p.0 + q.0) / 2.0, (p.1 + q.1) / 2.0)) > FRAME_INSET {
+                out += dist(p, q);
+            }
+        }
+        if out > 0.0 {
+            m.own_frame_x += 1;
+            m.own_frame_len += out;
+            m.details.push(format!(
+                "{}->{} own_frame {} {out:.0}px",
+                me.e.from, me.e.to, sc.clusters[home].id
+            ));
+        }
+    }
+
     // Largest object centring + canvas.
     let span_lo = if horizontal { miny } else { minx };
     let span_hi = if horizontal { maxy } else { maxx };
@@ -1268,6 +1829,42 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
     m.height = (maxy - miny) + 2.0 * MARGIN;
     m.aspect = m.width.max(m.height) / m.width.min(m.height).max(1.0);
     m.area_per_node = m.width * m.height / m.nodes.max(1) as f64;
+    // Ink: shapes as painted, label boxes, strokes (length × width).
+    let mut ink: f64 = outlines.iter().map(|o| poly_area(o)).sum();
+    ink += labels
+        .iter()
+        .map(|(_, r)| (r.2 - r.0) * (r.3 - r.1))
+        .sum::<f64>();
+    for e in sc.edges.iter().filter(|e| edge_drawn(e)) {
+        let pts = edge_painted_polyline(e);
+        let len: f64 = pts.windows(2).map(|w| dist(w[0], w[1])).sum();
+        ink += len * edge_stroke_width(e);
+    }
+    m.ink = ink / (m.width * m.height).max(1.0);
+    // Ink off the canvas `to_svg` writes: the drawing's bounds and the
+    // padding round them.
+    let (x0, x1, y0, y1) = (minx - MARGIN, maxx + MARGIN, miny - MARGIN, maxy + MARGIN);
+    for e in sc.edges.iter().filter(|e| edge_drawn(e)) {
+        let half = edge_stroke_width(e) / 2.0;
+        let stroke = edge_painted_polyline(e).into_iter().map(|p| (p, half));
+        let glyphs = scene::painted_glyph_corners(e)
+            .into_iter()
+            .map(|p| (p, 0.0));
+        let out = stroke
+            .chain(glyphs)
+            .map(|((x, y), pad)| {
+                (x0 - (x - pad))
+                    .max(y0 - (y - pad))
+                    .max(x + pad - x1)
+                    .max(y + pad - y1)
+            })
+            .fold(f64::NEG_INFINITY, f64::max);
+        if out > 0.0 {
+            m.ink_out += 1;
+            m.details
+                .push(format!("{}->{} ink_out {out:.1}px", e.from, e.to));
+        }
+    }
     m
 }
 
@@ -1310,5 +1907,303 @@ mod tests {
             ),
             (0, 0, 0, 0, 0)
         );
+    }
+
+    /// A flowchart and its static scene, for hand-drawn edge geometry.
+    fn laid(src: &str) -> (Graph, Scene) {
+        let g = match parse_document(src).unwrap() {
+            Document::Flowchart(g) => g,
+            _ => unreachable!("a flowchart"),
+        };
+        let sc = scene::scene(&g);
+        (g, sc)
+    }
+
+    /// Redraw `e` as straight segments through `pts` exactly (mermaid's
+    /// `linear` curve), so a test knows every drawn point.
+    fn draw_linear(e: &mut SceneEdge, pts: &[Pt]) {
+        let (a, b) = (pts[0], pts[pts.len() - 1]);
+        e.waypoints = pts.to_vec();
+        e.bezier = [a, a, b, b];
+        e.meta.curve = Some(EdgeCurve::Linear);
+    }
+
+    /// Redraw `e` as the one default cubic `b`.
+    fn draw_cubic(e: &mut SceneEdge, b: [Pt; 4]) {
+        e.waypoints.clear();
+        e.bezier = b;
+        e.meta.curve = None;
+    }
+
+    fn bottom(n: &SceneNode) -> Pt {
+        (n.x, n.y + n.h / 2.0)
+    }
+
+    fn top(n: &SceneNode) -> Pt {
+        (n.x, n.y - n.h / 2.0)
+    }
+
+    #[test]
+    fn end_tilt_reads_the_drawn_heading_against_the_side() {
+        let (g, mut sc) = laid("flowchart TD\nA-->B");
+        // As laid out: one straight spine, square onto both sides.
+        let m = measure(&g, &sc);
+        assert_eq!((m.end_tilt, m.end_tilt_max), (0, 0.0), "{m:?}");
+        // The arrowhead comes in at 45° from the upper left onto B's
+        // top side; the start (no glyph) is not judged.
+        let (p0, p3) = (bottom(&sc.nodes[0]), top(&sc.nodes[1]));
+        let c2 = (p3.0 - 30.0, p3.1 - 30.0);
+        draw_cubic(&mut sc.edges[0], [p0, (p0.0, p0.1 + 20.0), c2, p3]);
+        let m = measure(&g, &sc);
+        assert_eq!(m.end_tilt, 1, "{m:?}");
+        assert!((m.end_tilt_max - 45.0).abs() < 1e-6, "{}", m.end_tilt_max);
+        assert_eq!(m.end_kink, 1, "{m:?}");
+        // A line still turning under the head kinks at its base however
+        // square the head: an S whose last 6 px drop straight onto the
+        // side meets the head's base (a head's length up) at 45°.
+        let tip = top(&sc.nodes[1]);
+        let mid = ((p0.1 + tip.1) / 2.0, tip.1 - 6.0);
+        draw_linear(
+            &mut sc.edges[0],
+            &[
+                p0,
+                (p0.0, mid.0),
+                (tip.0 - 20.0, mid.1 - 20.0),
+                (tip.0, mid.1),
+                tip,
+            ],
+        );
+        let m = measure(&g, &sc);
+        assert_eq!((m.end_tilt, m.end_kink), (0, 1), "{m:?}");
+        // The heading is the drawn one: a polyline whose last leg drops
+        // straight onto the side is square, however it got there.
+        let mid = (p3.0 - 40.0, (p0.1 + p3.1) / 2.0);
+        draw_linear(&mut sc.edges[0], &[p0, mid, (p3.0, mid.1), p3]);
+        assert_eq!(measure(&g, &sc).end_tilt, 0);
+        // Onto a circle an end aims at the centre: radial is square,
+        // straight down beside the centre is not.
+        let (g, mut sc) = laid("flowchart TD\nA-->B((round))");
+        let (p0, c) = (bottom(&sc.nodes[0]), (sc.nodes[1].x, sc.nodes[1].y));
+        let r = sc.nodes[1].w / 2.0;
+        let off = r * 0.5;
+        let tip = (c.0 + off, c.1 - (r * r - off * off).sqrt());
+        draw_linear(&mut sc.edges[0], &[p0, (tip.0, p0.1), tip]);
+        let m = measure(&g, &sc);
+        assert_eq!(m.end_tilt, 1, "{m:?}");
+        assert!((m.end_tilt_max - 30.0).abs() < 1e-6, "{}", m.end_tilt_max);
+        assert!(m.end_gap_max < END_GAP_TOL, "{}", m.end_gap_max);
+    }
+
+    #[test]
+    fn end_gaps_measure_the_painted_outline() {
+        // Every shape's own ends, as laid out, sit on the outline or
+        // the metric says by how much (the slanted and capped shapes
+        // are the known offenders, report §2.5); a plain chain is clean.
+        let (g, sc) = laid("flowchart TD\nA-->B(r)-->C([s])-->D((c))-->E{d}");
+        let m = measure(&g, &sc);
+        assert_eq!(m.end_gaps, 0, "{m:?}");
+        // An end at a hexagon's box corner floats off its slanted face
+        // by the corner's distance to that face.
+        let (g, mut sc) = laid("flowchart TD\nA-->B{{hexagon node}}");
+        let n = &sc.nodes[1];
+        let (l, t, hh) = (n.x - n.w / 2.0, n.y - n.h / 2.0, n.h / 2.0);
+        let k = 14.0f64.min(n.w / 4.0);
+        let want = k * hh / k.hypot(hh);
+        let p0 = bottom(&sc.nodes[0]);
+        draw_linear(&mut sc.edges[0], &[p0, (l, p0.1), (l, t)]);
+        let m = measure(&g, &sc);
+        assert_eq!(m.end_gaps, 1, "{m:?}");
+        assert!(
+            (m.end_gap_max - want).abs() < 1e-6,
+            "{} vs {want}",
+            m.end_gap_max
+        );
+        // A cylinder's top is its cap: the box's top corner is off it,
+        // the cap's crown is on it.
+        let (g, mut sc) = laid("flowchart TD\nA-->B[(database)]");
+        let n = &sc.nodes[1];
+        let (l, t, crown) = (n.x - n.w / 2.0, n.y - n.h / 2.0, top(n));
+        let p0 = bottom(&sc.nodes[0]);
+        draw_linear(&mut sc.edges[0], &[p0, (l + 1.0, p0.1), (l + 1.0, t)]);
+        assert_eq!(measure(&g, &sc).end_gaps, 1);
+        draw_linear(&mut sc.edges[0], &[p0, crown]);
+        let m = measure(&g, &sc);
+        assert_eq!(m.end_gaps, 0, "{m:?}");
+        assert!(m.end_gap_max < 1e-9, "{}", m.end_gap_max);
+    }
+
+    #[test]
+    fn sideways_hairpins_are_wiggles_a_back_edges_lane_is_not() {
+        let (g, mut sc) = laid("flowchart TD\nA-->B\nB-->A");
+        let m = measure(&g, &sc);
+        assert_eq!(m.lat_wiggles, 0, "{m:?}");
+        let (a, b) = (bottom(&sc.nodes[0]), top(&sc.nodes[1]));
+        let (y1, y2) = (a.1 + 10.0, a.1 + 20.0);
+        // Forward A->B: 30 px right, 30 px back left, then down. Monotone
+        // along the flow, so the flow-axis `wiggles` cannot see it.
+        draw_linear(
+            &mut sc.edges[0],
+            &[
+                a,
+                (a.0, y1),
+                (a.0 + 30.0, y1),
+                (a.0 + 30.0, y2),
+                (a.0, y2),
+                b,
+            ],
+        );
+        // B->A up a lane 60 px to the side: one excursion, allowed.
+        let (bs, ae) = ((b.0 + 8.0, b.1), (a.0 + 8.0, a.1));
+        let lane = [
+            bs,
+            (bs.0, bs.1 - 4.0),
+            (bs.0 + 60.0, bs.1 - 4.0),
+            (bs.0 + 60.0, ae.1 + 4.0),
+            (ae.0, ae.1 + 4.0),
+            ae,
+        ];
+        draw_linear(&mut sc.edges[1], &lane);
+        let m = measure(&g, &sc);
+        assert_eq!(m.wiggles, 0, "{m:?}");
+        assert_eq!(m.lat_wiggles, 1, "{m:?}");
+        assert!((m.lat_backtrack - 30.0).abs() < 1e-9, "{}", m.lat_backtrack);
+        // A second, 20 px hook on the lane is one excursion too many.
+        let mut hooked = lane.to_vec();
+        let y = (bs.1 + ae.1) / 2.0;
+        hooked.splice(
+            3..3,
+            [
+                (bs.0 + 60.0, y),
+                (bs.0 + 40.0, y),
+                (bs.0 + 40.0, y - 4.0),
+                (bs.0 + 60.0, y - 4.0),
+            ],
+        );
+        draw_linear(&mut sc.edges[1], &hooked);
+        let m = measure(&g, &sc);
+        assert_eq!(m.lat_wiggles, 2, "{m:?}");
+        assert!((m.lat_backtrack - 50.0).abs() < 1e-9, "{}", m.lat_backtrack);
+        // Runs read with the tolerance: jitter below it is no run.
+        assert_eq!(
+            zigzag(&[0.0, 10.0, 5.0, 20.0], WIGGLE_TOL),
+            [0.0, 10.0, 5.0, 20.0]
+        );
+        assert_eq!(zigzag(&[0.0, 10.0, 8.0, 20.0], WIGGLE_TOL), [0.0, 20.0]);
+        assert_eq!(zigzag(&[0.0, 2.0, -1.0], WIGGLE_TOL), [0.0]);
+    }
+
+    #[test]
+    fn leaving_the_frame_both_ends_share_is_an_escape() {
+        let (g, mut sc) = laid("flowchart TD\nsubgraph S\nA-->B\nend\nC-->A");
+        let m = measure(&g, &sc);
+        assert_eq!((m.own_frame_x, m.own_frame_len), (0, 0.0), "{m:?}");
+        let f = &sc.clusters[0];
+        let right = f.x + f.w;
+        let (a, b) = (bottom(&sc.nodes[0]), top(&sc.nodes[1]));
+        let (y1, y2) = (a.1 + 5.0, b.1 - 5.0);
+        // Out 20 px past S's right border and back, inside it again.
+        draw_linear(
+            &mut sc.edges[0],
+            &[
+                a,
+                (a.0, y1),
+                (right + 20.0, y1),
+                (right + 20.0, y2),
+                (a.0, y2),
+                b,
+            ],
+        );
+        let m = measure(&g, &sc);
+        assert_eq!(m.own_frame_x, 1, "{m:?}");
+        let want = 2.0 * 19.0 + (y2 - y1);
+        assert!(
+            (m.own_frame_len - want).abs() <= 2.0 * SAMPLE_STEP,
+            "{}",
+            m.own_frame_len
+        );
+        // C->A has one end outside S: it may (must) cross the border.
+        assert!(m.details.iter().all(|d| !d.starts_with("C->A own_frame")));
+    }
+
+    #[test]
+    fn long_parallel_cables_and_idioms() {
+        let (g, mut sc) = laid("flowchart TD\nA-->B\nC-->D");
+        let m = measure(&g, &sc);
+        assert_eq!((m.idiom_ortho, m.band_pairs), (2, 0), "{m:?}");
+        // Two lines side by side for 200 px, 10 px apart: one cable.
+        let (x, y) = (sc.nodes[0].x, sc.nodes[0].y);
+        draw_linear(&mut sc.edges[0], &[(x, y), (x, y + 200.0)]);
+        draw_linear(&mut sc.edges[1], &[(x + 10.0, y), (x + 10.0, y + 200.0)]);
+        let m = measure(&g, &sc);
+        assert_eq!(m.band_pairs, 1, "{m:?}");
+        assert!(
+            (m.band_len - 200.0).abs() <= 2.0 * SAMPLE_STEP,
+            "{}",
+            m.band_len
+        );
+        // Further apart than the band they read as two lines.
+        draw_linear(&mut sc.edges[1], &[(x + 30.0, y), (x + 30.0, y + 200.0)]);
+        assert_eq!(measure(&g, &sc).band_pairs, 0);
+        // The idioms: an S, a bow, a spline through a dummy chain, and
+        // an orthogonal path; together they are every edge.
+        let s = [(0.0, 0.0), (0.0, 30.0), (50.0, 30.0), (50.0, 60.0)];
+        draw_cubic(&mut sc.edges[0], s);
+        assert_eq!(idiom(&sc.edges[0]), Idiom::SCubic);
+        let bow = [(0.0, 100.0), (80.0, 60.0), (80.0, 40.0), (0.0, 0.0)];
+        draw_cubic(&mut sc.edges[0], bow);
+        assert_eq!(idiom(&sc.edges[0]), Idiom::Bow);
+        let mut chain = sc.edges[0].clone();
+        chain.waypoints = vec![(0.0, 0.0), (10.0, 40.0), (30.0, 80.0), (30.0, 120.0)];
+        assert_eq!(idiom(&chain), Idiom::Spline);
+        chain.waypoints =
+            crate::router::smooth(&[(0.0, 0.0), (0.0, 40.0), (30.0, 40.0), (30.0, 120.0)], 6.0);
+        assert_eq!(idiom(&chain), Idiom::Ortho);
+        let m = measure(&g, &sc);
+        assert_eq!((m.idiom_bow, m.idiom_ortho), (1, 1), "{m:?}");
+        assert_eq!(
+            m.idiom_ortho + m.idiom_scubic + m.idiom_spline + m.idiom_bow,
+            m.edges
+        );
+    }
+
+    #[test]
+    fn drawn_crossings_include_level_and_plumb_edges() {
+        let (g, mut sc) = laid("flowchart TD\nA-->B\nC-->D");
+        let (x, y) = (sc.nodes[0].x, sc.nodes[0].y);
+        // A plumb line crossed by a level one: neither has a box with
+        // any width, so the older count's prune never pairs them.
+        draw_linear(&mut sc.edges[0], &[(x, y), (x, y + 200.0)]);
+        draw_linear(
+            &mut sc.edges[1],
+            &[(x - 50.0, y + 100.0), (x + 50.0, y + 100.0)],
+        );
+        let m = measure(&g, &sc);
+        assert_eq!((m.edge_edge_x, m.x_drawn), (0, 1), "{m:?}");
+        // A curve has a box: both counts see it cross.
+        draw_cubic(
+            &mut sc.edges[1],
+            [
+                (x - 50.0, y + 90.0),
+                (x, y + 90.0),
+                (x, y + 110.0),
+                (x + 50.0, y + 110.0),
+            ],
+        );
+        let m = measure(&g, &sc);
+        assert_eq!((m.edge_edge_x, m.x_drawn), (1, 1), "{m:?}");
+    }
+
+    #[test]
+    fn ink_is_the_painted_share_of_the_canvas() {
+        let (g, sc) = laid("flowchart TD\nA[a lone box]");
+        let m = measure(&g, &sc);
+        let n = &sc.nodes[0];
+        // The box less its four 3 px corner roundings.
+        let area = n.w * n.h - (4.0 - std::f64::consts::PI) * 9.0;
+        let want = area / (m.width * m.height);
+        assert!((m.ink - want).abs() < 1e-3 * want, "{} vs {want}", m.ink);
+        // An edge adds its stroke.
+        let (g, sc) = laid("flowchart TD\nA[a lone box]-->B[another]");
+        assert!(measure(&g, &sc).ink > 0.0);
     }
 }

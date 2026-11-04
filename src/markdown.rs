@@ -13,22 +13,12 @@
 //! rendering already understand, so no model change is needed and
 //! labels without markdown are untouched.
 
-use crate::layout::{text_width, TEXT_CALIBRATION};
+use crate::layout::text_width;
 use crate::parser::{decode_entities, normalize_breaks};
 
 /// Opening and closing delimiters of a mermaid markdown string.
 pub(crate) const MD_OPEN: &str = "\"`";
 pub(crate) const MD_CLOSE: &str = "`\"";
-
-/// Font size (px) mermaid lays labels out at.
-const MERMAID_LABEL_FONT_PX: f64 = 16.0;
-/// Mermaid's markdown wrapping width, in its px: `flowchart.wrappingWidth`
-/// in mermaid 11 (also the fixed width of edge labels). Mermaid 12
-/// lowered the node default to 120.
-const MD_WRAP_WIDTH_MERMAID_PX: f64 = 200.0;
-/// The same width in flowmaid's units (14px text), so the same words
-/// break as in mermaid's 16px rendering.
-const MD_WRAP_WIDTH: f64 = MD_WRAP_WIDTH_MERMAID_PX * TEXT_CALIBRATION / MERMAID_LABEL_FONT_PX;
 
 /// The inner text of a whole-label markdown string (`"`…`"`), if `s`
 /// (trimmed) is one.
@@ -71,11 +61,14 @@ pub(crate) fn leaves_open(s: &str) -> bool {
 }
 
 /// Lower the body of a markdown string into label markup. `wrap`
-/// greedy-wraps each line at mermaid's width (node labels);
-/// `single_line` joins the lines with spaces (edge labels and subgraph
-/// titles, which are one line in flowmaid). A raw backtick or `"` in
-/// the body is an error, as in mermaid's lexer.
-pub(crate) fn lower(raw: &str, wrap: bool, single_line: bool) -> Result<String, String> {
+/// wraps each line at that width (node labels: the graph's
+/// [`crate::model::Graph::wrapping_width`], [`crate::layout::WRAP_WIDTH`]
+/// by default — mermaid's markdown labels wrap like its plain ones),
+/// balanced as [`crate::layout::wrap_label`] wraps a plain label; `single_line`
+/// joins the lines with spaces (edge labels and subgraph titles, which
+/// are one line in flowmaid). A raw backtick or `"` in the body is an
+/// error, as in mermaid's lexer.
+pub(crate) fn lower(raw: &str, wrap: Option<f64>, single_line: bool) -> Result<String, String> {
     if raw.contains(['`', '"']) {
         return Err("a markdown string cannot contain a raw backtick or quote \
                     — write #96; or #quot;"
@@ -87,7 +80,7 @@ pub(crate) fn lower(raw: &str, wrap: bool, single_line: bool) -> Result<String, 
 /// [`lower`] for markdown that never went through mermaid's string
 /// lexer (a node-metadata `label`), so backticks and quotes are plain
 /// characters, printed as written like any other unsupported markdown.
-pub(crate) fn lower_text(raw: &str, wrap: bool, single_line: bool) -> String {
+pub(crate) fn lower_text(raw: &str, wrap: Option<f64>, single_line: bool) -> String {
     let mut lines: Vec<Line> = Vec::new();
     for unit in units(&normalize_breaks(raw)) {
         match unit {
@@ -96,10 +89,12 @@ pub(crate) fn lower_text(raw: &str, wrap: bool, single_line: bool) -> String {
         }
     }
     let lines: Vec<Line> = lines.into_iter().map(trim_line).collect();
-    let out: Vec<String> = if wrap {
-        lines.into_iter().flat_map(wrap_line).collect()
-    } else {
-        lines.iter().map(markup).collect()
+    let out: Vec<String> = match wrap {
+        Some(width) => lines
+            .into_iter()
+            .flat_map(|l| wrap_line(l, width))
+            .collect(),
+        None => lines.iter().map(markup).collect(),
     };
     out.join(if single_line { " " } else { "\n" })
 }
@@ -436,69 +431,24 @@ fn trim_line(mut l: Line) -> Line {
     l
 }
 
-/// Label markup for a styled line: adjacent runs of one style merge,
-/// a styled run becomes `<b>…</b>`, `<i>…</i>` or `<b><i>…</i></b>`.
+/// `l` as label markup ([`crate::wrap::markup`]).
 fn markup(l: &Line) -> String {
-    let mut merged: Line = Vec::new();
-    for (t, b, i) in l {
-        match merged.last_mut() {
-            Some(last) if last.1 == *b && last.2 == *i => last.0.push_str(t),
-            _ => merged.push((t.clone(), *b, *i)),
-        }
-    }
-    merged
-        .into_iter()
-        .map(|(t, b, i)| match (b, i) {
-            (false, false) => t,
-            (true, false) => format!("<b>{t}</b>"),
-            (false, true) => format!("<i>{t}</i>"),
-            (true, true) => format!("<b><i>{t}</i></b>"),
-        })
-        .collect()
+    crate::wrap::markup(l)
 }
 
-/// Greedy word wrap at [`MD_WRAP_WIDTH`], measured with the same
-/// estimate node sizing uses (bold counts wider, tags count zero). A
-/// word wider than the limit keeps a line to itself, unsplit, as in
-/// mermaid's HTML labels. A space keeps the style it was written in.
-fn wrap_line(l: Line) -> Vec<String> {
-    // Words (a word may mix styles), each with the style of the space
-    // before it.
-    let mut words: Vec<(Line, (bool, bool))> = vec![(Vec::new(), (false, false))];
-    for (t, b, i) in l {
-        for (k, part) in t.split(' ').enumerate() {
-            if k > 0 {
-                if words.last().is_some_and(|w| w.0.is_empty()) {
-                    words.pop();
-                }
-                words.push((Vec::new(), (b, i)));
-            }
-            if !part.is_empty() {
-                let w = &mut words.last_mut().expect("non-empty").0;
-                w.push((part.to_string(), b, i));
-            }
-        }
+/// Word wrap of one styled line at `width` px, measured with the same
+/// estimate node sizing uses (bold counts wider, tags count zero), as
+/// [`crate::layout::wrap_label`] wraps a plain label
+/// ([`crate::wrap::wrap`]): into as few lines as fit, evened out,
+/// breaking between CJK characters too. A word wider than the limit
+/// keeps a line to itself, unsplit, as in mermaid's HTML labels. A
+/// space keeps the style it was written in.
+fn wrap_line(l: Line, width: f64) -> Vec<String> {
+    let toks = crate::wrap::Tokens::new(&l);
+    if toks.len() == 0 {
+        return vec![String::new()];
     }
-    words.retain(|w| !w.0.is_empty());
-    let mut out: Vec<String> = Vec::new();
-    let mut cur: Line = Vec::new();
-    for (w, (sb, si)) in words {
-        if cur.is_empty() {
-            cur = w;
-            continue;
-        }
-        let mut cand = cur.clone();
-        cand.push((" ".to_string(), sb, si));
-        cand.extend(w.iter().cloned());
-        if text_width(&markup(&cand)) > MD_WRAP_WIDTH {
-            out.push(markup(&cur));
-            cur = w;
-        } else {
-            cur = cand;
-        }
-    }
-    out.push(markup(&cur));
-    out
+    toks.lines(&crate::wrap::wrap(&toks.widths(text_width), width))
 }
 
 #[cfg(test)]
@@ -506,7 +456,7 @@ mod tests {
     use super::*;
 
     fn lo(s: &str) -> String {
-        lower(s, false, false).unwrap()
+        lower(s, None, false).unwrap()
     }
 
     /// The pre-optimisation quadratic matcher, kept as the reference
@@ -605,7 +555,7 @@ mod tests {
         for unit in ["_*", "*_", "**_", "_ *", "a_*b"] {
             let label = unit.repeat(LABEL_BYTES / unit.len());
             let t = std::time::Instant::now();
-            lower(&label, false, false).unwrap();
+            lower(&label, None, false).unwrap();
             let took = t.elapsed();
             assert!(took < bound, "{unit:?}: {took:?}");
         }
@@ -656,38 +606,82 @@ mod tests {
         assert_eq!(lo("1. **x**\n2) y\n> q\n---"), "1. **x**\n2) y\n> q\n---");
         // Emphasis spans a soft line break.
         assert_eq!(lo("**a\nb**"), "<b>a</b>\n<b>b</b>");
-        assert_eq!(lower("two\n  lines", false, true).unwrap(), "two lines");
+        assert_eq!(lower("two\n  lines", None, true).unwrap(), "two lines");
         // Links and strikethrough print raw, as in mermaid's HTML path.
         assert_eq!(lo("[a](b) ~~x~~"), "[a](b) ~~x~~");
     }
 
     #[test]
     fn raw_backticks_and_quotes_are_errors() {
-        assert!(lower("bad ` tick", false, false).is_err());
-        assert!(lower("say \"hi\"", false, false).is_err());
+        assert!(lower("bad ` tick", None, false).is_err());
+        assert!(lower("say \"hi\"", None, false).is_err());
         assert_eq!(lo(""), "");
     }
 
     #[test]
-    fn wrapping_is_greedy_and_never_splits_words() {
+    fn wrapping_is_balanced_and_never_splits_words() {
+        let w = 120.0;
         let out = lower(
             "The quick brown fox jumps over the lazy dog and keeps running far away",
-            true,
+            Some(w),
             false,
         )
         .unwrap();
         let lines: Vec<&str> = out.split('\n').collect();
         assert!(lines.len() > 1, "{out}");
-        assert!(
-            lines.iter().all(|l| text_width(l) <= MD_WRAP_WIDTH),
-            "{out}"
-        );
+        assert!(lines.iter().all(|l| text_width(l) <= w), "{out}");
+        // As few lines as greedy filling needs, evened out: no line ends
+        // far shorter than the rest ("… far away" is not left behind).
+        let widths: Vec<f64> = lines.iter().map(|l| text_width(l)).collect();
+        let (lo, hi) = widths
+            .iter()
+            .fold((f64::INFINITY, 0.0f64), |(a, b), &x| (a.min(x), b.max(x)));
+        assert!(hi - lo < w / 2.0, "{out}");
         let word = "Supercalifragilisticexpialidociousword";
-        assert_eq!(lower(word, true, false).unwrap(), word);
+        assert_eq!(lower(word, Some(w), false).unwrap(), word);
         // Styled words keep their style across the break, and the space
         // between same-styled words joins the run.
-        let out = lower("**bold words here** and more", true, false).unwrap();
+        let out = lower("**bold words here** and more", Some(200.0), false).unwrap();
         assert_eq!(out, "<b>bold words here</b> and more");
+        let out = lower("**bold words here** and more", Some(w), false).unwrap();
+        assert_eq!(out, "<b>bold words</b>\n<b>here</b> and more");
+    }
+
+    /// B6 review r1 #6: a markdown node label's lines are broken as it
+    /// is lowered, but the graph keeps the markdown: `to_mermaid` writes
+    /// it back as written (no `<br/>` of the width's), and
+    /// `set_wrapping_width` lowers it again at the new width. A label
+    /// set some other way since is left alone.
+    #[test]
+    fn markdown_labels_round_trip_and_rewrap_as_written() {
+        let body = "**Markdown** label that is _long_ enough to wrap at the width";
+        let src = format!("flowchart TD\nJ[\"`{body}`\"] --> K@{{ label: \"**meta** {body}\" }}");
+        let mut g = crate::parser::parse(&src).unwrap();
+        assert!(g.nodes[0].label.contains('\n'), "{:?}", g.nodes[0].label);
+        let text = crate::to_mermaid(&g);
+        assert!(text.contains(&format!("\"`{body}`\"")), "{text}");
+        assert!(text.contains(&format!("\"`**meta** {body}`\"")), "{text}");
+        assert!(!text.contains("<br"), "{text}");
+        let back = crate::parser::parse(&text).unwrap();
+        assert_eq!(back.nodes[0].label, g.nodes[0].label);
+        assert_eq!(back.nodes[1].label, g.nodes[1].label);
+        // A narrower width breaks it into more lines; none, into one.
+        let lines = |g: &crate::model::Graph| g.nodes[0].label.lines().count();
+        let two = lines(&g);
+        g.set_wrapping_width(Some(80.0));
+        assert!(lines(&g) > two, "{:?}", g.nodes[0].label);
+        assert!(g.nodes[1].label.lines().count() > 2);
+        g.set_wrapping_width(None);
+        assert_eq!(lines(&g), 1);
+        assert_eq!(
+            g.nodes[0].label,
+            "<b>Markdown</b> label that is <i>long</i> enough to wrap at the width"
+        );
+        // An edited label is the host's: kept, and written as it is.
+        g.nodes[0].label = "Edited".to_string();
+        g.set_wrapping_width(Some(80.0));
+        assert_eq!(g.nodes[0].label, "Edited");
+        assert!(crate::to_mermaid(&g).contains("J[\"Edited\"]"));
     }
 
     #[test]

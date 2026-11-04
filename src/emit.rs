@@ -91,6 +91,17 @@ pub fn to_mermaid(g: &Graph) -> String {
     check_preconditions(g);
 
     let mut out = String::new();
+    // A wrapping width of its own (report M7) rides an init directive,
+    // so the source re-parses into the same drawing. The labels go out
+    // as written: their automatic breaks are the layout's, not text.
+    if let Some(w) = g
+        .wrapping_width()
+        .filter(|&w| w != crate::layout::WRAP_WIDTH)
+    {
+        out.push_str(&format!(
+            "%%{{init: {{\"flowchart\": {{\"wrappingWidth\": {w}}}}}}}%%\n"
+        ));
+    }
     out.push_str("flowchart ");
     out.push_str(dir_token(g.direction));
     out.push('\n');
@@ -460,6 +471,13 @@ fn node_ref(g: &Graph, i: usize) -> String {
         return n.id.clone();
     }
     let (open, close) = shape_delims(n.shape);
+    // A markdown label goes back as the markdown it was written in, not
+    // as its lowered lines (whose breaks the width put there); a body
+    // the string lexer could not hold (a metadata label's backtick or
+    // quote) falls back to the lowered text.
+    if let Some(body) = g.md_label(i).filter(|b| !b.contains(['`', '"'])) {
+        return format!("{}{}\"`{}`\"{}", n.id, open, body, close);
+    }
     format!("{}{}{}{}", n.id, open, label_text(&n.label), close)
 }
 
@@ -925,6 +943,38 @@ mod tests {
              E((circle)) --> F(((double))) --> G[(db)] --> H[[sub]]\n\
              I{{hex}} --> J[/para/] --> K[\\alt\\]\n\
              A --- B\n A -.-> C\n A -.- D\n A ==> E\n A === F\n A ~~~ G\n",
+        );
+    }
+
+    #[test]
+    fn state_note_cards_and_choice_survive_as_flowchart_text() {
+        // A state diagram's note cards are plain styled boxes with a
+        // dotted link, and its choice an empty diamond: all of it has a
+        // flowchart form, so the text keeps the cards, their colours and
+        // the compact choice.
+        let doc = crate::parser::parse_document(
+            "stateDiagram-v2\nstate c <<choice>>\nA --> c\nc --> B : yes\n\
+             note right of B\nkept\nas text\nend note",
+        )
+        .unwrap();
+        let crate::model::Document::State(g) = doc else {
+            panic!("a state diagram");
+        };
+        let text = to_mermaid(&g);
+        let back = parse(&text).unwrap_or_else(|e| panic!("{e}\n--\n{text}"));
+        assert_eq!((back.nodes.len(), back.edges.len()), (4, 3), "{text}");
+        let card = back
+            .nodes
+            .iter()
+            .find(|n| n.label == "kept\nas text")
+            .unwrap();
+        assert_eq!(card.style, g.nodes[3].style, "{text}");
+        assert!(back.edges.iter().any(|e| e.kind == EdgeKind::DottedOpen));
+        let c = &back.nodes[back.node_index("c").unwrap()];
+        let size = crate::layout::intrinsic_size(c);
+        assert_eq!(
+            size,
+            (crate::layout::CHOICE_SIZE, crate::layout::CHOICE_SIZE)
         );
     }
 

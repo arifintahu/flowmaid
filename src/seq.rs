@@ -15,9 +15,9 @@
 //! draw exactly what SVG exports.
 
 use crate::layout::text_width;
+use crate::model::Shape;
 use crate::model::{FrameKind, NoteSide, SeqHead, SeqItem, SequenceDiagram};
-use crate::scene::{escape, svg_open_a11y, A11y, SvgOptions, EDGE_COLOR, TEXT_COLOR};
-use crate::style::NOTE_STYLE;
+use crate::scene::{escape, svg_open_a11y, A11y, SvgOptions};
 
 /// Participant header box height.
 pub const BOX_H: f64 = 34.0;
@@ -41,7 +41,8 @@ const NEST_SHIFT: f64 = 3.0; // a nested activation bar's shift right
 /// Dash pattern of dashed messages (on, off) — see [`dash_offset`].
 const MSG_DASH: (f64, f64) = (6.0, 4.0);
 
-/// Lifelines + frame borders (lighter than the message lines).
+/// Lifelines + frame borders (lighter than the message lines), in the
+/// default theme ([`Palette::guide`] in any other).
 const GUIDE_COLOR: &str = "#aeb6d8";
 
 /// One participant box (header, or its footer mirror). Top-left
@@ -825,18 +826,21 @@ pub fn to_svg_with(sc: &SeqScene, opts: &SvgOptions) -> String {
 /// *under* the activation bars (the label glyphs go over them): a
 /// card on top cut a white gap into any bar it crossed, which read as
 /// two separate activations.
-fn label_backing(s: &mut String, x: f64, cy: f64, text: &str) {
+fn label_backing(s: &mut String, x: f64, cy: f64, text: &str, canvas: &str) {
     s.push_str(&format!(
-        "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"16\" fill=\"#ffffff\"/>\n",
+        "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"16\" fill=\"{}\"/>\n",
         x - 2.0,
         cy - 8.0,
-        text_width(text) + 4.0
+        text_width(text) + 4.0,
+        canvas
     ));
 }
 
 /// [`to_svg_with`] plus mermaid's `accTitle` / `accDescr` (see [`A11y`]).
 pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) -> String {
     let (title, desc) = a11y.resolve("Sequence diagram");
+    let pal = opts.palette();
+    let guide = pal.tuned(GUIDE_COLOR, &pal.guide);
     let mut s = String::new();
     svg_open_a11y(&mut s, sc.width, sc.height, 13, &title, desc, opts);
 
@@ -845,7 +849,7 @@ pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) ->
         s.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"4\" \
              fill=\"none\" stroke=\"{}\" stroke-width=\"1.2\"/>\n",
-            f.x, f.y, f.w, f.h, GUIDE_COLOR
+            f.x, f.y, f.w, f.h, guide
         ));
     }
     // …then lifelines and the `else` / `and` dividers — as heavy as
@@ -855,7 +859,7 @@ pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) ->
         s.push_str(&format!(
             "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{}\" \
              stroke-dasharray=\"4 4\"/>\n",
-            l.x, l.y0, l.x, l.y1, GUIDE_COLOR
+            l.x, l.y0, l.x, l.y1, guide
         ));
     }
     for f in &sc.frames {
@@ -867,24 +871,27 @@ pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) ->
                 dy,
                 f.x + f.w,
                 dy,
-                GUIDE_COLOR
+                guide
             ));
         }
     }
-    // …then the label backgrounds: each frame's keyword chip and the
-    // white cards under its branch labels…
+    // …then the label backgrounds: each frame's keyword chip (in a
+    // plain node's fill) and the canvas-coloured cards under its branch
+    // labels…
+    let chip_fill = pal.node_style(Shape::Rect).0;
     for f in &sc.frames {
         s.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"18\" \
-             fill=\"#eef1fb\" stroke=\"{}\"/>\n",
+             fill=\"{}\" stroke=\"{}\"/>\n",
             f.x,
             f.y,
             chip_w(f.kind),
-            GUIDE_COLOR
+            chip_fill,
+            guide
         ));
         let lx = frame_label_x(f);
         for (cy, text) in frame_label_rows(f) {
-            label_backing(&mut s, lx, cy, &text);
+            label_backing(&mut s, lx, cy, &text, &pal.background);
         }
     }
     // …activation bars over all of it (neither a divider nor a label
@@ -892,12 +899,13 @@ pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) ->
     for a in &sc.activations {
         s.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
-             fill=\"#ffffff\" stroke=\"{}\" stroke-width=\"1.4\"/>\n",
+             fill=\"{}\" stroke=\"{}\" stroke-width=\"1.4\"/>\n",
             a.x - ACT_W / 2.0,
             a.y0,
             ACT_W,
             a.y1 - a.y0,
-            crate::style::accent(a.participant)
+            pal.surface,
+            pal.item(a.participant).stroke
         ));
     }
     // …then the chip keywords and branch labels over the bars. All
@@ -909,7 +917,7 @@ pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) ->
              font-weight=\"bold\" fill=\"{}\">{}</text>\n",
             f.x + chip_w(f.kind) / 2.0,
             f.y + 9.0,
-            TEXT_COLOR,
+            pal.node_text,
             escape(f.kind.keyword())
         ));
         let lx = frame_label_x(f);
@@ -918,7 +926,7 @@ pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) ->
                 "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" fill=\"{}\">{}</text>\n",
                 lx,
                 cy,
-                TEXT_COLOR,
+                pal.text,
                 escape(&text)
             ));
         }
@@ -927,14 +935,14 @@ pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) ->
         s.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"3\" \
              fill=\"{}\" stroke=\"{}\" stroke-width=\"1.2\"/>\n",
-            nb.x, nb.y, nb.w, nb.h, NOTE_STYLE.fill, NOTE_STYLE.stroke
+            nb.x, nb.y, nb.w, nb.h, pal.note_fill, pal.note_stroke
         ));
         s.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" text-anchor=\"middle\" \
              fill=\"{}\">{}</text>\n",
             nb.x + nb.w / 2.0,
             nb.y + nb.h / 2.0,
-            TEXT_COLOR,
+            pal.note_text,
             escape(&nb.text)
         ));
     }
@@ -963,11 +971,15 @@ pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) ->
         s.push_str(&format!(
             "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"1.6\"{}/>\n",
             path.trim_end(),
-            EDGE_COLOR,
+            pal.line,
             dash
         ));
         let np = m.points.len();
-        write_head(&mut s, &head(m.points[np - 1], m.points[np - 2], m.head));
+        write_head(
+            &mut s,
+            &head(m.points[np - 1], m.points[np - 2], m.head),
+            &pal.line,
+        );
         if m.text.is_empty() && m.number.is_none() {
             continue;
         }
@@ -983,7 +995,7 @@ pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) ->
                 m.label_pos.0,
                 m.label_pos.1,
                 anchor,
-                TEXT_COLOR,
+                pal.text,
                 k,
                 escape(&m.text)
             )),
@@ -992,7 +1004,7 @@ pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) ->
                 m.label_pos.0,
                 m.label_pos.1,
                 anchor,
-                TEXT_COLOR,
+                pal.text,
                 escape(&m.text)
             )),
         }
@@ -1001,27 +1013,28 @@ pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) ->
     // row then the footer mirror. Participants get a filled box, actors
     // a stick figure with their name below. Text keeps ≥ 4.5:1 either
     // way: an actor's name is its accent darkened as needed for the
-    // white canvas, a participant's is white or dark ink by contrast
-    // with its fill.
+    // canvas, a participant's is white or dark ink by contrast with its
+    // fill (a mermaid-like theme paints every participant alike, see
+    // `Palette::item`).
     let n = sc.boxes.len();
     for (k, b) in sc.boxes.iter().chain(&sc.footer).enumerate() {
         let i = if n == 0 { k } else { k % n };
-        let accent = crate::style::accent(i);
+        let paint = pal.item(i);
         if b.actor {
-            write_actor(&mut s, b, accent, crate::style::accent_ink(i));
+            write_actor(&mut s, b, paint.stroke, &paint.canvas_ink, &pal.background);
             continue;
         }
         s.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"4\" \
              fill=\"{}\" stroke=\"{}\" stroke-width=\"1.6\"/>\n",
-            b.x, b.y, b.w, b.h, accent, accent
+            b.x, b.y, b.w, b.h, paint.fill, paint.stroke
         ));
         s.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" text-anchor=\"middle\" \
              font-weight=\"bold\" fill=\"{}\">{}</text>\n",
             b.x + b.w / 2.0,
             b.y + b.h / 2.0,
-            crate::style::text_on(accent),
+            paint.ink,
             escape(&b.label)
         ));
     }
@@ -1030,13 +1043,13 @@ pub(crate) fn to_svg_a11y_with(sc: &SeqScene, a11y: &A11y, opts: &SvgOptions) ->
 }
 
 /// An actor as its UML stick figure ([`actor_figure`]) in its accent,
-/// name below in `ink`.
-fn write_actor(s: &mut String, b: &PartBox, accent: &str, ink: &str) {
+/// head filled with the `canvas`, name below in `ink`.
+fn write_actor(s: &mut String, b: &PartBox, accent: &str, ink: &str, canvas: &str) {
     let fig = actor_figure(b);
     s.push_str(&format!(
-        "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"#ffffff\" stroke=\"{}\" \
+        "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{}\" stroke=\"{}\" \
          stroke-width=\"1.6\"/>\n",
-        fig.head.0, fig.head.1, fig.head_r, accent
+        fig.head.0, fig.head.1, fig.head_r, canvas, accent
     ));
     let d = fig
         .segments
@@ -1059,7 +1072,7 @@ fn write_actor(s: &mut String, b: &PartBox, accent: &str, ink: &str) {
     ));
 }
 
-fn write_head(s: &mut String, h: &Head) {
+fn write_head(s: &mut String, h: &Head, line: &str) {
     if !h.polygon.is_empty() {
         let pts = h
             .polygon
@@ -1069,14 +1082,14 @@ fn write_head(s: &mut String, h: &Head) {
             .join(" ");
         s.push_str(&format!(
             "<polygon points=\"{}\" fill=\"{}\"/>\n",
-            pts, EDGE_COLOR
+            pts, line
         ));
     }
     for [a, b] in &h.segments {
         s.push_str(&format!(
             "<path d=\"M {:.1} {:.1} L {:.1} {:.1}\" fill=\"none\" stroke=\"{}\" \
              stroke-width=\"1.6\"/>\n",
-            a.0, a.1, b.0, b.1, EDGE_COLOR
+            a.0, a.1, b.0, b.1, line
         ));
     }
 }
@@ -1086,6 +1099,7 @@ mod tests {
     use super::*;
     use crate::model::Document;
     use crate::parser::parse_document;
+    use crate::style::NOTE_STYLE;
 
     fn sd(src: &str) -> SequenceDiagram {
         match parse_document(src).unwrap() {

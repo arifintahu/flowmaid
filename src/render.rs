@@ -209,6 +209,16 @@ mod tests {
             Some(g.subgraphs.iter().position(|s| s.id == "Platform").unwrap())
         );
         assert_eq!(workers.direction, Some(crate::model::Direction::LR));
+        // Mentioning Q / W1 / W2 in `Platform` after `Workers` closed
+        // leaves them in `Workers` (mermaid: the first block to close
+        // keeps a node); re-claiming them used to empty the nested box,
+        // which then was not drawn at all.
+        let ids: Vec<&str> = workers
+            .nodes
+            .iter()
+            .map(|&v| g.nodes[v].id.as_str())
+            .collect();
+        assert_eq!(ids, ["Q", "W1", "W2"]);
         // Edges targeting a subgraph landed in sub_edges (Dev->CI,
         // Reg->Platform, Platform->Mon, Rollback->Platform).
         assert!(
@@ -260,6 +270,18 @@ mod tests {
         assert!(svg.contains("<polygon"), "hexagon/parallelogram polygons");
         assert!(svg.matches("<circle").count() >= 2, "double circle");
         assert!(svg.contains("CI/CD Pipeline") && svg.contains("Production Platform"));
+        assert!(
+            svg.contains(">Async Workers</text>"),
+            "the nested box's title"
+        );
+        // One frame per subgraph, the nested one inside its parent.
+        let frame = |d: usize| {
+            let c = crate::style::cluster_style(d);
+            svg.matches(&format!("fill=\"{}\" stroke=\"{}\"", c.fill, c.stroke))
+                .count()
+        };
+        assert_eq!(frame(0) + frame(1), 3, "3 cluster rects for 3 subgraphs");
+        assert_eq!(frame(1), 1, "the nested one a step deeper");
 
         // Interactive path stays consistent: route() over the auto
         // positions yields the same node/edge/cluster counts.
@@ -269,6 +291,67 @@ mod tests {
         assert_eq!(s0.nodes.len(), s1.nodes.len());
         assert_eq!(s0.edges.len(), s1.edges.len());
         assert_eq!(s0.clusters.len(), s1.clusters.len());
+
+        // `Reg --> Platform` ranks the CI box above Platform, though a
+        // cycle (`Cache --> Gate`) gives every Platform member an
+        // internal in-edge; the boxes used to sit side by side.
+        let frame = |id: &str| s0.clusters.iter().find(|c| c.id == id).unwrap();
+        let (ci, pf) = (frame("CI"), frame("Platform"));
+        assert!(
+            ci.y + ci.h < pf.y,
+            "CI bottom {} must be above Platform top {}",
+            ci.y + ci.h,
+            pf.y
+        );
+        let ends = |from: &str, to: &str| {
+            let e = s0
+                .edges
+                .iter()
+                .find(|e| e.from == from && e.to == to)
+                .unwrap();
+            let pl = crate::scene::edge_polyline(e);
+            (pl[0], pl[pl.len() - 1])
+        };
+        // It drops onto Platform's top side from above ...
+        let (p0, p3) = ends("Reg", "Platform");
+        assert!((p3.1 - pf.y).abs() < 0.5 && p0.1 < p3.1, "{p0:?} -> {p3:?}");
+        assert!(p3.0 > pf.x && p3.0 < pf.x + pf.w);
+        // ... and `Rollback --> Platform` runs straight up into its
+        // bottom side: no S towards the box's entry member at its top.
+        let (p0, p3) = ends("Rollback", "Platform");
+        assert!((p3.1 - (pf.y + pf.h)).abs() < 0.5, "{p3:?}");
+        assert!((p0.0 - p3.0).abs() < 0.5, "straight: {p0:?} -> {p3:?}");
+
+        // No edge ends on its own frame's border: `Dev --> CI`, Dev
+        // inside CI, leads down onto Build (CI's entry member), in the
+        // static scene and in route() alike — it was an arrow up to CI's
+        // top border beside the title, against the flow.
+        for sc in [&s0, &s1] {
+            let e = sc
+                .edges
+                .iter()
+                .find(|e| e.from == "Dev" && e.to == "CI")
+                .unwrap();
+            let pl = crate::scene::edge_polyline(e);
+            let (p0, p3) = (pl[0], pl[pl.len() - 1]);
+            let node = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
+            let (dev, build) = (node("Dev"), node("Build"));
+            assert!(
+                (p0.1 - (dev.y + dev.h / 2.0)).abs() < 1.0,
+                "leaves Dev's bottom"
+            );
+            assert!(
+                (p3.1 - (build.y - build.h / 2.0)).abs() < 1.0,
+                "enters Build's top"
+            );
+            let f = sc.clusters.iter().find(|c| c.id == "CI").unwrap();
+            for q in [p0, p3] {
+                assert!(
+                    (q.1 - f.y).abs() > 1.0 && (q.1 - f.y - f.h).abs() > 1.0,
+                    "an end on CI's frame: {q:?}"
+                );
+            }
+        }
     }
 
     /// End-to-end showcase for stateDiagram-v2 riding the flowchart
@@ -302,6 +385,13 @@ mod tests {
         let svg = render(&g);
         assert!(!svg.contains("NaN") && !svg.contains("inf"));
         assert!(svg.contains("Validating") && svg.contains(">submit</text>"));
+        // The note is drawn (it used to vanish without a trace), its
+        // link named after the card, the choice and bars after their ids.
+        assert!(svg.contains(">shown to the user</text>"));
+        assert!(svg.contains("<title>Rejected → note</title>"));
+        for id in ["decide", "forked", "joined"] {
+            assert!(svg.contains(&format!("<g><title>{id}</title>")), "{id}");
+        }
         let (w, h) = (attr(&svg, "width"), attr(&svg, "height"));
         for line in paths(&svg).iter().filter(|p| p.contains(" C ")) {
             for (x, y) in coords(line) {
@@ -315,6 +405,60 @@ mod tests {
         let s1 = crate::scene::route(&g, &pos);
         assert_eq!(s0.nodes.len(), s1.nodes.len());
         assert_eq!(s0.edges.len(), s1.edges.len());
+    }
+
+    /// State notes ride the flowchart pipeline as boxes of their own:
+    /// placed by `right of` / `left of` along the flow like mermaid,
+    /// joined by a dotted line, and picked, dragged and rerouted like
+    /// any node.
+    #[test]
+    fn state_note_cards_are_placed_and_interactive() {
+        use crate::model::Document;
+        use crate::scene::{route, route_partial, scene, Hit};
+        let src = "stateDiagram-v2\n[*] --> A\nA --> B\nB --> C\nC --> [*]\n\
+                   note right of A : after A\nnote left of C : before C";
+        let Document::State(g) = crate::parser::parse_document(src).unwrap() else {
+            panic!("a state diagram");
+        };
+        let sc = scene(&g);
+        let at = |id: &str| &sc.nodes[g.node_index(id).unwrap()];
+        let card = |text: &str| sc.nodes.iter().position(|n| n.label == text).unwrap();
+        let (after, before) = (card("after A"), card("before C"));
+        let (a, b, c) = (at("A"), at("B"), at("C"));
+        // `right of A` sits on B's layer (after A); `left of C` on B's
+        // layer too (just before C), not parked on the top layer.
+        assert!((sc.nodes[after].y - b.y).abs() < 1.0, "right of: after A");
+        assert!((sc.nodes[before].y - b.y).abs() < 1.0, "left of: before C");
+        assert!(a.y < b.y && b.y < c.y);
+        // The link is drawn dotted, without an arrowhead.
+        let svg = render(&g);
+        let link = svg
+            .lines()
+            .find(|l| l.contains("<title>A → note</title>"))
+            .expect("the note link is drawn");
+        assert!(link.contains("stroke-dasharray") && !link.contains("marker-end"));
+        // Interactive: a card is picked where it is drawn, and dragging
+        // it reroutes its link from the new spot.
+        let n = &sc.nodes[after];
+        assert_eq!(sc.hit_test(n.x, n.y, 4.0), Some(Hit::Node(after)));
+        let base: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let mut moved = base.clone();
+        // Down and left, into free space below B.
+        moved[after].0 -= 100.0;
+        moved[after].1 += 110.0;
+        assert_eq!(sc.node_at(moved[after].0, moved[after].1), None);
+        let link_of = |s: &crate::scene::Scene| {
+            s.edges
+                .iter()
+                .find(|e| e.to == g.nodes[after].id)
+                .map(|e| e.bezier[3])
+                .unwrap()
+        };
+        for s in [route(&g, &moved), route_partial(&g, &moved, &sc, &base)] {
+            assert_eq!(s.node_at(moved[after].0, moved[after].1), Some(after));
+            let end = link_of(&s);
+            assert!((end.0 - moved[after].0).abs() < n.w / 2.0 + 0.5, "{end:?}");
+        }
     }
 
     #[test]
@@ -367,13 +511,19 @@ mod tests {
 
     #[test]
     fn back_edge_routes_around_widest_layer() {
+        // The lane clears the widest layer it passes (report §2.2): the
+        // drawn path reaches past every node box.
         let src =
             "flowchart TD\nA --> B1\nA --> B2\nA --> B3\nB1 --> C\nB2 --> C\nB3 --> C\nC --> A";
         let g = parse(src).unwrap();
         let svg = render(&g);
         let back = paths(&svg).pop().unwrap(); // last edge = C --> A
         let c = coords(&back);
-        let apex_x = 0.125 * (c[0].0 + c[3].0) + 0.75 * c[1].0;
+        let lane_x = |pick: fn(f64, f64) -> f64, init: f64| c.iter().map(|p| p.0).fold(init, pick);
+        let (lo, hi) = (
+            lane_x(f64::min, f64::INFINITY),
+            lane_x(f64::max, f64::NEG_INFINITY),
+        );
         let mut min_left = f64::INFINITY;
         let mut max_right = f64::NEG_INFINITY;
         for line in svg.lines().filter(|l| l.starts_with("<rect x=")) {
@@ -383,11 +533,16 @@ mod tests {
             max_right = max_right.max(x + w);
         }
         assert!(
-            apex_x > max_right + 8.0 || apex_x < min_left - 8.0,
-            "back-edge apex ({:.0}) must clear the nodes [{:.0}..{:.0}]",
-            apex_x,
-            min_left,
-            max_right
+            hi > max_right + 8.0 || lo < min_left - 8.0,
+            "back-edge lane ({lo:.0}..{hi:.0}) must clear the nodes [{min_left:.0}..{max_right:.0}]"
         );
+        // Square out of and into its ends: across the flow side, or (by
+        // A's fan and C's fan-in heading the lane's way) the side facing
+        // the lane.
+        let n = c.len();
+        let square =
+            |p: (f64, f64), q: (f64, f64)| (p.0 - q.0).abs() < 0.2 || (p.1 - q.1).abs() < 0.2;
+        assert!(square(c[0], c[1]), "leaves square: {c:?}");
+        assert!(square(c[n - 1], c[n - 2]), "enters square: {c:?}");
     }
 }

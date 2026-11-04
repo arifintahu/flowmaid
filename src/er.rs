@@ -16,9 +16,10 @@
 use crate::layout::{text_width, LABEL_BOX_H};
 use crate::model::{Attr, Card, EdgeKind, Entity, ErDiagram, Graph, Shape};
 use crate::scene::{
-    edge_path_d, edge_polyline, escape, fit_top_left, route_sized, scene_sized, seg_aabb,
-    svg_label_box, svg_open_a11y, A11y, Scene, SceneEdge, SvgOptions, EDGE_COLOR, TEXT_COLOR,
+    edge_path_d, edge_polyline, edge_stroke_width, escape, fit_top_left, route_sized, scene_sized,
+    seg_aabb, svg_label_box, svg_open_a11y, A11y, Scene, SceneEdge, SvgOptions,
 };
+use crate::style::Palette;
 
 /// Table header height in pixels.
 pub const HEADER_H: f64 = 30.0;
@@ -33,7 +34,8 @@ pub const COL_GAP: f64 = 14.0;
 /// paragraph-long comment cannot stretch its table across the canvas.
 pub const COMMENT_MAX_W: f64 = 280.0;
 
-/// Muted colour for the attribute type column (and comments).
+/// Muted colour for the attribute type column (and comments) in the
+/// default theme ([`Palette::muted_text`] in any theme).
 pub const TYPE_COLOR: &str = "#6a7086";
 
 /// Stroke width of relationship lines and their crow's foot glyphs.
@@ -182,6 +184,11 @@ fn assemble(d: &ErDiagram, tables: Vec<ErTable>, mut scene: Scene, g: &Graph) ->
         .collect();
     // Here, not in the SVG writer, so GUI painters get the same spots.
     labels_off_glyphs(&mut scene, &cards);
+    // The width `to_svg` strokes, kept on the edges so picking
+    // (`Scene::edge_at` / `hits_in_rect`) covers the very same pixels.
+    for e in &mut scene.edges {
+        e.paint_width = Some(LINE_W);
+    }
     ErScene {
         scene,
         tables,
@@ -200,6 +207,11 @@ fn assemble(d: &ErDiagram, tables: Vec<ErTable>, mut scene: Scene, g: &Graph) ->
 fn build(d: &ErDiagram) -> (Graph, Vec<ErTable>, Vec<(f64, f64)>) {
     let mut g = Graph::default();
     g.direction = d.direction;
+    // Boxes are sized and their text laid out by this module's own
+    // painter: node labels never wrap.
+    g.set_wrapping_width(None);
+    // The ER painter strokes the edges and draws their ends itself.
+    g.edge_paint_width = Some(LINE_W);
     for e in &d.entities {
         g.ensure_node(&e.name, Some(e.title().to_string()), Some(Shape::Rect));
     }
@@ -371,6 +383,7 @@ pub(crate) fn to_svg_a11y_with(es: &ErScene, a11y: &A11y, opts: &SvgOptions) -> 
     let (title, desc) = a11y.resolve("Entity-relationship diagram");
     let fitted = fit_top_left(&es.scene);
     let sc = &*fitted;
+    let pal = opts.palette();
     let mut s = String::new();
     svg_open_a11y(&mut s, sc.width, sc.height, 13, &title, desc, opts);
 
@@ -385,21 +398,24 @@ pub(crate) fn to_svg_a11y_with(es: &ErScene, a11y: &A11y, opts: &SvgOptions) -> 
         s.push_str(&format!(
             "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{}\"{}/>\n",
             edge_path_d(e, |p| p),
-            EDGE_COLOR,
-            LINE_W,
+            pal.line,
+            edge_stroke_width(e), // LINE_W, as `assemble` set it
             dash
         ));
     }
 
-    // Entity tables — each entity gets a stable accent color.
+    // Entity tables — each entity gets a stable accent color (in the
+    // default theme; a mermaid-like theme paints them all alike, see
+    // `Palette::item`).
     for (i, (n, table)) in sc.nodes.iter().zip(&es.tables).enumerate() {
-        let accent = crate::style::accent(i);
+        let paint = pal.item(i);
+        let accent = paint.fill;
         let x0 = n.x - n.w / 2.0;
         let y0 = n.y - n.h / 2.0;
         s.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"4\" \
-             fill=\"#ffffff\"/>\n",
-            x0, y0, n.w, n.h
+             fill=\"{}\"/>\n",
+            x0, y0, n.w, n.h, pal.surface
         ));
         // The band is square where it meets the body: rounding its
         // bottom corners left white notches at the join. Its top
@@ -441,7 +457,7 @@ pub(crate) fn to_svg_a11y_with(es: &ErScene, a11y: &A11y, opts: &SvgOptions) -> 
              font-weight=\"bold\" fill=\"{}\">{}</text>\n",
             n.x,
             y0 + HEADER_H / 2.0,
-            crate::style::text_on(accent),
+            paint.ink,
             escape(&table.title)
         ));
         for (r, row) in table.rows.iter().enumerate() {
@@ -454,19 +470,19 @@ pub(crate) fn to_svg_a11y_with(es: &ErScene, a11y: &A11y, opts: &SvgOptions) -> 
                     ry,
                     x0 + n.w,
                     ry,
-                    crate::scene::LABEL_BORDER
+                    pal.label_border
                 ));
             }
             let tyc = ry + ROW_H / 2.0;
-            text_at(&mut s, x0 + PAD, tyc, "", TYPE_COLOR, &row.ty);
-            text_at(&mut s, x0 + table.name_x(), tyc, "", TEXT_COLOR, &row.name);
+            text_at(&mut s, x0 + PAD, tyc, "", &pal.muted_text, &row.ty);
+            text_at(&mut s, x0 + table.name_x(), tyc, "", &pal.text, &row.name);
             if !row.keys.is_empty() {
                 text_at(
                     &mut s,
                     x0 + table.keys_end_x(n.w),
                     tyc,
                     " text-anchor=\"end\" font-weight=\"bold\"",
-                    EDGE_COLOR,
+                    &pal.line,
                     &row.keys,
                 );
             }
@@ -484,7 +500,7 @@ pub(crate) fn to_svg_a11y_with(es: &ErScene, a11y: &A11y, opts: &SvgOptions) -> 
                      fill=\"{}\">{}{}</text>\n",
                     x0 + table.comment_x(),
                     tyc,
-                    TYPE_COLOR,
+                    pal.muted_text,
                     tip,
                     escape(&row.comment)
                 ));
@@ -495,7 +511,7 @@ pub(crate) fn to_svg_a11y_with(es: &ErScene, a11y: &A11y, opts: &SvgOptions) -> 
         s.push_str(&format!(
             "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"4\" \
              fill=\"none\" stroke=\"{}\" stroke-width=\"1.6\"/>\n",
-            x0, y0, n.w, n.h, accent
+            x0, y0, n.w, n.h, paint.stroke
         ));
     }
 
@@ -504,14 +520,14 @@ pub(crate) fn to_svg_a11y_with(es: &ErScene, a11y: &A11y, opts: &SvgOptions) -> 
     // them into the band).
     for (e, &(card_from, card_to)) in sc.edges.iter().zip(&es.cards) {
         let [a, b] = end_glyphs(e, (card_from, card_to));
-        write_glyph(&mut s, &a);
-        write_glyph(&mut s, &b);
+        write_glyph(&mut s, &a, &pal);
+        write_glyph(&mut s, &b, &pal);
     }
 
     // Relationship labels on top of everything.
     for e in &sc.edges {
         if let Some((text, m, w)) = &e.label {
-            svg_label_box(&mut s, text, *m, *w);
+            svg_label_box(&mut s, text, *m, *w, &pal);
         }
     }
 
@@ -530,19 +546,21 @@ fn text_at(s: &mut String, x: f64, y: f64, extra: &str, fill: &str, text: &str) 
     ));
 }
 
-fn write_glyph(s: &mut String, g: &Glyph) {
+/// One crow's foot in the theme's line colour; its zero-ring is filled
+/// with the canvas, so it reads hollow over the line beneath it.
+fn write_glyph(s: &mut String, g: &Glyph, pal: &Palette) {
     for [a, b] in &g.segments {
         s.push_str(&format!(
             "<path d=\"M {:.1} {:.1} L {:.1} {:.1}\" fill=\"none\" stroke=\"{}\" \
              stroke-width=\"{}\"/>\n",
-            a.0, a.1, b.0, b.1, EDGE_COLOR, LINE_W
+            a.0, a.1, b.0, b.1, pal.line, LINE_W
         ));
     }
     if let Some((c, r)) = g.circle {
         s.push_str(&format!(
-            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"#ffffff\" stroke=\"{}\" \
+            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{}\" stroke=\"{}\" \
              stroke-width=\"{}\"/>\n",
-            c.0, c.1, r, EDGE_COLOR, LINE_W
+            c.0, c.1, r, pal.background, pal.line, LINE_W
         ));
     }
 }
@@ -847,7 +865,9 @@ fn free_stretch_spots(e: &SceneEdge, reach: (f64, f64), w: f64) -> Vec<(f64, f64
     let pts = edge_polyline(e);
     let walk = Walk::new(&pts);
     let total = walk.len();
-    let at = |t: f64| walk.at(t.clamp(0.0, total));
+    // Not `clamp`: that panics when a NaN centre from a host makes
+    // `total` NaN.
+    let at = |t: f64| walk.at(t.max(0.0).min(total));
     let (lo, hi) = (reach.0, total - reach.1);
     let mid = if lo <= hi {
         (lo + hi) / 2.0
