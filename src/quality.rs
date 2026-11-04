@@ -1482,12 +1482,19 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
             if me.e.ends.end_marker(me.e.kind).is_some() {
                 let n = me.pts.len();
                 let tip = me.pts[n - 1];
-                let back = me.pts[..n - 1]
+                let mut back = me.pts[..n - 1]
                     .iter()
                     .rev()
                     .find(|&&p| dist(p, tip) >= ARROW_LEN)
                     .copied()
                     .unwrap_or(me.pts[0]);
+                // On a straight line the head is a head long however
+                // far apart its samples (as the label stage's box).
+                let d = dist(back, tip);
+                if d > ARROW_LEN && crate::labels::runs_straight_across(&me.pts) {
+                    let k = ARROW_LEN / d;
+                    back = (tip.0 + (back.0 - tip.0) * k, tip.1 + (back.1 - tip.1) * k);
+                }
                 if r.hits_seg(back, tip) {
                     m.lbl_arrow += 1;
                     m.details

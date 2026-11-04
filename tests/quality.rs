@@ -315,8 +315,12 @@ fn layout_shape_gate() {
     /// ceiling locked the defect in): wide-labels' back-edge no longer
     /// loops under the row by its label's width, so the LR drawing is as
     /// flat as its row of long labels (345 -> 160 px tall, aspect 11.97;
-    /// mermaid draws it at 13.6).
-    const MAX_ASPECT: f64 = 12.5;
+    /// mermaid draws it at 13.6). 12.5 -> 12.6 with B7 review r3 #4: its
+    /// `consumed asynchronously by the worker pool` lies on its straight
+    /// line instead of above it (the head box on a straight line no
+    /// longer runs the line's whole length), the canvas 2.4 px shorter
+    /// (160 -> 157.6 px, aspect 12.32 -> 12.51), the drawing unchanged.
+    const MAX_ASPECT: f64 = 12.6;
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/quality");
     for &(name, _, _) in CEILINGS {
         let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");

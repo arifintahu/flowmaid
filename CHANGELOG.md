@@ -182,7 +182,13 @@ Minor, not patch: several class structs gain public fields (see
   used to leave about 6 px, one dash of a dotted edge, and a thick or
   coloured edge read as plain); where a drag brings the ends nearer than
   that, the label steps beside its line instead of hiding the stroke. A
-  plain edge's gap is unchanged. A decision's branch label sits in
+  plain edge's gap is unchanged. On a straight line across the page a
+  head keeps a label only its own length (and 3 px) away: a `curve:
+  linear` or `step` edge's label no longer steps beside its line (the
+  head's room took the whole line), and `route()` keeps such a label on
+  its line where `scene()` does (its straight curve's sparse samples
+  near the ends made the head 21 px long, so a 1 px drag moved the
+  label 20 px). A decision's branch label sits in
   the middle of its curve, where the S runs straight, instead of in the
   half that turns into its target. So does a hub's (a node with more
   ends) where the drawing runs down the page: the gap grows (by up to

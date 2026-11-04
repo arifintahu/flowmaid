@@ -1046,6 +1046,64 @@ pub(crate) fn chip_rect(clusters: &[SceneCluster], ci: usize, canvas_right: f64)
     )
 }
 
+/// Whether polyline `pts` runs straight across the page (its chord more
+/// across than down, as an LR / RL label lies along its line): every
+/// sample within [`TOUCH_EPS`] of the chord between its ends.
+pub(crate) fn runs_straight_across(pts: &[(f64, f64)]) -> bool {
+    let (Some(&a), Some(&b)) = (pts.first(), pts.last()) else {
+        return false;
+    };
+    let len = (b.0 - a.0).hypot(b.1 - a.1);
+    (b.0 - a.0).abs() > (b.1 - a.1).abs()
+        && pts.iter().all(|p| {
+            ((p.0 - a.0) * (b.1 - a.1) - (p.1 - a.1) * (b.0 - a.0)).abs() / len <= TOUCH_EPS
+        })
+}
+
+/// Most (px) an arrowhead's box reaches back from its tip along a line
+/// that [`runs_straight_across`]: a head and half a [`LABEL_CLEAR`], so a label
+/// stays a few px off it, and one the label stage centres on the run
+/// clear of its head (`head_clear_spot`, LABEL_CLEAR off) still fits.
+const STRAIGHT_HEAD_BOX: f64 = ARROW_MARKER_PX + LABEL_CLEAR / 2.0;
+
+/// [`arrow_box`] at either end of polyline `pts` (the tip `at_end` or at
+/// its start), on a line that [`runs_straight_across`] no longer than
+/// [`STRAIGHT_HEAD_BOX`] (B7 review r3 #4). The box reaches back to the
+/// first sample a head's length off the tip — on a coarsely sampled
+/// curve past the head, the chord the eye follows there — but on a
+/// straight line that chord is the line itself: a `curve: linear`
+/// edge's head took its whole line, and a straight route() cubic's,
+/// whose samples thin out toward its ends, 21 px, so an LR label scene()
+/// centred on its line between tail and head (`head_clear_spot`, in a
+/// gap the layout sized for it) stepped beside it in route() and jumped
+/// 20 px under a 1 px drag. (`quality`'s `lbl_arrow` measures the head
+/// itself there, a head long.) Down the page a label is a row tall and
+/// its gap keeps a [`crate::layout::LABEL_RUN`] either side; the box
+/// there is as it was.
+fn end_arrow_box(pts: &[(f64, f64)], at_end: bool, straight: bool) -> Option<Rect> {
+    let tip = if at_end { *pts.last()? } else { *pts.first()? };
+    let back = |n: usize| -> Box<dyn Iterator<Item = (f64, f64)> + '_> {
+        if at_end {
+            Box::new(pts.iter().rev().copied().take(n))
+        } else {
+            Box::new(pts.iter().copied().take(n))
+        }
+    };
+    if straight {
+        // The sample the box would reach back to, and how far that is.
+        let far = back(pts.len())
+            .find(|p| (p.0 - tip.0).hypot(p.1 - tip.1) >= ARROW_MARKER_PX)
+            .unwrap_or(if at_end { pts[0] } else { pts[pts.len() - 1] });
+        let d = (far.0 - tip.0).hypot(far.1 - tip.1);
+        if d > STRAIGHT_HEAD_BOX {
+            let k = STRAIGHT_HEAD_BOX / d;
+            let base = (tip.0 + (far.0 - tip.0) * k, tip.1 + (far.1 - tip.1) * k);
+            return arrow_box(tip, [base].into_iter());
+        }
+    }
+    arrow_box(tip, back(pts.len()))
+}
+
 /// Box an arrowhead drawn at the end `tip` of a polyline (walked
 /// backwards by `back`) occupies: [`ARROW_MARKER_PX`] wide, from the tip
 /// back to the first sample at least that far (the far end of a shorter
@@ -1661,16 +1719,14 @@ fn place(
     // one by LABEL_GAP no longer fits the gap the layout sized for it.
     for (e, pts) in edges.iter().zip(&lines) {
         let Some(pts) = pts else { continue };
-        let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else {
-            continue;
-        };
+        let straight = runs_straight_across(pts);
         if e.ends.end_marker(e.kind).is_some() {
-            if let Some(r) = arrow_box(last, pts.iter().rev().copied()) {
+            if let Some(r) = end_arrow_box(pts, true, straight) {
                 fixed.push(r, Kind::Arrow);
             }
         }
         if e.ends.start_marker(e.kind).is_some() {
-            if let Some(r) = arrow_box(first, pts.iter().copied()) {
+            if let Some(r) = end_arrow_box(pts, false, straight) {
                 fixed.push(r, Kind::Arrow);
             }
         }
@@ -2964,14 +3020,12 @@ pub(crate) fn label_clashes(nodes: &[SceneNode], edges: &[SceneEdge]) -> Vec<boo
     let mut heads: Vec<(usize, Rect)> = Vec::new();
     for (j, (e, pts)) in edges.iter().zip(&lines).enumerate() {
         let Some(pts) = pts else { continue };
-        let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else {
-            continue;
-        };
+        let straight = runs_straight_across(pts);
         if e.ends.end_marker(e.kind).is_some() {
-            heads.extend(arrow_box(last, pts.iter().rev().copied()).map(|r| (j, r)));
+            heads.extend(end_arrow_box(pts, true, straight).map(|r| (j, r)));
         }
         if e.ends.start_marker(e.kind).is_some() {
-            heads.extend(arrow_box(first, pts.iter().copied()).map(|r| (j, r)));
+            heads.extend(end_arrow_box(pts, false, straight).map(|r| (j, r)));
         }
     }
     let meets = |a: Rect, b: Rect| a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3;
@@ -3104,24 +3158,67 @@ mod tests {
         let sc = crate::scene::scene(&g);
         let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
         let routed = crate::scene::route(&g, &at);
-        for (mode, sc) in [("scene", &sc), ("route", &routed)] {
-            let mut on_line = 0;
+        // B7 review r3 #4: route()'s 'a much longer label here' stayed
+        // beside its line (its straight cubic's samples thin out toward
+        // the ends, and the head box ran 21 px back to the last one), so
+        // a 1 px drag of D or E moved it 20 px. Every label now lies on
+        // its line in scene() and route() alike, and holds still.
+        let mut dragged = at.clone();
+        dragged[3].0 += 1.0;
+        let partial = crate::scene::route_partial(&g, &dragged, &sc, &at);
+        for (mode, sc) in [("scene", &sc), ("route", &routed), ("drag", &partial)] {
             for e in &sc.edges {
                 let (text, c, w) = e.label.as_ref().unwrap();
                 let (a, b) = (e.bezier[0], e.bezier[3]);
                 assert!((a.1 - b.1).abs() < 1e-6, "{mode} {text}: straight");
-                if (c.1 - a.1).abs() > FAN_ON_LINE {
-                    continue;
-                }
-                on_line += 1;
+                assert!(
+                    (c.1 - a.1).abs() <= FAN_ON_LINE,
+                    "{mode} {text}: on its line"
+                );
                 let tail = c.0 - w / 2.0 - a.0;
                 let head = b.0 - ARROW_MARKER_PX - (c.0 + w / 2.0);
                 assert!(
-                    head >= LABEL_CLEAR - 1e-6 && (tail - head).abs() < 1e-6,
+                    head >= LABEL_CLEAR - 0.5 - 1e-6 && (tail - head).abs() < 1.0 + 1e-6,
                     "{mode} {text}: tail {tail:.1} head {head:.1}"
                 );
             }
-            assert!(on_line >= 3, "{mode}: {on_line} labels on their lines");
+        }
+        for (e, f) in sc.edges.iter().zip(&partial.edges) {
+            let (c, d) = (e.label.as_ref().unwrap().1, f.label.as_ref().unwrap().1);
+            assert!((c.0 - d.0).hypot(c.1 - d.1) <= 1.0 + 1e-6, "{c:?} -> {d:?}");
+        }
+    }
+
+    #[test]
+    fn a_straight_linear_lr_edge_keeps_its_label_on_its_line() {
+        // B7 review r3 #4: a `curve: linear` (or step) edge is drawn as
+        // two samples, and its head's box took the whole line, so its
+        // label always stepped beside it. On a straight line across the
+        // page the box is a head (and half a LABEL_CLEAR) long.
+        let g = crate::parser::parse(
+            "flowchart LR
+  A[Alpha] e1@-->|styled red| B[Beta]
+  B -->|stepped| C[Gamma]
+               e1@{ curve: linear }
+  linkStyle 1 interpolate step
+",
+        )
+        .unwrap();
+        let sc = crate::scene::scene(&g);
+        let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let routed = crate::scene::route(&g, &at);
+        for (mode, sc) in [("scene", &sc), ("route", &routed)] {
+            for e in &sc.edges {
+                let (text, c, _) = e.label.as_ref().unwrap();
+                let pts = edge_polyline(e);
+                assert!(runs_straight_across(&pts), "{mode} {text}");
+                assert!(
+                    (c.1 - pts[0].1).abs() <= FAN_ON_LINE,
+                    "{mode} {text}: {c:?}"
+                );
+                let head = end_arrow_box(&pts, true, true).unwrap();
+                assert!(head.2 - head.0 <= STRAIGHT_HEAD_BOX + 1e-6, "{mode} {text}");
+            }
         }
     }
 
