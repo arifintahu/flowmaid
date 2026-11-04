@@ -220,9 +220,26 @@ fn styled_room(e: &crate::model::Edge) -> f64 {
     if stub <= 0.0 {
         return 0.0;
     }
+    end_glyphs(e) as f64 * ARROW_MARKER_PX + 2.0 * (LABEL_CLEAR + stub)
+}
+
+/// How many end glyphs (arrowheads, circles, crosses) edge `e` draws,
+/// one at least: the gap room an LR / RL label leaves along its line is
+/// counted per glyph ([`lr_label_room`], [`styled_room`]).
+fn end_glyphs(e: &crate::model::Edge) -> usize {
     let marks = usize::from(e.ends.start_marker(e.kind).is_some())
         + usize::from(e.ends.end_marker(e.kind).is_some());
-    marks.max(1) as f64 * ARROW_MARKER_PX + 2.0 * (LABEL_CLEAR + stub)
+    marks.max(1)
+}
+
+/// Report M3: the room (px) an LR / RL gap keeps along the flow past the
+/// label of an edge across it — each of its end glyphs (one at least)
+/// and [`LABEL_CLEAR`] on either side of the chip, or a styled edge's
+/// [`styled_room`] where that is more. A double-headed edge (`<-->`)
+/// keeps both heads' room (B7 review r4 #4): sized for one, its label
+/// had no spot clear of both heads on its line and stepped above it.
+fn lr_label_room(e: &crate::model::Edge) -> f64 {
+    (2.0 * LABEL_CLEAR + end_glyphs(e) as f64 * ARROW_MARKER_PX).max(styled_room(e))
 }
 
 /// One line of a compact branch point's fan between two adjacent TD/BT
@@ -2911,8 +2928,9 @@ fn place(
     // (`Edge::end_room`, both ends summed: ER crow's feet) is gap the
     // label may not take, so an edge carrying any also gets an entry
     // without a label (extent 0): its glyphs must fit facing each other.
-    // Last, the room past its label an LR / RL styled edge's gap keeps
-    // (see `styled_room`; 0 for a plain edge). An end given as `None` is
+    // Last, the room past its label an LR / RL gap keeps (its glyphs and
+    // clearances, or a styled edge's stroke runs: `lr_label_room`). An
+    // end given as `None` is
     // a frame border the edge is cut back to (`Graph::frame_cut`), on
     // the farthest frame closing / opening on that layer.
     type ShortLabel = (Option<usize>, Option<usize>, f64, f64, bool, f64);
@@ -3048,7 +3066,7 @@ fn place(
                         ext,
                         room,
                         false,
-                        styled_room(e),
+                        lr_label_room(e),
                     ));
                     // No row of its own among the gap's labels: where the
                     // drawn run lies across the gap is up to the frames'
@@ -3142,7 +3160,7 @@ fn place(
             ext,
             room,
             fan.is_some(),
-            styled_room(e),
+            lr_label_room(e),
         ));
         // In LR/RL a row along the layer axis costs a label's whole
         // width, and the scene never uses it: colliding labels there
@@ -3320,7 +3338,7 @@ fn place(
             // its own box: a label on the border line would hide it. End
             // room counts as part of the ends: the label (or, without
             // one, the other end's glyph) clears it by LABEL_CLEAR too.
-            for &(s, t, ext, room, fan, styled) in &short_labels[li] {
+            for &(s, t, ext, room, fan, lr_room) in &short_labels[li] {
                 let lo_side = match s {
                     Some(s) if reach[s].1 <= 0.0 => alsize[s] / 2.0,
                     _ => reach_of(li - 1, 1),
@@ -3335,10 +3353,11 @@ fn place(
                 // gap keeps its label clear of the arrowhead too (report
                 // M3, §2.6): across TD / BT a [`LABEL_RUN`] on either
                 // side; along LR / RL, where the label is a whole width
-                // long, the head and a clearance on both sides — the
-                // label stage centres such a label on the run clear of
-                // its head (`labels::head_clear_spot`), so the clearance
-                // falls at both ends of the chip. A styled edge's gap
+                // long, the head (each head of a double-headed edge) and
+                // a clearance on both sides — the label stage centres such
+                // a label on the run clear of its head
+                // (`labels::head_clear_spot`), so the clearance falls at
+                // both ends of the chip (`lr_label_room`). A styled edge's gap
                 // (dotted, thick, `linkStyle`-painted) keeps a run of its
                 // stroke in sight past those clearances too
                 // (`styled_room`), or the chip covers all but a dash of
@@ -3350,7 +3369,7 @@ fn place(
                 let flow = ext > 0.0 && g.edge_paint_width.is_none() && !judged;
                 let need = match (flow, horizontal) {
                     (true, false) => Some(ext + 2.0 * LABEL_RUN),
-                    (true, true) => Some(ext + (2.0 * LABEL_CLEAR + ARROW_MARKER_PX).max(styled)),
+                    (true, true) => Some(ext + lr_room),
                     (false, _) => None,
                 };
                 match need {
@@ -4898,6 +4917,38 @@ mod tests {
             let want = w + 2.0 * LABEL_CLEAR + ARROW_MARKER_PX;
             assert!((g - want).abs() < 1e-9, "{dir:?}: {g} for {want}");
         }
+    }
+
+    /// B7 review r4 #4, #7: along LR a double-headed edge's labelled gap
+    /// keeps room for both heads (sized for one, `<-->`'s label had no
+    /// spot clear of both on its line and stepped above it), and a
+    /// `linkStyle` width that repeats the plain one leaves a plain gap
+    /// (it grew every labelled LR gap by about 30 px).
+    #[test]
+    fn an_lr_gap_counts_both_heads_and_ignores_a_plain_width() {
+        let gap = |src: &str| {
+            let g = crate::parser::parse(src).unwrap();
+            let sc = crate::scene::scene(&g);
+            let (a, b) = (&sc.nodes[0], &sc.nodes[1]);
+            let e = &sc.edges[0];
+            let (_, c, _) = e.label.as_ref().unwrap();
+            ((b.x - b.w / 2.0) - (a.x + a.w / 2.0), c.1 - e.bezier[0].1)
+        };
+        let w = text_width("both ways here") + LABEL_PAD_W;
+        let (two, off) = gap("flowchart LR\n  A[Alpha] <-->|both ways here| B[Beta]\n");
+        let want = w + 2.0 * LABEL_CLEAR + 2.0 * ARROW_MARKER_PX;
+        assert!((two - want).abs() < 1e-9, "{two} for {want}");
+        assert!(off.abs() < 1e-9, "the label stays on its line: {off}");
+        let (one, _) = gap("flowchart LR\n  A[Alpha] -->|both ways here| B[Beta]\n");
+        assert!((one - (want - ARROW_MARKER_PX)).abs() < 1e-9, "{one}");
+        let (plain_w, _) = gap(
+            "flowchart LR\n  A[Alpha] -->|both ways here| B[Beta]\n  linkStyle default stroke-width:2px\n",
+        );
+        assert_eq!(plain_w, one);
+        let (wide, _) = gap(
+            "flowchart LR\n  A[Alpha] -->|both ways here| B[Beta]\n  linkStyle default stroke-width:3px\n",
+        );
+        assert!(wide > one + 20.0, "{wide} vs {one}");
     }
 
     /// B7 review r4 #2: a labelled edge between two composites whose

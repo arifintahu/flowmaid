@@ -171,8 +171,9 @@ Minor, not patch: several class structs gain public fields (see
   to hold the label, an arrowhead and a stub either side of it: 72 px
   down the page for a one-line label (the 60 px gap used to stay, a
   20 px chip swallowing a third of it and the edge reading as two hooks),
-  and along LR / RL the label's width, the head and a clearance either
-  side (the head used to be left out); there a label on its line sits
+  and along LR / RL the label's width, the head (both heads of a `<-->`
+  edge, whose label otherwise stepped above its line) and a clearance
+  either side (the head used to be left out); there a label on its line sits
   centred on the run clear of its arrowhead, so the clearance falls at
   both ends of its chip (at the curve's middle the chip stopped 3-4 px
   short of the head, which seemed to grow out of it). So does the gap
@@ -182,7 +183,9 @@ Minor, not patch: several class structs gain public fields (see
   stand-in ran on to members deeper inside a box, and its chip covered
   the whole edge and its arrowhead. A styled edge's
   LR / RL gap (dotted, thick, animated, or `linkStyle`-painted with a
-  colour, width or dash) also keeps a run of its stroke in sight either
+  colour, a width other than the plain 2 px, or a dash; `linkStyle
+  default stroke-width:2px` draws plain and leaves a plain gap) also
+  keeps a run of its stroke in sight either
   side of the chip: 15 px, or two periods of a longer dash (the chip
   used to leave about 6 px, one dash of a dotted edge, and a thick or
   coloured edge read as plain); where a drag brings the ends nearer than

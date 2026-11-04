@@ -3407,6 +3407,17 @@ note for Map~K,V~ \"generic\"
         assert_eq!(label_stub(EdgeKind::Arrow, &red), 15.0);
         let ink = styled(&|s| s.color = Some("#d33".into()));
         assert_eq!(label_stub(EdgeKind::Arrow, &ink), 0.0);
+        // B7 review r4 #7: a width that repeats the plain one shows no
+        // style (`linkStyle default stroke-width:2px`), nor does a `==>`
+        // set back to it (it draws plain); another width does.
+        let plain_w = styled(&|s| s.stroke_width = Some(crate::scene::EDGE_WIDTH));
+        assert_eq!(label_stub(EdgeKind::Arrow, &plain_w), 0.0);
+        assert_eq!(label_stub(EdgeKind::Thick, &plain_w), 0.0);
+        let wide = styled(&|s| s.stroke_width = Some(3.0));
+        assert_eq!(label_stub(EdgeKind::Arrow, &wide), 15.0);
+        assert_eq!(label_stub(EdgeKind::Thick, &plain), 15.0);
+        // A dotted edge at the plain width keeps its dash.
+        assert_eq!(label_stub(EdgeKind::Dotted, &plain_w), 15.0);
     }
 
     #[test]

@@ -5446,8 +5446,8 @@ const STYLE_STUB_MAX: f64 = 3.0 * STYLE_STUB;
 /// needs only its line; otherwise [`STYLE_STUB`], or two periods of its
 /// dash where those are longer (capped at [`STYLE_STUB_MAX`]). Styled
 /// means dotted (`-.->`), thick (`==>`), animated, or painted by
-/// `linkStyle` with a colour, a width or a dash (`stroke-dasharray:0`
-/// draws it solid). A label centred in a gap sized only for itself and
+/// `linkStyle` with a colour, a width other than the plain
+/// [`EDGE_WIDTH`] or a dash (`stroke-dasharray:0` draws it solid). A label centred in a gap sized only for itself and
 /// its head left about 6 px either side: a single dash, and a `==>` /
 /// `linkStyle` edge that read as plain. The layout sizes an LR / RL
 /// labelled gap for this much (`layout`'s head room) and the label
@@ -5467,10 +5467,14 @@ pub(crate) fn label_stub(kind: EdgeKind, meta: &crate::model::EdgeMeta) -> f64 {
         (None, None) if matches!(kind, EdgeKind::Dotted | EdgeKind::DottedOpen) => 2.5 * width,
         (None, None) => 0.0,
     };
-    let styled = period > 0.0
-        || matches!(kind, EdgeKind::Thick | EdgeKind::ThickOpen)
-        || st.stroke.is_some()
-        || st.stroke_width.is_some();
+    // A width is a style where it draws other than the plain one: a
+    // `==>`'s, or a `linkStyle` width that is not the default (B7 review
+    // r4 #7: `linkStyle default stroke-width:2px` grew every labelled LR
+    // gap by about 30 px with nothing to show for it). Any colour counts:
+    // the layout cannot know which theme paints the drawing, and one
+    // that repeats a theme's own line reads as plain under that theme
+    // alone.
+    let styled = period > 0.0 || (width - EDGE_WIDTH).abs() > 1e-9 || st.stroke.is_some();
     if styled {
         (2.0 * period).clamp(STYLE_STUB, STYLE_STUB_MAX)
     } else {
