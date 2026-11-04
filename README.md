@@ -11,11 +11,11 @@ A small Mermaid-like diagram engine written in pure std Rust with zero external 
 
 ## flowmaid next to mermaid
 
-The same `.mmd` source rendered by mermaid 12.2.0 (left, in headless Chromium) and by flowmaid 0.34.0 (right, `flowmaid file.mmd`). flowmaid keeps its own semantic palette by default; mermaid's look is one `--theme default` away (see [Themes](#themes)).
+The same `.mmd` source rendered by mermaid 12.2.0 (left, in headless Chromium) and by flowmaid 0.35.0 (right, `flowmaid file.mmd`). flowmaid keeps its own semantic palette by default; mermaid's look is one `--theme default` away (see [Themes](#themes)).
 
 **Flowchart with subgraphs, a decision and a back-edge**
 
-![advanced flowchart: mermaid 12.2.0 vs flowmaid 0.34.0](docs/img/compare/advanced.png)
+![advanced flowchart: mermaid 12.2.0 vs flowmaid 0.35.0](docs/img/compare/advanced.png)
 
 **Loop back to an earlier step**
 
@@ -106,7 +106,7 @@ Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-flowmaid = "0.34"
+flowmaid = "0.35"
 ```
 
 ## Usage
@@ -459,7 +459,7 @@ The JSON form supports the same features additively — nodes/edges carry `style
 A three-stage pipeline, one module per stage:
 
 1. `parser.rs` — hand-written character-cursor parser. Each line is parsed into a chain of nodes and edges, with line-numbered error messages.
-2. `layout.rs` — a Sugiyama pipeline following [dagre](https://github.com/dagrejs/dagre) (the algorithm mermaid.js uses): (a) DFS marks *back-edges* so cycles can't break the layering, (b) *longest-path layering* assigns nodes to layers, (c) long edges are split into per-layer *dummy chains* so they reserve straight routing channels, (d) *ordering* reduces crossings with weighted-median sweeps plus a local adjacent-swap transpose, keeping the layering with the fewest crossings across eight rounds, (e) *Brandes-Köpf* coordinate assignment runs four vertical alignments (up/down × left/right) and blends them by the per-node median, so long edges come out as straight vertical runs and fan-in/out nodes centre over their neighbours. Subgraphs are laid out in the *same* global pass rather than collapsed: *border-node walls* keep each cluster's members in a compact band (so cross-cluster edges route through the gaps, not the boxes), and a labelled long edge sizes the middle dummy of its chain to its label so converging labels claim their own slots instead of piling up. A gap between adjacent layers that carries an edge label grows to hold the label clear of the arrowhead (72px down the page for a one-line label; along LR the label's width, the head — both heads of a `<-->` edge — and a clearance, plus a 15px run of stroke either side for a dotted, thick or `linkStyle`-painted edge so its style still reads; a `linkStyle` width that repeats the plain 2px is no style), and so does the gap between two stacked composites or subgraphs that a labelled edge crosses from border to border, and a subgraph's title strip takes room only above its first row, so the rows inside keep the usual gap. Everything is computed in abstract coordinates (breadth × layer), so all four diagram directions are handled by a single transform at the end.
+2. `layout.rs` — a Sugiyama pipeline following [dagre](https://github.com/dagrejs/dagre) (the algorithm mermaid.js uses): (a) DFS marks *back-edges* so cycles can't break the layering, (b) *longest-path layering* assigns nodes to layers, (c) long edges are split into per-layer *dummy chains* so they reserve straight routing channels, (d) *ordering* reduces crossings with weighted-median sweeps plus a local adjacent-swap transpose, keeping the layering with the fewest crossings across eight rounds, (e) *Brandes-Köpf* coordinate assignment runs four vertical alignments (up/down × left/right) and blends them by the per-node median, so long edges come out as straight vertical runs and fan-in/out nodes centre over their neighbours. Subgraphs are laid out in the *same* global pass rather than collapsed: *border-node walls* keep each cluster's members in a compact band (so cross-cluster edges route through the gaps, not the boxes), and a labelled long edge sizes the middle dummy of its chain to its label so converging labels claim their own slots instead of piling up. A gap between adjacent layers that carries an edge label grows to hold the label clear of the arrowhead (72px down the page for a one-line label; along LR the label's width, the head — both heads of a `<-->` edge — and a clearance, plus a 15px run of stroke either side for a dotted, thick or `linkStyle`-painted edge so its style still reads; a `linkStyle` width that repeats the plain 2px is no style), and so does the gap between two stacked composites or subgraphs that a labelled edge crosses from border to border, and a subgraph's title strip takes room only above its first row, so the rows inside keep the usual gap. A subgraph's edge-less members (and chains only its own members join) start on its first row, not on the drawing's first layer beside the node that feeds it. A drawing broader than 2.5 : 1 is narrowed — a subgraph stacked below its sibling, a row of sibling subgraphs folded into two, sources pulled down beside their targets, leaves staggered into two rows — only where that adds at most 2% to its area and 10% to its edges' length (a stacked or folded subgraph at most 15% along the flow), so a hub feeding a column of subgraphs keeps them in one column. Everything is computed in abstract coordinates (breadth × layer), so all four diagram directions are handled by a single transform at the end.
 3. `render.rs` — maps abstract coordinates to final x,y according to the direction, then draws bezier curves with arrowheads (SVG markers), clips lines exactly at shape borders (rectangles, circles, and diamonds each have their own intersection formula), and places labels at curve midpoints.
 
 `model.rs` holds the shared data structures (`Graph`, `Node`, `Edge`, shape and direction enums).
@@ -522,9 +522,9 @@ flowmaid spends its time on drawing quality — crossing-aware routing, back-edg
 
 | nodes | edges | parse | layout | render* | SVG |
 |------:|------:|------:|-------:|--------:|----:|
-| 49 | 100 | 0.15 ms | 1.3 ms | 26 ms | 82 KB |
-| 200 | 400 | 0.57 ms | 26 ms | 0.20 s | 659 KB |
-| 1,000 | 2,010 | 3.9 ms | 2.0 s | 3.3 s | 7.7 MB |
+| 49 | 100 | 0.15 ms | 1.5 ms | 35 ms | 82 KB |
+| 200 | 400 | 1.1 ms | 32 ms | 0.21 s | 659 KB |
+| 1,000 | 2,010 | 2.9 ms | 1.0 s | 2.5 s | 6.6 MB |
 
 \* render includes layout and routing.
 
