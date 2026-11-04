@@ -175,7 +175,12 @@ Minor, not patch: several class structs gain public fields (see
   side (the head used to be left out); there a label on its line sits
   centred on the run clear of its arrowhead, so the clearance falls at
   both ends of its chip (at the curve's middle the chip stopped 3-4 px
-  short of the head, which seemed to grow out of it). A styled edge's
+  short of the head, which seemed to grow out of it). So does the gap
+  between two composite states (or subgraphs) stacked one after the
+  other when a labelled transition between them is drawn from border to
+  border: such a gap stayed about 18 px whenever the transition's
+  stand-in ran on to members deeper inside a box, and its chip covered
+  the whole edge and its arrowhead. A styled edge's
   LR / RL gap (dotted, thick, animated, or `linkStyle`-painted with a
   colour, width or dash) also keeps a run of its stroke in sight either
   side of the chip: 15 px, or two periods of a longer dash (the chip

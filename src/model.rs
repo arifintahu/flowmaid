@@ -404,6 +404,13 @@ pub struct Graph {
     /// cardinality there, which in LR / RL lie along the same axis as
     /// the label.
     pub(crate) label_end_room: Vec<f64>,
+    /// Per edge (index-parallel with `edges`; missing = none): the
+    /// subgraph box each end (`[from, to]`) is cut back to when drawn —
+    /// a clustered scene's stand-in for an edge that ends on a whole box
+    /// (`K0 --> K1` between state composites). The layout keeps such an
+    /// edge's label room in the gap between those borders, where it is
+    /// drawn, though its stand-in runs on to members deeper inside.
+    pub(crate) frame_cut: Vec<[Option<usize>; 2]>,
     /// Keep every layer's leaves on their layer: no leaf staggering
     /// when the drawing is a ribbon. Class diagrams set it — a
     /// hierarchy's children read as one row under their parent (as

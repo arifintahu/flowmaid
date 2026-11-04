@@ -3362,6 +3362,20 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene 
             })
             .collect()
     };
+    // Each stand-in cut back to a frame tells the layout which: its
+    // label is drawn between those borders (B7 review r4 #2).
+    ga.frame_cut = vec![[None, None]; ga.edges.len()];
+    for (i, si) in stand_in.iter().enumerate() {
+        let Some(ei) = *si else { continue };
+        if own_drawn[i] {
+            continue;
+        }
+        let cut = |end: End| match end {
+            End::Sub(s) => Some(s),
+            End::Node(_) => None,
+        };
+        ga.frame_cut[ei] = [cut(g.sub_edges[i].from), cut(g.sub_edges[i].to)];
+    }
     let (lo, groups) = layout_clustered_ranked(&ga, sizes, &node_cluster, &rank_only);
     let lanes = static_lanes(&ga, &lo, Some(&node_cluster), ne);
     let mut sc = scene_from_layout(&ga, sizes, labels, lo, &lanes, ne);

@@ -2912,8 +2912,10 @@ fn place(
     // label may not take, so an edge carrying any also gets an entry
     // without a label (extent 0): its glyphs must fit facing each other.
     // Last, the room past its label an LR / RL styled edge's gap keeps
-    // (see `styled_room`; 0 for a plain edge).
-    type ShortLabel = (usize, usize, f64, f64, bool, f64);
+    // (see `styled_room`; 0 for a plain edge). An end given as `None` is
+    // a frame border the edge is cut back to (`Graph::frame_cut`), on
+    // the farthest frame closing / opening on that layer.
+    type ShortLabel = (Option<usize>, Option<usize>, f64, f64, bool, f64);
     let mut short_labels: Vec<Vec<ShortLabel>> = vec![Vec::new(); nlayers];
     // Per upper layer: (breadth centre, breadth extent, layer extent,
     // end room).
@@ -3005,6 +3007,58 @@ fn place(
     };
     for (ei, e) in g.edges.iter().enumerate() {
         let short = alayer[e.from].abs_diff(alayer[e.to]) == 1;
+        // A stand-in for an edge that ends on a whole box (`K0 --> K1`,
+        // `Graph::frame_cut`) is drawn only between the borders it is cut
+        // back to; when those face each other across one gap its label
+        // lies there, though the stand-in runs on to members deeper
+        // inside (or back up, as a back-edge's does). Without room there
+        // two composites stacked 18 px apart had their labels cover the
+        // whole edge and its head (B7 review r4 #2). A stand-in whose
+        // own ends are adjacent is measured as any short edge, below.
+        if let Some(cut) = g
+            .frame_cut
+            .get(ei)
+            .filter(|c| c[0].is_some() || c[1].is_some())
+        {
+            if let (Some(lbl), false) = (
+                &e.label,
+                e.from == e.to || matches!(e.kind, EdgeKind::Invisible) || short,
+            ) {
+                let (lo, hi, lo_cut, hi_cut) = if alayer[e.from] < alayer[e.to] {
+                    (e.from, e.to, cut[0], cut[1])
+                } else {
+                    (e.to, e.from, cut[1], cut[0])
+                };
+                // The layer the border faces from: a box left on its
+                // last layer, entered on its first.
+                let lo_l = lo_cut
+                    .and_then(|c| cluster_span.get(&c))
+                    .map_or(alayer[lo], |s| s.1);
+                let hi_l = hi_cut
+                    .and_then(|c| cluster_span.get(&c))
+                    .map_or(alayer[hi], |s| s.0);
+                if hi_l == lo_l + 1 {
+                    let w = text_width(lbl) + LABEL_PAD_W;
+                    let ext = if horizontal { w } else { LABEL_BOX_H };
+                    let room = e.end_room.0 + e.end_room.1;
+                    let end = |v: usize, c: Option<usize>| c.is_none().then_some(v);
+                    short_labels[hi_l].push((
+                        end(lo, lo_cut),
+                        end(hi, hi_cut),
+                        ext,
+                        room,
+                        false,
+                        styled_room(e),
+                    ));
+                    // No row of its own among the gap's labels: where the
+                    // drawn run lies across the gap is up to the frames'
+                    // ports, not the stand-in's members, and a composite's
+                    // 2-cycle labels (`Idle --> Busy`, `Busy --> Idle`)
+                    // already stand beside their lines, as drawn before.
+                }
+                continue;
+            }
+        }
         // A back-edge between adjacent layers is drawn across their gap
         // (`crate::lanes`: nothing lies between its ends), its label
         // there too: the gap fits it like a forward edge's (a 2-cycle's
@@ -3068,7 +3122,7 @@ fn place(
             continue;
         }
         let Some(lbl) = &e.label else {
-            short_labels[alayer[hi]].push((lo, hi, 0.0, room, false, 0.0));
+            short_labels[alayer[hi]].push((Some(lo), Some(hi), 0.0, room, false, 0.0));
             continue;
         };
         let w = text_width(lbl) + LABEL_PAD_W;
@@ -3082,7 +3136,14 @@ fn place(
         // and cardinalities) is kept at both.
         let label_room = 2.0 * g.label_end_room.get(ei).copied().unwrap_or(0.0);
         let room = (room + label_room).max(lane_legs(ei, lo, hi, across));
-        short_labels[alayer[hi]].push((lo, hi, ext, room, fan.is_some(), styled_room(e)));
+        short_labels[alayer[hi]].push((
+            Some(lo),
+            Some(hi),
+            ext,
+            room,
+            fan.is_some(),
+            styled_room(e),
+        ));
         // In LR/RL a row along the layer axis costs a label's whole
         // width, and the scene never uses it: colliding labels there
         // slide apart ACROSS the flow (they are only LABEL_BOX_H tall),
@@ -3260,15 +3321,13 @@ fn place(
             // room counts as part of the ends: the label (or, without
             // one, the other end's glyph) clears it by LABEL_CLEAR too.
             for &(s, t, ext, room, fan, styled) in &short_labels[li] {
-                let lo_side = if reach[s].1 > 0.0 {
-                    reach_of(li - 1, 1)
-                } else {
-                    alsize[s] / 2.0
+                let lo_side = match s {
+                    Some(s) if reach[s].1 <= 0.0 => alsize[s] / 2.0,
+                    _ => reach_of(li - 1, 1),
                 };
-                let hi_side = if reach[t].0 > 0.0 {
-                    reach_of(li, 0)
-                } else {
-                    alsize[t] / 2.0
+                let hi_side = match t {
+                    Some(t) if reach[t].0 <= 0.0 => alsize[t] / 2.0,
+                    _ => reach_of(li, 0),
                 };
                 let ends = lcoord[li - 1] + (lo_side + hi_side);
                 let at = cursor + before;
@@ -4838,6 +4897,59 @@ mod tests {
             let g = gap(Some("a long branch label"), dir);
             let want = w + 2.0 * LABEL_CLEAR + ARROW_MARKER_PX;
             assert!((g - want).abs() < 1e-9, "{dir:?}: {g} for {want}");
+        }
+    }
+
+    /// B7 review r4 #2: a labelled edge between two composites whose
+    /// stand-in runs on to members deeper inside (here out of a nested
+    /// box) is still drawn only between the two borders, and that gap
+    /// holds its label clear of both heads as a short edge's does — it
+    /// used to stay FRAME_GAP-ish (21 px), the chips covering the whole
+    /// edge and its arrowhead. Both labels lie in the gap, off the heads.
+    #[test]
+    fn a_labelled_gap_between_composites_holds_its_labels() {
+        let doc = crate::parser::parse_document(
+            "stateDiagram-v2
+  state K0 {
+    [*] --> K0_0
+    state K0N {
+      [*] --> a
+      a --> b
+    }
+    K0_0 --> K0N
+  }
+  state K1 {
+    [*] --> c
+  }
+  K0 --> K1 : g2
+  K1 --> K0 : back
+",
+        )
+        .unwrap();
+        let crate::model::Document::State(g) = doc else {
+            panic!("not a state diagram");
+        };
+        let sc = crate::scene::scene(&g);
+        let frame = |id: &str| sc.clusters.iter().find(|c| c.id == id).unwrap();
+        let (k0, k1) = (frame("K0"), frame("K1"));
+        let (top, bottom) = (k0.y + k0.h, k1.y);
+        assert!(
+            bottom - top >= LABEL_BOX_H + 2.0 * LABEL_RUN - 1e-9,
+            "gap {top} .. {bottom}"
+        );
+        for text in ["g2", "back"] {
+            let e = sc
+                .edges
+                .iter()
+                .find(|e| e.label.as_ref().is_some_and(|l| l.0 == text))
+                .unwrap();
+            let (_, c, _) = e.label.as_ref().unwrap();
+            // Inside the gap, a head's length clear of either border.
+            assert!(
+                c.1 - LABEL_BOX_H / 2.0 >= top + ARROW_MARKER_PX
+                    && c.1 + LABEL_BOX_H / 2.0 <= bottom - ARROW_MARKER_PX,
+                "{text} at {c:?} in {top} .. {bottom}"
+            );
         }
     }
 
