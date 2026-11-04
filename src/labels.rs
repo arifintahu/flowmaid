@@ -1896,6 +1896,11 @@ fn place(
         .collect();
 
     let n = edges.len();
+    // Edges with a parallel twin (their labels stack along their lines).
+    let twinned: Vec<bool> = edges
+        .iter()
+        .map(|e| pairs.get(&pair(e)).is_some_and(|&k| k > 1))
+        .collect();
     let mut tracks: Vec<Option<Track>> = (0..n).map(|_| None).collect();
     // A fan label left in the near half of its line (the builder's
     // midpoint slot, say) is stacked into the far part first; one that
@@ -2116,6 +2121,64 @@ fn place(
         // Nothing moved: a further round would find the same spots.
         if !any {
             break;
+        }
+    }
+    // Last, in the final pass, a label the builders' pass moved off its
+    // preferred spot returns there once that spot is clean (B7 review r4
+    // #3): the builders place labels before the port stage spreads the
+    // ends, and a fan's labels that met at their first midpoints (v4's
+    // `thick` and `side`, 11 px apart) still stood apart after the
+    // spread had moved their curves 30 px apart — one slid toward its
+    // head, its chip 3 px off the head's base, in a gap the layout had
+    // sized for it in the middle. Every other label is final by now, so
+    // a return never pushes one aside, and only a redrawn edge's label
+    // returns (a drag leaves the others put). On a straight LR line the
+    // spot is the run clear of the head (`head_clear_spot`). Only a
+    // label whose spot is its curve's middle: not a hub's (it lies toward the
+    // head, the far half's middle), a compact branch point's fan (its
+    // rows are `stack_fans`'), a twin (twins stack along their own
+    // lines), a long edge (its slot is its dummy's), a self-loop, or a
+    // class / ER relation (its painter's labels are as they were).
+    if let Pass::Changed(changed) = pass {
+        for ei in 0..n {
+            let e = &edges[ei];
+            let (Some(pts), Some((_, at, w))) = (&lines[ei], e.label.clone()) else {
+                continue;
+            };
+            if !changed.get(ei).copied().unwrap_or(false)
+                || e.from == e.to
+                || e.paint_width.is_some()
+                || !e.waypoints.is_empty()
+                || fan[ei].is_some()
+                || hub[ei].1 > 0
+                || stacked[ei]
+                || twinned[ei]
+            {
+                continue;
+            }
+            let len: f64 = pts
+                .windows(2)
+                .map(|s| (s[1].0 - s[0].0).hypot(s[1].1 - s[0].1))
+                .sum();
+            let mid = line_at(pts, len * LABEL_PREFER);
+            let to = head_clear_spot(e, pts, mid).unwrap_or(mid);
+            if (to.0 - at.0).hypot(to.1 - at.1) <= TOUCH_EPS {
+                continue;
+            }
+            // Clean as a label kept where it is must be: no stroke, no
+            // head even touched, its keep-out clear.
+            let r = label_rect(to, w);
+            if field.hits(&placed, ei, r).none()
+                && field.untouched(r)
+                && placed.clear(ei, r, keep[ei])
+                && field.strokes().count(r, ei, 0) == 0
+            {
+                if let Some((_, m, _)) = &mut edges[ei].label {
+                    *m = to;
+                }
+                placed.set(ei, r);
+                moved.push(ei);
+            }
         }
     }
     moved.sort_unstable();
@@ -3228,6 +3291,51 @@ mod tests {
                 );
                 let head = end_arrow_box(&pts, true, true).unwrap();
                 assert!(head.2 - head.0 <= STRAIGHT_HEAD_BOX + 1e-6, "{mode} {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_fan_label_moved_by_the_builders_returns_to_its_middle() {
+        // B7 review r4 #3: the builders placed `thick` and `side` at
+        // their first midpoints, 11 px apart, and slid `thick` toward its
+        // head; the port stage then spread the fan 30 px apart, but the
+        // label stayed put, its chip 3 px off the head's base in a gap
+        // sized for it in the middle. In the final pass it returns to its
+        // curve's middle once that spot is clean — in scene(), route()
+        // and a drag alike.
+        let g = crate::parser::parse(
+            "flowchart TD
+  A[Start] -.->|dotted| B[Next]
+  B ==>|thick| C[Then]
+  C -->|plain| D[End]
+  B -->|side| E[Other]
+  linkStyle 2 stroke:#d33,stroke-dasharray: 6 3
+",
+        )
+        .unwrap();
+        let sc = crate::scene::scene(&g);
+        let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let routed = crate::scene::route(&g, &at);
+        let mut moved = at.clone();
+        moved[2].0 += 1.0;
+        let drag = crate::scene::route_partial(&g, &moved, &sc, &at);
+        for (mode, sc) in [("scene", &sc), ("route", &routed), ("drag", &drag)] {
+            for e in &sc.edges {
+                let (text, c, w) = e.label.as_ref().unwrap();
+                let pts = edge_polyline(e);
+                let mid = line_middle(&pts);
+                if text == "thick" || text == "side" {
+                    assert!(
+                        (c.0 - mid.0).hypot(c.1 - mid.1) <= 1.0,
+                        "{mode} {text} at {c:?}, middle {mid:?}"
+                    );
+                }
+                // Every chip stays well off its head's base.
+                let tip = *pts.last().unwrap();
+                let base = tip.1 - ARROW_MARKER_PX;
+                let r = label_rect(*c, *w);
+                assert!(base - r.3 >= 10.0, "{mode} {text}: {r:?} vs base {base}");
             }
         }
     }

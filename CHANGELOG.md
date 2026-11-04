@@ -206,7 +206,10 @@ Minor, not patch: several class structs gain public fields (see
   fan's other curves (a hub's `express` sat on the bend 6 px off its
   head, its middle crossed by a sibling's curve); a fan too crowded for
   that, or with parallel twins, keeps its gap and its labels keep to the
-  half away from the hub. An edge end alone on its box side
+  half away from the hub. A label the first placement pass moved aside
+  (it runs before a fan's ends are spread) returns to its curve's middle
+  once that spot is clear: a decision fan's `thick` stayed 3 px off its
+  head after its sibling had moved 30 px away. An edge end alone on its box side
   meets that side in the middle (long-labels' arrivals landed up to
   44 px off their targets' centres, and the flow through a node jogged);
   three or more ends on one box side are spaced evenly, centred where
