@@ -99,7 +99,8 @@ pub(crate) struct Ctx {
     /// something (it passes near what the drag changed): the ports stage
     /// never re-places its ends by its own rules (a drag's redrawn ends
     /// make room round them), and the router reroutes it for a node,
-    /// frame or chip it now hits, never for spacing alone. Such an edge's
+    /// frame or chip it now hits or a run on top of another edge, never
+    /// for spacing alone. Such an edge's
     /// ends used to be re-placed by `route()`'s rules, which need not
     /// agree with the base's, so a 1 px drag of a node beside it threw
     /// them 20-45 px. All `false` (but where `fixed`) outside

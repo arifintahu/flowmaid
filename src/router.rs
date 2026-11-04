@@ -4905,7 +4905,8 @@ pub(crate) fn repair(g: &Graph, sc: &mut Scene, cx: &Ctx, mode: Mode, moved: &mu
     };
     for &(class, i) in &bad {
         // An edge a drag holds ([`Ctx::held`]) is rerouted only for
-        // what it now hits, never for spacing alone.
+        // what it now hits or runs on top of (class 0), never for
+        // spacing alone.
         if class == 1 && cx.held.get(i).copied().unwrap_or(false) {
             continue;
         }

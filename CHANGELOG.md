@@ -216,8 +216,9 @@ Minor, not patch: several class structs gain public fields (see
   labelled twins, whose slant asks for more than the port spacing, used
   to swap across their sibling on every drag of any node). An edge the
   drag keeps because it merely passes near the dragged node holds its
-  ends too, and is rerouted only for a node, frame or title it now hits,
-  never for spacing alone (its ends used to be re-spaced by `route()`'s
+  ends too, and is rerouted only for a node, frame or title it now hits
+  or a run on top of another edge, never for spacing alone (its ends
+  used to be re-spaced by `route()`'s
   rules: a 1 px drag of a note card beside one threw it 22 px; over
   dense-td's and bench-75's drags 17 and 18 such jumps, now 3 and 15).
   A drag that

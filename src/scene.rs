@@ -4661,7 +4661,8 @@ const PARTIAL_ROUTE_SHARE: f64 = 0.5;
 /// `PARTIAL_CLEAR` of a moved node's old or new box, of the strip a
 /// frame grew by or of its moved title chip keep their `base` path and
 /// ends but are rerouted when it now hits a node, a frame or a title
-/// chip (never for spacing alone). Every other edge keeps its
+/// chip, or runs on top of another edge (never for spacing alone).
+/// Every other edge keeps its
 /// `base` geometry (channel waypoints, label slot; only a port shared
 /// with a redrawn edge is spaced again, and its label moves when it now
 /// covers something) and is an obstacle the affected edges are routed
@@ -4844,7 +4845,8 @@ pub fn route_partial(
     let mut fixed = vec![true; base.edges.len()];
     // Every edge but the redrawn ones holds its ends (`Ctx::held`): one
     // kept near the drag (not `fixed`) is rerouted only where it now
-    // hits something, its ends left where the base put them.
+    // hits something or runs on top of another edge, its ends left
+    // where the base put them.
     let mut held = vec![true; base.edges.len()];
     let mut redrawn = 0;
     for (i, e) in sc.edges.iter_mut().enumerate() {
