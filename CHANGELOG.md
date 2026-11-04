@@ -7,10 +7,53 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Class and state diagrams were reworked to read at least as well as
-mermaid's, keeping flowmaid's interactive scene API and portable SVG.
-Minor, not patch: several class structs gain public fields (see
-**Breaking** under Changed).
+## [0.34.0] - 2026-11-04
+
+### Highlights
+
+A large visual release for flowcharts, plus reworked class and state
+diagrams, keeping flowmaid's interactive scene API and portable SVG.
+Nothing public is removed or renamed and every function keeps its
+signature, but a few structs gain fields (see **Breaking** under Changed),
+so this is a minor bump. The detailed notes follow the highlights.
+
+- **Arrowheads.** One 11 px head for every flowchart edge, thick `==>`
+  included. The tip sits exactly on the node border, square to the side,
+  and very wide `linkStyle` strokes grow their head.
+- **Back-edges run in orthogonal lanes** beside the drawing, as in
+  mermaid, and the same in `scene()` and while dragging. 2-cycles,
+  self-loops (several labelled loops too) and edges inside their own
+  subgraph are handled.
+- **Subgraphs and canvas.** Nested subgraphs keep their nodes, frames are
+  tinted by depth with borders of at least 3:1, the canvas fits the
+  drawing with even margins, and nothing drawn is cut off.
+- **Labels and ports.** A labelled gap leaves room for the label and both
+  heads. A lone end is centred on its side, a fan spreads as an even comb,
+  sibling labels keep 20 px apart, and there is no dead strip under a
+  subgraph's first row.
+- **Shapes.** Edge ends touch every shape's real outline (hexagon,
+  cylinder, parallelogram, circle and the rest). Cylinders read as drums.
+  Long node labels wrap (200 px by default, `wrappingWidth`), and diamonds
+  stay no flatter than 1.6:1.
+- **Themes.** mermaid's `default`, `neutral`, `dark` and `forest` are
+  options through `%%{init}%%`, frontmatter, `SvgOptions::theme` or
+  `--theme`. The semantic palette stays the default, byte for byte.
+- **Styling.** `classDef default` styles every node, dotted edges are drawn
+  as dots, and a `%%{ … }%%` directive written over several lines parses.
+- **Class diagrams.** Notes, stereotypes, generics, `direction`, static and
+  abstract members, two-way relations and lollipop interfaces; top-down
+  hierarchies with orthogonal, rounded edges.
+- **State diagrams.** Notes, a compact `<<choice>>` diamond, and fork/join
+  bars that span their branches.
+- **Interactive API kept, and faster.** Picking follows the painted stroke
+  and `hit_test` is about 4.5× faster. A 1 px drag leaves unrelated fans
+  alone, and routing stays finite for any node size. `scene`, `route`,
+  `route_partial`, `hit_test` and `to_mermaid` keep their signatures.
+- **Deeply nested JSON is an error, not a crash.** Advance JSON nested
+  deeper than 128 levels returns an error instead of overflowing the
+  stack (#77, #78).
+- **Quality and tooling.** New defect metrics in the quality harness with
+  ratchets, and a per-file benchmark (`bench -- files`).
 
 ### Added
 
@@ -790,6 +833,16 @@ Minor, not patch: several class structs gain public fields (see
     `Metrics::default()` and assign them. New columns no longer break it.
 
 ### Fixed
+
+- **Deeply nested advance JSON no longer crashes the process** (#77, #78,
+  contributed by arifintahu). The JSON reader recursed once per array or
+  object level with no limit, so about 40 KB of nested brackets overflowed
+  the stack and aborted the process (in wasm the module traps); a stack
+  overflow cannot be caught, so any host feeding untrusted JSON to the
+  advance renderer could be crashed. Nesting deeper than 128 levels now
+  returns `advance error — JSON nested too deeply (more than 128 levels)`,
+  in line with the mermaid parser (500 levels) and the advance text DSL
+  (16).
 
 - **Edge ends touch every shape's outline** (report M6, P0 #9). The edge
   stages met a parallelogram, a trapezoid (drawn as one), a hexagon and a
