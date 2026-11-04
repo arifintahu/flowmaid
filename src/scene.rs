@@ -5409,6 +5409,79 @@ pub(crate) fn dotted_dash(width: f64) -> String {
     let r = |v: f64| (v * 10.0).round() / 10.0;
     format!("{} {}", r(width), r(width * 1.5))
 }
+
+/// Least run (px) of stroke a styled edge keeps in sight on either side
+/// of a label lying on its line (report M3, B7 review r3 #1): three dots
+/// of a dotted edge's dash at the default width, two at a 3 px
+/// `linkStyle` width; a run a thick or coloured stroke reads on.
+const STYLE_STUB: f64 = 15.0;
+/// The most [`label_stub`] asks for, whatever a `stroke-dasharray`.
+const STYLE_STUB_MAX: f64 = 3.0 * STYLE_STUB;
+
+/// Report M3, B7 review r3 #1: how much stroke (px) an edge drawn by the
+/// flowchart painter must show on either side of a label chip lying on
+/// its line for its style to read — 0 for a plain solid edge, which
+/// needs only its line; otherwise [`STYLE_STUB`], or two periods of its
+/// dash where those are longer (capped at [`STYLE_STUB_MAX`]). Styled
+/// means dotted (`-.->`), thick (`==>`), animated, or painted by
+/// `linkStyle` with a colour, a width or a dash (`stroke-dasharray:0`
+/// draws it solid). A label centred in a gap sized only for itself and
+/// its head left about 6 px either side: a single dash, and a `==>` /
+/// `linkStyle` edge that read as plain. The layout sizes an LR / RL
+/// labelled gap for this much (`layout`'s head room) and the label
+/// stage keeps a chip off it (or beside its line where the gap is
+/// shorter, as a drag may make it).
+pub(crate) fn label_stub(kind: EdgeKind, meta: &crate::model::EdgeMeta) -> f64 {
+    let st = &meta.style;
+    let width = st.stroke_width.unwrap_or(match kind {
+        EdgeKind::Thick | EdgeKind::ThickOpen => EDGE_WIDTH_THICK,
+        _ => EDGE_WIDTH,
+    });
+    // One period of the dash the painter draws (0 = solid); a list of
+    // odd length repeats twice per period, as SVG has it.
+    let period = match (&st.stroke_dasharray, meta.animation) {
+        (_, Some(_)) => dash_period(EDGE_ANIMATION_DASH),
+        (Some(d), None) => dash_period(d),
+        (None, None) if matches!(kind, EdgeKind::Dotted | EdgeKind::DottedOpen) => 2.5 * width,
+        (None, None) => 0.0,
+    };
+    let styled = period > 0.0
+        || matches!(kind, EdgeKind::Thick | EdgeKind::ThickOpen)
+        || st.stroke.is_some()
+        || st.stroke_width.is_some();
+    if styled {
+        (2.0 * period).clamp(STYLE_STUB, STYLE_STUB_MAX)
+    } else {
+        0.0
+    }
+}
+
+/// One period (px) of an SVG `stroke-dasharray` value (`5 5`, `5,5`,
+/// `5px 3px`, `4 2 1`): its lengths summed, twice for an odd count. 0
+/// for a solid line (`0`, `none`); a value that does not parse counts as
+/// a short dash.
+fn dash_period(d: &str) -> f64 {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for part in d.split(|c: char| c == ',' || c.is_whitespace()) {
+        let part = part.trim().trim_end_matches("px");
+        if part.is_empty() {
+            continue;
+        }
+        match part.parse::<f64>() {
+            Ok(v) if v.is_finite() && v >= 0.0 => {
+                sum += v;
+                count += 1;
+            }
+            _ if part.eq_ignore_ascii_case("none") => return 0.0,
+            _ => return STYLE_STUB / 2.0,
+        }
+    }
+    if count % 2 == 1 {
+        sum *= 2.0;
+    }
+    sum
+}
 /// Size of an end glyph in default edge strokes.
 const ARROW_MARKER_UNITS: f64 = 5.5;
 /// Length and width (px, user space) of every edge end glyph — the

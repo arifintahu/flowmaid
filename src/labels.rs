@@ -35,8 +35,8 @@ use crate::layout::{
 };
 use crate::model::{EdgeKind, Graph};
 use crate::scene::{
-    basis_sample, edge_drawn, edge_polyline, fit_cluster_title, shift_scene, Bbox, Scene,
-    SceneCluster, SceneEdge, SceneNode, ARROW_MARKER_PX, MARGIN,
+    basis_sample, edge_drawn, edge_polyline, fit_cluster_title, label_stub, shift_scene, Bbox,
+    Scene, SceneCluster, SceneEdge, SceneNode, ARROW_MARKER_PX, MARGIN,
 };
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1674,6 +1674,12 @@ fn place(
                 fixed.push(r, Kind::Arrow);
             }
         }
+        // A styled edge's label leaves a run of its stroke in sight at
+        // either end, as a head is left: on its line where the gap holds
+        // it, beside it where the gap is shorter (`stub_boxes`).
+        for r in stub_boxes(e, pts) {
+            fixed.push(r, Kind::Arrow);
+        }
     }
     let field = Field {
         fixed,
@@ -2080,6 +2086,73 @@ fn line_at(pts: &[(f64, f64)], s: f64) -> (f64, f64) {
         left -= d;
     }
     pts.last().copied().unwrap_or((0.0, 0.0))
+}
+
+/// Report M3, B7 review r3 #1: the runs of a labelled styled edge's
+/// stroke (dotted, thick, `linkStyle`-painted) a label chip keeps clear
+/// of, as an arrowhead is kept clear: at either end of its line, past
+/// its end glyph there, [`label_stub`] long and a head wide, in short
+/// oriented boxes. Only for a free line drawn across the page (LR / RL:
+/// its chord runs more across than down), where a label lies along its
+/// line and the layout sizes the gap for those runs (`layout`'s
+/// `styled_room`): centred there, a chip clears them by
+/// [`LABEL_CLEAR`]; in a gap a drag made shorter it steps beside its
+/// line, as a label does off a head. A TD / BT label is a row tall and
+/// its gap keeps a [`crate::layout::LABEL_RUN`] either side. Before, a
+/// chip in an LR gap sized for itself and its head left about 6 px of
+/// stroke either side: one dash of a dotted edge, and a thick or
+/// coloured one that read as plain.
+fn stub_boxes(e: &SceneEdge, pts: &[(f64, f64)]) -> Vec<Rect> {
+    let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else {
+        return Vec::new();
+    };
+    if e.label.is_none()
+        || e.paint_width.is_some()
+        || e.from == e.to
+        || (last.0 - first.0).abs() <= (last.1 - first.1).abs()
+    {
+        return Vec::new();
+    }
+    let stub = label_stub(e.kind, &e.meta);
+    if stub <= 0.0 {
+        return Vec::new();
+    }
+    let len: f64 = pts
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+        .sum();
+    let mut out = Vec::new();
+    for (head, at_end) in [
+        (e.ends.start_marker(e.kind).is_some(), false),
+        (e.ends.end_marker(e.kind).is_some(), true),
+    ] {
+        let a0 = if head { ARROW_MARKER_PX } else { 0.0 };
+        let a1 = (a0 + stub).min(len);
+        // In steps of at most a head's length, so a bending run's boxes
+        // hug it.
+        let steps = ((a1 - a0) / ARROW_MARKER_PX).ceil().max(1.0) as usize;
+        for k in 0..steps {
+            let (s0, s1) = (
+                a0 + (a1 - a0) * k as f64 / steps as f64,
+                a0 + (a1 - a0) * (k + 1) as f64 / steps as f64,
+            );
+            let at = |s: f64| line_at(pts, if at_end { len - s } else { s });
+            let (p, q) = (at(s0), at(s1));
+            let d = (q.0 - p.0).hypot(q.1 - p.1);
+            if d <= f64::EPSILON {
+                continue;
+            }
+            let h = ARROW_MARKER_PX / 2.0;
+            let (nx, ny) = (-(q.1 - p.1) / d * h, (q.0 - p.0) / d * h);
+            out.push((
+                p.0.min(q.0) - nx.abs(),
+                p.1.min(q.1) - ny.abs(),
+                p.0.max(q.0) + nx.abs(),
+                p.1.max(q.1) + ny.abs(),
+            ));
+        }
+    }
+    out
 }
 
 /// Report M3 (§2.6), B7 review r2 #3: the spot a label lying along its
@@ -3050,6 +3123,128 @@ mod tests {
             }
             assert!(on_line >= 3, "{mode}: {on_line} labels on their lines");
         }
+    }
+
+    #[test]
+    fn a_styled_lr_label_leaves_its_stroke_in_sight() {
+        // B7 review r3 #1: an LR / RL gap sized for its label and head
+        // left about 6 px of stroke either side of the chip: one dash of
+        // a dotted edge, a thick or `linkStyle`-coloured one that read
+        // as plain. Such a gap now keeps `label_stub` of stroke in sight
+        // past LABEL_CLEAR either side, in scene() and route(); a plain
+        // edge's gap is as before.
+        for (dir, edge, style) in [
+            ("LR", "-.->", ""),
+            ("LR", "==>", ""),
+            ("RL", "-.->", ""),
+            ("LR", "-->", "linkStyle 0 stroke:#3a3"),
+            ("LR", "-.->", "linkStyle 0 stroke:#3a3,stroke-width:3px"),
+            ("LR", "-->", "linkStyle 0 stroke-dasharray: 10 6"),
+            ("LR", "<-.->", ""),
+            ("LR", "-.-", ""),
+        ] {
+            let src =
+                format!("flowchart {dir}\n  C[Gamma] {edge}|dotted wide| D[Delta]\n  {style}\n");
+            let g = crate::parser::parse(&src).unwrap();
+            let sc = crate::scene::scene(&g);
+            let at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+            let routed = crate::scene::route(&g, &at);
+            for (mode, sc) in [("scene", &sc), ("route", &routed)] {
+                let e = &sc.edges[0];
+                let stub = label_stub(e.kind, &e.meta);
+                assert!(stub >= 15.0, "{src}: styled");
+                let (_, c, w) = e.label.as_ref().unwrap();
+                let (a, b) = (e.bezier[0], e.bezier[3]);
+                assert!(
+                    (a.1 - b.1).abs() < 1e-6 && (c.1 - a.1).abs() < 1e-6,
+                    "{mode} {src}"
+                );
+                // Stroke in sight from either end (past its glyph) to the
+                // chip.
+                let s = (b.0 - a.0).signum();
+                let glyph = |m: bool| if m { ARROW_MARKER_PX } else { 0.0 };
+                let tail = s * (c.0 - a.0) - w / 2.0 - glyph(e.ends.start_marker(e.kind).is_some());
+                let head = s * (b.0 - c.0) - w / 2.0 - glyph(e.ends.end_marker(e.kind).is_some());
+                assert!(
+                    tail.min(head) >= stub + LABEL_CLEAR - 0.5,
+                    "{mode} {src}: tail {tail:.1} head {head:.1}, stub {stub}"
+                );
+            }
+        }
+        // A plain edge's label still fills its gap but for the head and
+        // LABEL_CLEAR either side.
+        let g = crate::parser::parse("flowchart LR\n  C[Gamma] -->|dotted wide| D[Delta]").unwrap();
+        let sc = crate::scene::scene(&g);
+        let e = &sc.edges[0];
+        let (_, _, w) = e.label.as_ref().unwrap();
+        let gap = e.bezier[3].0 - e.bezier[0].0;
+        assert!(
+            (gap - (w + 2.0 * LABEL_CLEAR + ARROW_MARKER_PX)).abs() < 0.5,
+            "plain gap {gap}"
+        );
+        assert_eq!(label_stub(e.kind, &e.meta), 0.0);
+    }
+
+    #[test]
+    fn a_styled_label_steps_beside_a_gap_too_short_for_its_stroke() {
+        // B7 review r3 #1: dragged closer than the layout spaced them, a
+        // dotted edge's ends leave no room for its chip and a run of
+        // stroke either side: the chip steps beside its line (as one does
+        // off a head) instead of hiding all but a dash of it.
+        let g = crate::parser::parse(
+            "flowchart LR\n  C[Gamma] -.->|dotted wide| D[Delta]\n  \
+             linkStyle 0 stroke:#3a3,stroke-width:3px\n",
+        )
+        .unwrap();
+        let sc = crate::scene::scene(&g);
+        let mut at: Vec<(f64, f64)> = sc.nodes.iter().map(|n| (n.x, n.y)).collect();
+        // 20 px nearer: the chip and its head still fit (with 11 px of
+        // stroke either side), its stroke runs do not.
+        at[1].0 -= 20.0;
+        let routed = crate::scene::route(&g, &at);
+        let e = &routed.edges[0];
+        let (_, c, w) = e.label.as_ref().unwrap();
+        let r = label_rect(*c, *w);
+        assert!(
+            (c.1 - e.bezier[0].1).abs() > LABEL_BOX_H / 2.0,
+            "{r:?} on its line"
+        );
+        let pts = edge_polyline(e);
+        for s in stub_boxes(e, &pts) {
+            assert_eq!(covered(r, 0.0, &[s]), 0.0, "chip {r:?} on a stub {s:?}");
+        }
+        // Still its own label: beside its line, not across the page.
+        assert!(rect_line_dist(r, &pts) <= LABEL_DRIFT_MAX, "{r:?}");
+    }
+
+    #[test]
+    fn label_stub_reads_the_edge_style() {
+        use crate::model::{EdgeMeta, LinkStyle};
+        let plain = EdgeMeta::default();
+        assert_eq!(label_stub(EdgeKind::Arrow, &plain), 0.0);
+        assert_eq!(label_stub(EdgeKind::Open, &plain), 0.0);
+        assert_eq!(label_stub(EdgeKind::Dotted, &plain), 15.0);
+        assert_eq!(label_stub(EdgeKind::ThickOpen, &plain), 15.0);
+        let styled = |f: &dyn Fn(&mut LinkStyle)| {
+            let mut m = EdgeMeta::default();
+            f(&mut m.style);
+            m
+        };
+        // `stroke-dasharray:0` draws a dotted edge solid.
+        let solid = styled(&|s| s.stroke_dasharray = Some("0".into()));
+        assert_eq!(label_stub(EdgeKind::Dotted, &solid), 0.0);
+        // Two periods of a long dash; an odd list repeats twice.
+        let dash = styled(&|s| s.stroke_dasharray = Some("10px, 6".into()));
+        assert_eq!(label_stub(EdgeKind::Arrow, &dash), 32.0);
+        let odd = styled(&|s| s.stroke_dasharray = Some("4 2 4".into()));
+        assert_eq!(label_stub(EdgeKind::Arrow, &odd), 40.0);
+        let huge = styled(&|s| s.stroke_dasharray = Some("100 100".into()));
+        assert_eq!(label_stub(EdgeKind::Arrow, &huge), 45.0);
+        // A colour or width alone, not the label text's colour.
+        let red = styled(&|s| s.stroke = Some("#d33".into()));
+        assert_eq!(label_stub(EdgeKind::Arrow, &red), 15.0);
+        let ink = styled(&|s| s.color = Some("#d33".into()));
+        assert_eq!(label_stub(EdgeKind::Arrow, &ink), 0.0);
     }
 
     #[test]

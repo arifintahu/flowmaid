@@ -175,7 +175,14 @@ Minor, not patch: several class structs gain public fields (see
   side (the head used to be left out); there a label on its line sits
   centred on the run clear of its arrowhead, so the clearance falls at
   both ends of its chip (at the curve's middle the chip stopped 3-4 px
-  short of the head, which seemed to grow out of it). A decision's branch label sits in
+  short of the head, which seemed to grow out of it). A styled edge's
+  LR / RL gap (dotted, thick, animated, or `linkStyle`-painted with a
+  colour, width or dash) also keeps a run of its stroke in sight either
+  side of the chip: 15 px, or two periods of a longer dash (the chip
+  used to leave about 6 px, one dash of a dotted edge, and a thick or
+  coloured edge read as plain); where a drag brings the ends nearer than
+  that, the label steps beside its line instead of hiding the stroke. A
+  plain edge's gap is unchanged. A decision's branch label sits in
   the middle of its curve, where the S runs straight, instead of in the
   half that turns into its target. So does a hub's (a node with more
   ends) where the drawing runs down the page: the gap grows (by up to

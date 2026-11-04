@@ -208,6 +208,23 @@ fn fan_gap(beyond: f64) -> f64 {
     (beyond + FAN_HEAD_ROOM) / (1.0 - FAN_FAR)
 }
 
+/// Report M3, B7 review r3 #1: the room (px) an LR / RL gap keeps along
+/// the flow past the label of a styled edge across it (dotted, thick,
+/// `linkStyle`-painted: [`crate::scene::label_stub`]) — each of its end
+/// glyphs (one at least), and on either side of the chip
+/// [`LABEL_CLEAR`] plus the run of stroke the style reads on; 0 for a
+/// plain edge, whose gap keeps the plain head room. The label stage
+/// keeps the chip off those runs.
+fn styled_room(e: &crate::model::Edge) -> f64 {
+    let stub = crate::scene::label_stub(e.kind, &e.meta);
+    if stub <= 0.0 {
+        return 0.0;
+    }
+    let marks = usize::from(e.ends.start_marker(e.kind).is_some())
+        + usize::from(e.ends.end_marker(e.kind).is_some());
+    marks.max(1) as f64 * ARROW_MARKER_PX + 2.0 * (LABEL_CLEAR + stub)
+}
+
 /// One line of a compact branch point's fan between two adjacent TD/BT
 /// layers, in breadth: from where it leaves the point to the port at its
 /// far end, with its label's width if it has one.
@@ -2894,7 +2911,9 @@ fn place(
     // (`Edge::end_room`, both ends summed: ER crow's feet) is gap the
     // label may not take, so an edge carrying any also gets an entry
     // without a label (extent 0): its glyphs must fit facing each other.
-    type ShortLabel = (usize, usize, f64, f64, bool);
+    // Last, the room past its label an LR / RL styled edge's gap keeps
+    // (see `styled_room`; 0 for a plain edge).
+    type ShortLabel = (usize, usize, f64, f64, bool, f64);
     let mut short_labels: Vec<Vec<ShortLabel>> = vec![Vec::new(); nlayers];
     // Per upper layer: (breadth centre, breadth extent, layer extent,
     // end room).
@@ -3049,7 +3068,7 @@ fn place(
             continue;
         }
         let Some(lbl) = &e.label else {
-            short_labels[alayer[hi]].push((lo, hi, 0.0, room, false));
+            short_labels[alayer[hi]].push((lo, hi, 0.0, room, false, 0.0));
             continue;
         };
         let w = text_width(lbl) + LABEL_PAD_W;
@@ -3063,7 +3082,7 @@ fn place(
         // and cardinalities) is kept at both.
         let label_room = 2.0 * g.label_end_room.get(ei).copied().unwrap_or(0.0);
         let room = (room + label_room).max(lane_legs(ei, lo, hi, across));
-        short_labels[alayer[hi]].push((lo, hi, ext, room, fan.is_some()));
+        short_labels[alayer[hi]].push((lo, hi, ext, room, fan.is_some(), styled_room(e)));
         // In LR/RL a row along the layer axis costs a label's whole
         // width, and the scene never uses it: colliding labels there
         // slide apart ACROSS the flow (they are only LABEL_BOX_H tall),
@@ -3240,7 +3259,7 @@ fn place(
             // its own box: a label on the border line would hide it. End
             // room counts as part of the ends: the label (or, without
             // one, the other end's glyph) clears it by LABEL_CLEAR too.
-            for &(s, t, ext, room, fan) in &short_labels[li] {
+            for &(s, t, ext, room, fan, styled) in &short_labels[li] {
                 let lo_side = if reach[s].1 > 0.0 {
                     reach_of(li - 1, 1)
                 } else {
@@ -3260,15 +3279,19 @@ fn place(
                 // long, the head and a clearance on both sides — the
                 // label stage centres such a label on the run clear of
                 // its head (`labels::head_clear_spot`), so the clearance
-                // falls at both ends of the chip. (Growing the LR gap by
-                // a `LABEL_RUN` either side re-laid dense-lr and drew
-                // wide-labels flatter than `MAX_ASPECT`.) (Class and ER
-                // scenes keep their glyph room in `room` and the plain
-                // rule.)
+                // falls at both ends of the chip. A styled edge's gap
+                // (dotted, thick, `linkStyle`-painted) keeps a run of its
+                // stroke in sight past those clearances too
+                // (`styled_room`), or the chip covers all but a dash of
+                // it and its style no longer reads. (Growing every LR
+                // gap by a `LABEL_RUN` either side re-laid dense-lr and
+                // drew wide-labels flatter than `MAX_ASPECT`.) (Class
+                // and ER scenes keep their glyph room in `room` and the
+                // plain rule.)
                 let flow = ext > 0.0 && g.edge_paint_width.is_none() && !judged;
                 let need = match (flow, horizontal) {
                     (true, false) => Some(ext + 2.0 * LABEL_RUN),
-                    (true, true) => Some(ext + 2.0 * LABEL_CLEAR + ARROW_MARKER_PX),
+                    (true, true) => Some(ext + (2.0 * LABEL_CLEAR + ARROW_MARKER_PX).max(styled)),
                     (false, _) => None,
                 };
                 match need {
