@@ -16152,7 +16152,13 @@ mod tests {
                         .find(|n| n.id == id)
                         .map(|n| n.label.as_str())
                 };
+                // (Only while the router draws it: since the cycle
+                // breakers take the walk reversing fewer transitions, B8
+                // review r1 #3, the composites read left to right and
+                // the link is a plain curve, which `scene()` and
+                // `route()` bend as they bend any free curve.)
                 let routed = name == "nested-composite"
+                    && !a.waypoints.is_empty()
                     && (card(&a.from) == Some("in458") || card(&a.to) == Some("in458"));
                 // A straight link (B7 review r1 #4, `straight-link`: a
                 // comb kept in `scene()` and not in `route()` pushed its

@@ -417,11 +417,15 @@ fn crossing_gaps_do_not_read_as_dashes() {
 /// (dense-td 1 811 -> 1 674); static hug 2 820 -> 2 830, as dense-td's
 /// re-laid gaps cost it (2 008 -> 2 020: its `n25 -> n38` runs 12 px
 /// longer beside node `n13`), still under the 2 969 before B7.
+/// B8 (report M11, see `DEFECT_BASELINE`): routed hug 3 290 -> 3 350,
+/// fanout-frames' one column of frames (0 -> 62: the hub's `route()`
+/// edge to its fourth frame runs 62 px down the third's border); its
+/// static hug falls 212 -> 0.
 const CHANNEL_MAX: [(&str, f64, f64); 4] = [
     ("overlap_len", 2_950.0, 7_160.0),
     ("overlap_max", 470.0, 1_400.0),
     ("tight_len", 12_630.0, 20_700.0),
-    ("hug_len", 2_830.0, 3_290.0),
+    ("hug_len", 2_830.0, 3_350.0),
 ];
 
 /// Most edges (over all fixtures, per mode) that pass a title chip
@@ -592,6 +596,17 @@ fn channels_keep_edges_apart_and_off_chips() {
 /// B7 review r1 #7): x_drawn routed 500 -> 502 (dense-td 73 -> 76, still
 /// under the 503 before), band_pairs static 95 -> 94, band_len static
 /// 46 030 -> 45 800.
+///
+/// B8 (report M11): a narrowing step may no longer grow the drawing's
+/// area or its edges' length along the flow, so fanout-frames keeps its
+/// column of frames in one column (as mermaid draws it) instead of
+/// stacking its third frame under its first, beside the column. The
+/// hub's edges into the column's far ends cross once more: x_drawn
+/// 498 | 502 -> 499 | 504 (fanout-frames 2 | 1 -> 3 | 3), and the
+/// column's longer bundled runs band_len 45 800 | 51 310 -> 45 930 |
+/// 51 550 (fanout-frames 268 | 114 -> 396 | 352). Its static drawing
+/// sheds a border hug (212 px), a tight run, a sideways wiggle and
+/// three end kinks, its canvas 34 % narrower and 9 % smaller.
 const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
     ("end_tilt", 7.0, 11.0),
     ("end_tilt_max", 76.8, 128.4),
@@ -602,11 +617,11 @@ const DEFECT_BASELINE: [(&str, f64, f64); 16] = [
     ("own_frame_x", 0.0, 0.0),
     ("own_frame_len", 0.0, 0.0),
     ("band_pairs", 94.0, 104.0),
-    ("band_len", 45_800.0, 51_310.0),
+    ("band_len", 45_930.0, 51_550.0),
     ("idiom_scubic", 61.0, 80.0),
     ("idiom_spline", 21.0, 22.0),
     ("idiom_bow", 2.0, 1.0),
-    ("x_drawn", 498.0, 502.0),
+    ("x_drawn", 499.0, 504.0),
     ("end_kink", 53.0, 69.0),
     ("ink_out", 0.0, 0.0),
 ];
@@ -874,4 +889,116 @@ fn a_one_px_drag_leaves_unrelated_edges_put() {
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Moving one top-level node declaration of dense-td (report §2.9's
+/// repro: the `n45` line) to other top-level lines keeps its width
+/// within [`SHUFFLE_WIDTH_MAX`] of the source order's. Over all 57 such
+/// positions it lays out 4 197 – 4 347 px (+3.6 %); it was 4 155 –
+/// 5 740 px, a third either way of the 4 : 1 entry to narrowing and of
+/// a stacking refused for its node hits (B8 review r1 #3).
+#[test]
+fn moving_a_node_declaration_barely_moves_dense_td() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/quality/dense-td.mmd"
+    ))
+    .expect("fixture");
+    let lines: Vec<&str> = src.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("n45["))
+        .expect("n45 is declared");
+    let mut rest = lines.clone();
+    let decl = rest.remove(at);
+    // Top-level lines (outside every subgraph block), past the header.
+    let mut depth = 0usize;
+    let mut tops: Vec<usize> = Vec::new();
+    for (i, l) in rest.iter().enumerate() {
+        let t = l.trim();
+        if i >= 2 && depth == 0 {
+            tops.push(i);
+        }
+        if t.starts_with("subgraph") {
+            depth += 1;
+        } else if t == "end" {
+            depth -= 1;
+        }
+    }
+    tops.push(rest.len());
+    let width = |s: &str| {
+        let g = match flowmaid::parser::parse_document(s).expect("parses") {
+            flowmaid::Document::Flowchart(g) => g,
+            _ => unreachable!("a flowchart fixture"),
+        };
+        flowmaid::scene::scene(&g).width
+    };
+    let w0 = width(&src);
+    // Six positions spread over the file: after `n46`, between the
+    // subgraph blocks, among the edges, at the end.
+    for k in 0..6 {
+        let i = tops[k * (tops.len() - 1) / 5];
+        let mut moved = rest.clone();
+        moved.insert(i, decl);
+        let w = width(&moved.join("\n"));
+        assert!(
+            (w - w0).abs() <= SHUFFLE_WIDTH_MAX * w0,
+            "n45 before line {i}: width {w:.0} against {w0:.0}"
+        );
+    }
+}
+
+/// Most a shuffle of a fixture's edge lines may change its canvas
+/// width (share of the source order's): the layout's output depends on
+/// declaration order only through its documented tie-breaks (report
+/// §2.9, B8: "permuting the edge lines of dense-td must not change width
+/// by more than ~10 %"). Measured over twelve shuffles: dense-td 4 249
+/// px, its shuffles 4 249 or 4 392 (+3.4 %); dense-lr always 2 299;
+/// bench-75 1 772, its shuffles 1 772 – 1 906 (+7.6 %; it was 1 772 –
+/// 2 129, +20 %, while its cycle breakers followed the edge lines'
+/// order alone, B8 review r1 #3).
+const SHUFFLE_WIDTH_MAX: f64 = 0.10;
+
+/// Shuffling the edge lines of the generated dense fixtures and of
+/// bench-75 (nodes all declared up front, in their subgraphs) keeps
+/// their width within [`SHUFFLE_WIDTH_MAX`]; all three are drawn with
+/// the flow along their width or their width as the breadth the
+/// layout narrows (dense-td).
+#[test]
+fn edge_line_order_barely_moves_the_dense_layouts() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/quality");
+    for name in ["dense-td", "dense-lr", "bench-75"] {
+        let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");
+        let lines: Vec<&str> = src.lines().collect();
+        let is_edge = |l: &str| ["-->", "-.->", "==>"].iter().any(|a| l.contains(a));
+        let at: Vec<usize> = (0..lines.len()).filter(|&i| is_edge(lines[i])).collect();
+        let width = |s: &str| {
+            let g = match flowmaid::parser::parse_document(s).expect("parses") {
+                flowmaid::Document::Flowchart(g) => g,
+                _ => unreachable!("a flowchart fixture"),
+            };
+            flowmaid::scene::scene(&g).width
+        };
+        let w0 = width(&src);
+        // Deterministic shuffles (xorshift), a few seeds.
+        for seed in 1..=6u64 {
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut order: Vec<&str> = at.iter().map(|&i| lines[i]).collect();
+            for i in (1..order.len()).rev() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                order.swap(i, (x % (i as u64 + 1)) as usize);
+            }
+            let mut out: Vec<&str> = lines.clone();
+            for (&i, l) in at.iter().zip(order) {
+                out[i] = l;
+            }
+            let w = width(&out.join("\n"));
+            assert!(
+                (w - w0).abs() <= SHUFFLE_WIDTH_MAX * w0,
+                "{name} shuffle {seed}: width {w:.0} against {w0:.0}"
+            );
+        }
+    }
 }

@@ -7,6 +7,66 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **A subgraph's edge-less members sit in its first row** (report §2.9,
+  B8 review r1). A member with no edges (or a chain only the subgraph's
+  own members join) used to land on the drawing's first layer, beside
+  whatever feeds the drawing: a hub that reaches a subgraph through one
+  of its members sat level with that subgraph's other members, and its
+  edges to the next layer struck through the frame. Such a member now
+  starts on the subgraph's first row — the top layer of its members that
+  link out of it — as mermaid draws it; inside a nested subgraph it keeps
+  its place when its outermost subgraph already starts on that row. A
+  subgraph nothing links out of keeps its place. Over 600 generated
+  hub-and-subgraphs drawings, edges cutting through frames fall 71 % and
+  defects 64 %; the corpus and fixture drawings are unchanged.
+- **Narrowing a broad flowchart never grows it** (report M11). A drawing
+  broader than 2.5 : 1 (it was 4 : 1; class diagrams ride the same
+  layout) is narrowed by stacking a subgraph below its sibling, folding
+  three or more siblings that share a layer into two runs, pulling
+  sources down beside their targets, or staggering leaves into two rows
+  — but every step is now kept only when it adds at
+  most 2 % to the drawing's area and 10 % to its total edge length, and a
+  stacking or fold at most 15 % to the edge length along the flow (the
+  detour past the sibling). Leaf staggering and source pulling are held
+  to the area and length limits too, so some leaf fans now stay one row
+  where a staggered second row would have grown them (a random leaf
+  fan keeps 2 052 x 276 px where it was staggered to 1 283 x 459, its
+  crossings 14 -> 8; over 120 random fans defects and crossings fall
+  slightly). A step may cut more edges across boxes than before only
+  where it saves more crossings than that. A hub feeding six frames of
+  different heights (`fanout-frames`) keeps them in one column, as
+  mermaid draws it (its third frame used to step into a second column,
+  9.7 % more area). A fold rarely passes: its later run's edges thread
+  past the earlier run's frames, which the flow limit refuses for frames
+  deep along the flow (3 of some 1 800 generated and corpus flowcharts
+  fold); it wins for a TB row of shallow frames and leaves under one hub,
+  a 4.9 : 1 ribbon folded into two rows.
+- **Moving a node's declaration line barely moves the drawing** (report
+  §2.9, P1). Moving `n45`'s line in the dense TD fixture to any other
+  top-level line used to swing its width 4 155 – 5 740 px, a third either
+  way of the old 4 : 1 entry to narrowing and of a stacking refused for
+  its node hits; it now stays within 4 249 – 4 492 px (+5.7 %). The
+  cycle breakers no longer follow the order the edge lines happen to be
+  written in alone: of a walk in source order and one in the order the
+  targets were declared, the one reversing fewer edges wins (source
+  order on a tie). Shuffling bench-75's edge lines used to lay it out
+  1 772 – 2 129 px along the flow with 56 – 68 of its 75 edges pointing
+  along it; now 1 772 – 1 906 px with 66 – 68. No corpus drawing
+  changes; the 13 of some 1 800 generated flowcharts that do lose most
+  of their defects, and 15 of 964 generated state diagrams change (the
+  nested composites of the `nested-composite` note fixture now read
+  left to right, in the order their transitions run).
+
+### Fixed
+
+- **`route()` scores candidate paths faster** (drag speed): a path
+  segment whose bounding box misses a node, frame, title chip or label is
+  skipped before the clipping arithmetic. The routes are byte-identical;
+  a full `route()` of the dense fixtures runs 6-9 % fewer instructions
+  (dense-td, dense-lr), bench-75 2 %.
+
 ## [0.34.0] - 2026-11-04
 
 ### Highlights
