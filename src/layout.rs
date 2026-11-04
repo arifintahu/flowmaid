@@ -101,10 +101,17 @@ pub(crate) const FRAME_GAP: f64 = 8.0;
 /// stop once it is reached (G12).
 const ASPECT_TARGET: f64 = 2.5;
 /// Breadth-to-depth ratio past which a drawing counts as a ribbon and
-/// is narrowed at all. Below it, re-layering costs more than it gives:
+/// is narrowed at all: the ratio the rounds aim for. It was 4 : 1, for
 /// the longer edges and channel detours of a stacked or staggered
-/// drawing outweigh the breadth saved on a moderately wide one.
-const RIBBON_ENTRY: f64 = 4.0;
+/// drawing outweighed the breadth saved on a moderately wide one; a
+/// step now must give back breadth without growing area, edge length,
+/// crossings or node hits past their slack (report M11), so a step that
+/// costs more than it gives is refused at any ratio. Over the 164 of
+/// some 1 800 generated and corpus flowcharts that narrowing between
+/// 2.5 : 1 and 4 : 1 changes, it cuts their defects by a fifth (static)
+/// to a quarter (`route()`) and their area by a tenth, crossings about
+/// even (B8 review r1 #1); the corpus and fixtures are unchanged.
+const RIBBON_ENTRY: f64 = ASPECT_TARGET;
 /// Share of drawing area (breadth x depth, as the search judges them) a
 /// narrowing step may add (report M11): narrowing is meant to fill the
 /// drawing, not to grow it. fanout-frames' third frame stacked under
@@ -122,7 +129,13 @@ const NARROW_LEN_SLACK: f64 = 0.1;
 /// total edge length 25 % (the fan's spread shrank) but grew the length
 /// along the flow 60 %: every edge into the second column threading the
 /// first. (A staggered leaf only steps one layer out beside its row:
-/// leaf staggering is not held to it.)
+/// leaf staggering is not held to it.) Folds rarely pass it — 3 of some
+/// 1 800 generated and corpus flowcharts fold, a TB row of shallow
+/// frames and leaves under one hub — for a later run's edges always
+/// thread past the earlier run (B8 review r1 #5); trading the slack for
+/// an exchange rate instead (each px of flow detour buying 1.7 px of
+/// breadth) folded 86 generated drawings, and raised their drawn
+/// crossings 20 to 30 %.
 const NARROW_FLOW_SLACK: f64 = 0.15;
 /// Fewest real nodes a layer needs before its leaves are staggered.
 const STAGGER_MIN_NODES: usize = 6;
@@ -1484,7 +1497,7 @@ fn layout_core(
         "number of sizes must match number of nodes"
     );
     let groups: Vec<RankGroup> = rank_only.to_vec();
-    let rk = rank(g, &groups);
+    let rk = rank(g, &groups, node_cluster);
     let mut layer = rk.layer.clone();
     if g.tight_sources {
         if let Some(tight) = tighten_sources(g, &groups, &rk, &layer) {
@@ -1599,7 +1612,13 @@ fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, 
     // several steps cannot pile up re-threadings.
     let hit_cap = st.best.hits + NARROW_HIT_SLACK;
     // A step must give back breadth without adding area or edge length
-    // past their slack (report M11), crossings or node hits.
+    // past their slack (report M11), crossings or node hits. Node hits
+    // may grow past their slack only where the step saves more
+    // crossings than it adds hits, its judged crossings and hits
+    // falling together: dense-td's two biggest frames stacked one way
+    // cut 33 crossings for 9 hits when its first two nodes were
+    // declared the other way round, and refused, that order drew it
+    // 5 240 px broad instead of 4 201 (B8 review r1 #3).
     let area = |p: &Placement| p.lo.total_b * p.depth;
     let better = |cand: &Placement, cur: &Placement| {
         cand.lo.total_b <= cur.lo.total_b * (1.0 - STAGGER_MIN_GAIN)
@@ -1607,7 +1626,8 @@ fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, 
             && edge_length(g, &cand.lo, false)
                 <= edge_length(g, &cur.lo, false) * (1.0 + NARROW_LEN_SLACK)
             && cand.crossings <= cap
-            && cand.hits <= hit_cap.min(cur.hits + NARROW_HIT_SLACK)
+            && (cand.hits <= hit_cap.min(cur.hits + NARROW_HIT_SLACK)
+                || cand.crossings + cand.hits < cur.crossings + cur.hits)
     };
     // A stacked box's in-edges thread past its sibling; a staggered leaf
     // only steps one layer out beside its row.
@@ -1661,7 +1681,7 @@ fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, 
                 }
                 let mut cand_groups = st.groups.clone();
                 cand_groups.push(group);
-                let crk = rank(g, &cand_groups);
+                let crk = rank(g, &cand_groups, node_cluster);
                 let cand = place(
                     g,
                     sizes,
@@ -2171,8 +2191,10 @@ struct Ranking {
     layer: Vec<usize>,
 }
 
-/// Steps 1 and 2: mark back-edges, then longest-path layering.
-fn rank(g: &Graph, rank_only: &[RankGroup]) -> Ranking {
+/// Steps 1 and 2: mark back-edges, then longest-path layering; with
+/// `node_cluster`, each box's loose parts are then seated on its top
+/// layer ([`seat_loose_parts`]).
+fn rank(g: &Graph, rank_only: &[RankGroup], node_cluster: Option<&[Vec<usize>]>) -> Ranking {
     let n = g.nodes.len();
     // Ranking graph: the real nodes, then one HUB per rank-only group
     // (`from -> hub` weighs one layer, `hub -> to` none), so a group
@@ -2199,36 +2221,60 @@ fn rank(g: &Graph, rank_only: &[RankGroup]) -> Ranking {
         }
     }
 
-    // --- 1. Mark back-edges (cycle breakers) with iterative DFS ---
-    let mut state = vec![0u8; nx]; // 0 unvisited, 1 on stack, 2 done
-    let mut back = vec![false; nlinks];
-    for s in 0..nx {
-        if state[s] != 0 {
-            continue;
-        }
-        state[s] = 1;
-        let mut stack: Vec<(usize, usize)> = vec![(s, 0)];
-        while !stack.is_empty() {
-            let (u, ci) = *stack.last().unwrap();
-            if ci < adj[u].len() {
-                stack.last_mut().unwrap().1 += 1;
-                let (v, ei) = adj[u][ci];
-                if v == u {
-                    back[ei] = true; // self-loop
-                    continue;
-                }
-                match state[v] {
-                    0 => {
-                        state[v] = 1;
-                        stack.push((v, 0));
-                    }
-                    1 => back[ei] = true, // edge back to an ancestor = cycle
-                    _ => {}
-                }
-            } else {
-                state[u] = 2;
-                stack.pop();
+    // --- 1. Mark back-edges (cycle breakers) with iterative DFS, twice:
+    // following each node's links in source order, then in the order
+    // their targets were declared. The walk that reverses fewer real
+    // edges wins, source order on a tie (report §2.9, B8 review r1 #3).
+    // A walk in source order alone took its cycle breakers from the
+    // order the edge lines happened to be written in: bench-75 with its
+    // edge lines shuffled drew 56 to 68 of its 75 edges along the flow
+    // and laid out 1 772 to 2 129 px along it (now 66 to 68, and 1 772
+    // to 1 906 px); over 1 800 generated and corpus flowcharts the 13
+    // that change lose 85 % of their defects.
+    let dfs_back = |adj: &[Vec<(usize, usize)>]| -> Vec<bool> {
+        let mut state = vec![0u8; nx]; // 0 unvisited, 1 on stack, 2 done
+        let mut back = vec![false; nlinks];
+        for s in 0..nx {
+            if state[s] != 0 {
+                continue;
             }
+            state[s] = 1;
+            let mut stack: Vec<(usize, usize)> = vec![(s, 0)];
+            while !stack.is_empty() {
+                let (u, ci) = *stack.last().unwrap();
+                if ci < adj[u].len() {
+                    stack.last_mut().unwrap().1 += 1;
+                    let (v, ei) = adj[u][ci];
+                    if v == u {
+                        back[ei] = true; // self-loop
+                        continue;
+                    }
+                    match state[v] {
+                        0 => {
+                            state[v] = 1;
+                            stack.push((v, 0));
+                        }
+                        1 => back[ei] = true, // edge back to an ancestor = cycle
+                        _ => {}
+                    }
+                } else {
+                    state[u] = 2;
+                    stack.pop();
+                }
+            }
+        }
+        back
+    };
+    let mut back = dfs_back(&adj);
+    let mut by_target = adj.clone();
+    for links in by_target.iter_mut() {
+        links.sort_by_key(|&(v, ei)| (v, ei));
+    }
+    if by_target != adj {
+        let alt = dfs_back(&by_target);
+        let reversed = |b: &[bool]| b[..ne].iter().filter(|&&x| x).count();
+        if reversed(&alt) < reversed(&back) {
+            back = alt;
         }
     }
 
@@ -2287,11 +2333,128 @@ fn rank(g: &Graph, rank_only: &[RankGroup]) -> Ranking {
         }
     }
 
+    // --- 4. A box's loose parts down to its top layer.
+    if let Some(nc) = node_cluster {
+        seat_loose_parts(nc, &adj, &mut layer);
+    }
+
     layer.truncate(n);
     Ranking {
         back,
         group_eid,
         layer,
+    }
+}
+
+/// Seat every loose part of a box on the box's top layer (report §2.9,
+/// B8 review r1 #1). A part is a connected piece of the ranking graph
+/// `adj` (real nodes `0..nc.len()`, then rank-only hubs; every link
+/// counts, cycle breakers too) that lies wholly inside one box: an
+/// edge-less member, a chain only its own members join, a packed grid
+/// of notes. Longest-path layering parks each such part on the first
+/// layer, beside whatever feeds the drawing — a hub fanning out into
+/// boxes then sat level with the edge-less members of the boxes it
+/// feeds through one member, its edges striking through their frames
+/// to reach the next layer. Mermaid (dagre's nesting edges from the
+/// box's top border) draws them in the box's first row instead.
+/// A part moves down, whole, until its first layer is the top layer of
+/// the members of its outermost box that link out of that box (the
+/// anchors): the box's first row. An island box (no link leaves it)
+/// hands the part on to the next box inside it that has anchors, and a
+/// box no link leaves at any depth keeps its place. Inside its
+/// outermost box a part may stay above an inner box's own anchors: the
+/// rows it keeps lie within the outer frame anyway, and seating it on
+/// the inner box re-laid a dense nested drawing for no frame it cleared
+/// (dense-td's lone member of a third-level box, 4 rows down: 20 % more
+/// crossings, and its `route()` left two long edges through nodes and
+/// ran 30 % slower). Parts are seated
+/// shallowest first, so an anchor never moves after a part was seated
+/// on it. Every link stays inside its part, so each keeps its length
+/// and direction.
+fn seat_loose_parts(nc: &[Vec<usize>], adj: &[Vec<(usize, usize)>], layer: &mut [usize]) {
+    let n = nc.len();
+    let nx = adj.len();
+    // Undirected parts, numbered by their first node.
+    let mut und: Vec<Vec<usize>> = vec![Vec::new(); nx];
+    for (u, links) in adj.iter().enumerate() {
+        for &(v, _) in links {
+            und[u].push(v);
+            und[v].push(u);
+        }
+    }
+    let mut part = vec![usize::MAX; nx];
+    let mut parts: Vec<Vec<usize>> = Vec::new();
+    for s in 0..nx {
+        if part[s] != usize::MAX {
+            continue;
+        }
+        let id = parts.len();
+        part[s] = id;
+        let mut nodes = vec![s];
+        let mut i = 0;
+        while let Some(&u) = nodes.get(i) {
+            i += 1;
+            for &v in &und[u] {
+                if part[v] == usize::MAX {
+                    part[v] = id;
+                    nodes.push(v);
+                }
+            }
+        }
+        parts.push(nodes);
+    }
+    // Each part's innermost common box path (empty: it reaches the top
+    // level, or holds no real node).
+    let paths: Vec<Vec<usize>> = parts
+        .iter()
+        .map(|nodes| {
+            let mut real = nodes.iter().filter(|&&v| v < n);
+            let Some(&first) = real.next() else {
+                return Vec::new();
+            };
+            let mut path = nc[first].clone();
+            for &v in real {
+                let k = path.iter().zip(&nc[v]).take_while(|(a, b)| a == b).count();
+                path.truncate(k);
+            }
+            path
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..parts.len()).filter(|&p| !paths[p].is_empty()).collect();
+    if order.is_empty() {
+        return;
+    }
+    order.sort_by_key(|&p| paths[p].len());
+    // Per box, its anchors' top layer, read once: an anchor's part
+    // reaches no deeper than the box, so it was seated before any part
+    // that lies inside the box.
+    let mut tops: BTreeMap<usize, Option<usize>> = BTreeMap::new();
+    for p in order {
+        for (depth, &c) in paths[p].iter().enumerate() {
+            let top = *tops.entry(c).or_insert_with(|| {
+                (0..n)
+                    .filter(|&v| {
+                        nc[v].get(depth) == Some(&c) && paths[part[v]].get(depth) != Some(&c)
+                    })
+                    .map(|v| layer[v])
+                    .min()
+            });
+            let Some(top) = top else {
+                continue;
+            };
+            let first = parts[p]
+                .iter()
+                .filter(|&&v| v < n)
+                .map(|&v| layer[v])
+                .min()
+                .unwrap_or(top);
+            if top > first {
+                for &v in &parts[p] {
+                    layer[v] += top - first;
+                }
+            }
+            break;
+        }
     }
 }
 
@@ -5071,6 +5234,96 @@ mod tests {
         );
     }
 
+    /// A box's loose parts sit on its top layer (report §2.9, B8 review
+    /// r1 #1): a hub feeding a box through one member no longer leaves
+    /// the box's edge-less members level with the hub (its edges struck
+    /// through their frame to reach the member), a chain only the box's
+    /// own members join starts on the member's row, and a nested box
+    /// nothing links out of takes its parent's top row. A box no link
+    /// leaves keeps its place, and a part already on its outermost
+    /// box's first row stays there, above its inner box's anchor.
+    #[test]
+    fn a_box_seats_its_loose_parts_on_its_top_layer() {
+        let src = "flowchart TB\nhub\nsubgraph g[box]\nlinked\nloose1\nloose2\nc1 --> c2\n\
+                   subgraph inner[inner]\ni1\nend\nend\nsubgraph island[island]\nx1\nend\n\
+                   subgraph o[outer]\nsrc2\nsubgraph in2[in2]\nx2\ny2\nend\nend\n\
+                   hub --> linked\nsrc2 --> out2\nhub --> y2\n";
+        let g = crate::parser::parse(src).unwrap();
+        let sc = crate::scene::scene(&g);
+        let y = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap().y;
+        let row = y("linked");
+        assert!(y("hub") < row - 30.0, "the hub above its target");
+        for id in ["loose1", "loose2", "c1", "i1"] {
+            assert!(
+                (y(id) - row).abs() < 1.0,
+                "{id} at {} off the box's row {row}",
+                y(id)
+            );
+        }
+        assert!(y("c2") > row + 30.0, "the chain keeps its own step");
+        // The island box has no anchor: it stays on the first row.
+        assert!((y("x1") - y("hub")).abs() < 1.0);
+        // The outer box starts on the first row (src2): x2 stays there,
+        // above its own box's anchor y2.
+        assert!((y("x2") - y("src2")).abs() < 1.0);
+        assert!(y("y2") > y("x2") + 30.0);
+    }
+
+    /// A hub feeding a row of shallow frames and leaves on one layer (a
+    /// generated 4.9 : 1 ribbon) folds it into two rows (report M11):
+    /// after one sibling stacking, a wrap ranks the later run of frames
+    /// one row down — 2 093 -> 1 106 px of judged breadth for 10 % more
+    /// edge length along the flow. (Where the later run's edges would
+    /// thread past deep frames, NARROW_FLOW_SLACK refuses it.)
+    #[test]
+    fn a_hub_fed_row_of_shallow_frames_wraps_into_two_rows() {
+        let src = "flowchart TB\n\
+                     n0[\"aliqua eiusmod adipiscing elit<br/>sed elit\"]\n\
+                     subgraph g0[\"eiusmod ut labore elit magna\"]\n\
+                       direction LR\n\
+                       n1([\"ut aliqua\"])\n\
+                     end\n\
+                     subgraph g1[\"eiusmod elit\"]\n\
+                       direction TB\n\
+                       n2(\"amet lorem elit aliqua<br/>sed\")\n\
+                     end\n\
+                     subgraph g2[\"sit lorem amet labore magna\"]\n\
+                       direction LR\n\
+                       n3([\"dolor consectetur magna consectetur<br/>amet incididunt dolor\"])\n\
+                     end\n\
+                     subgraph g3[\"do\"]\n\
+                       n4[(\"dolor\")]\n\
+                     end\n\
+                     subgraph g4[\"nostrud elit do laboris laboris tempor elit\"]\n\
+                       direction TB\n\
+                       n5[\"magna incididunt\"]\n\
+                       n6([\"ipsum<br/>elit<br/>elit elit magna\"])\n\
+                       n7(\"sed<br/>amet amet nostrud\")\n\
+                       n8[(\"ut elit adipiscing<br/>dolor laboris nostrud eiusmod\")]\n\
+                       n9([\"incididunt sit incididunt<br/>ut veniam tempor nostrud\"])\n\
+                       n10[(\"lorem aliqua<br/>tempor\")]\n\
+                     end\n\
+                     n11([\"ut incididunt lorem aliqua\"])\n\
+                     n12([\"dolor magna adipiscing consectetur\"])\n\
+                     n13([\"aliqua\"])\n\
+                     n0 -.-> n1\n\
+                     n0 --> g1\n\
+                     n0 --> g2\n\
+                     n0 -.-> g3\n\
+                     n0 --> g4\n\
+                     n0 --> n11\n\
+                     n0 --> n12\n\
+                     n0 --> n13\n";
+        let g = crate::parser::parse(src).unwrap();
+        let sc = crate::scene::scene(&g);
+        let frame = |id: &str| sc.clusters.iter().find(|c| c.id == id).unwrap();
+        let first_row = frame("g1").y + frame("g1").h;
+        for id in ["g2", "g4"] {
+            assert!(frame(id).y > first_row, "{id} not wrapped below g1");
+        }
+        assert!(sc.width < 2.0 * sc.height, "{} x {}", sc.width, sc.height);
+    }
+
     /// The narrowing guards (report M11) read edge length both ways:
     /// node centre to centre on both axes, or along the flow only.
     #[test]
@@ -5118,7 +5371,7 @@ mod tests {
             })
             .collect();
         let sizes: Vec<(f64, f64)> = vec![(60.0, 40.0); g.nodes.len()];
-        let rk = rank(&g, &[]);
+        let rk = rank(&g, &[], None);
         let (lo, _) = layout_core(&g, &sizes, Some(&nc), &[]);
         let wraps = wrap_candidates(&g, &nc, &[], &rk, &rk.layer, &lo);
         assert_eq!(wraps.len(), 1, "{wraps:?}");
@@ -5135,7 +5388,7 @@ mod tests {
         let (x, y) = (&g.nodes[then[0]].id, &g.nodes[first[0]].id);
         back += &format!("{x} --> {y}\n");
         let g2 = crate::parser::parse(&back).unwrap();
-        let rk2 = rank(&g2, &[]);
+        let rk2 = rank(&g2, &[], None);
         let wraps2 = wrap_candidates(&g2, &nc, &[], &rk2, &rk2.layer, &lo);
         assert!(
             wraps2

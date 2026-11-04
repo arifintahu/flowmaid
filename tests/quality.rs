@@ -891,21 +891,83 @@ fn a_one_px_drag_leaves_unrelated_edges_put() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
+/// Moving one top-level node declaration of dense-td (report §2.9's
+/// repro: the `n45` line) to other top-level lines keeps its width
+/// within [`SHUFFLE_WIDTH_MAX`] of the source order's. Over all 57 such
+/// positions it lays out 4 197 – 4 347 px (+3.6 %); it was 4 155 –
+/// 5 740 px, a third either way of the 4 : 1 entry to narrowing and of
+/// a stacking refused for its node hits (B8 review r1 #3).
+#[test]
+fn moving_a_node_declaration_barely_moves_dense_td() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/quality/dense-td.mmd"
+    ))
+    .expect("fixture");
+    let lines: Vec<&str> = src.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("n45["))
+        .expect("n45 is declared");
+    let mut rest = lines.clone();
+    let decl = rest.remove(at);
+    // Top-level lines (outside every subgraph block), past the header.
+    let mut depth = 0usize;
+    let mut tops: Vec<usize> = Vec::new();
+    for (i, l) in rest.iter().enumerate() {
+        let t = l.trim();
+        if i >= 2 && depth == 0 {
+            tops.push(i);
+        }
+        if t.starts_with("subgraph") {
+            depth += 1;
+        } else if t == "end" {
+            depth -= 1;
+        }
+    }
+    tops.push(rest.len());
+    let width = |s: &str| {
+        let g = match flowmaid::parser::parse_document(s).expect("parses") {
+            flowmaid::Document::Flowchart(g) => g,
+            _ => unreachable!("a flowchart fixture"),
+        };
+        flowmaid::scene::scene(&g).width
+    };
+    let w0 = width(&src);
+    // Six positions spread over the file: after `n46`, between the
+    // subgraph blocks, among the edges, at the end.
+    for k in 0..6 {
+        let i = tops[k * (tops.len() - 1) / 5];
+        let mut moved = rest.clone();
+        moved.insert(i, decl);
+        let w = width(&moved.join("\n"));
+        assert!(
+            (w - w0).abs() <= SHUFFLE_WIDTH_MAX * w0,
+            "n45 before line {i}: width {w:.0} against {w0:.0}"
+        );
+    }
+}
+
 /// Most a shuffle of a fixture's edge lines may change its canvas
 /// width (share of the source order's): the layout's output depends on
 /// declaration order only through its documented tie-breaks (report
 /// §2.9, B8: "permuting the edge lines of dense-td must not change width
-/// by more than ~10 %"). Measured over eleven shuffles: dense-td 4 249
-/// px, its shuffles 4 249 or 4 392 (+3.4 %); dense-lr always 2 299.
+/// by more than ~10 %"). Measured over twelve shuffles: dense-td 4 249
+/// px, its shuffles 4 249 or 4 392 (+3.4 %); dense-lr always 2 299;
+/// bench-75 1 772, its shuffles 1 772 – 1 906 (+7.6 %; it was 1 772 –
+/// 2 129, +20 %, while its cycle breakers followed the edge lines'
+/// order alone, B8 review r1 #3).
 const SHUFFLE_WIDTH_MAX: f64 = 0.10;
 
-/// Shuffling the edge lines of the generated dense fixtures (nodes all
-/// declared up front, in their subgraphs) keeps their width within
-/// [`SHUFFLE_WIDTH_MAX`].
+/// Shuffling the edge lines of the generated dense fixtures and of
+/// bench-75 (nodes all declared up front, in their subgraphs) keeps
+/// their width within [`SHUFFLE_WIDTH_MAX`]; all three are drawn with
+/// the flow along their width or their width as the breadth the
+/// layout narrows (dense-td).
 #[test]
 fn edge_line_order_barely_moves_the_dense_layouts() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/quality");
-    for name in ["dense-td", "dense-lr"] {
+    for name in ["dense-td", "dense-lr", "bench-75"] {
         let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");
         let lines: Vec<&str> = src.lines().collect();
         let is_edge = |l: &str| ["-->", "-.->", "==>"].iter().any(|a| l.contains(a));
@@ -919,7 +981,7 @@ fn edge_line_order_barely_moves_the_dense_layouts() {
         };
         let w0 = width(&src);
         // Deterministic shuffles (xorshift), a few seeds.
-        for seed in 1..=3u64 {
+        for seed in 1..=6u64 {
             let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
             let mut order: Vec<&str> = at.iter().map(|&i| lines[i]).collect();
             for i in (1..order.len()).rev() {
