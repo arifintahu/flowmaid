@@ -791,6 +791,12 @@ Minor, not patch: several class structs gain public fields (see
 
 ### Fixed
 
+- **`route()` scores candidate paths faster** (drag speed): a path
+  segment whose bounding box misses a node, frame, title chip or label is
+  skipped before the clipping arithmetic. The routes are byte-identical;
+  a full `route()` of the dense fixtures runs 6-9 % fewer instructions
+  (dense-td, dense-lr), bench-75 2 %.
+
 - **Edge ends touch every shape's outline** (report M6, P0 #9). The edge
   stages met a parallelogram, a trapezoid (drawn as one), a hexagon and a
   cylinder as their bounding box, so ends floated 7–10 px beside a
