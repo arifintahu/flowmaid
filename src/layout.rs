@@ -2453,28 +2453,37 @@ fn rank(
 /// the topmost node outside every box with a link into it (a real
 /// edge, an edge to the box's frame through its rank-only stand-in).
 /// Each SOURCE member — a member with no link in at all but from a
-/// `lead` note card, edge-less or linking onward — ranks no higher than
-/// the first row of the outermost box on its path that has feeders, and
-/// a box one of those sources links into ranks its own first-row
-/// members (no link in from inside it) below that source, so the line
-/// leaves the source's row for the next instead of threading the boxes
-/// on its row. Inside its outermost box a source may stay above an
-/// inner box's own feeders: the rows it keeps lie within the outer frame
+/// `lead` note card: edge-less, linking onward out of the box, or
+/// leading inside it to a member the feeders rank (which then moves a
+/// row down: f051's `n8 -> n9`) — ranks no higher than the first row of
+/// the outermost box on its path that has feeders, and a box one of
+/// those sources links into ranks its own first-row members (no link
+/// in from inside it) below that source, so the line leaves the
+/// source's row for the next instead of threading the boxes on its
+/// row. Inside its outermost box a source may stay above an inner
+/// box's own feeders: the rows it keeps lie within the outer frame
 /// anyway.
+///
+/// A node outside the box and the boxes it leads into may move with
+/// the seats only where it HANGS below the move: every link into it
+/// comes from a node that moved too, so no other line stretches (x7's
+/// `nightly job --> mail relay`). A box such a node belongs to follows
+/// the seated box down whole, ranked below the moved node linking into
+/// it (x1: the hub feeds Alpha and Gamma, Alpha leads into Beta and
+/// Beta into Gamma; Gamma, else three rows deep beside Beta, sits one
+/// row below it).
 ///
 /// What stays put: a box with no feeder outside every box (dense-td's
 /// and dense-lr's boxes fed from other boxes keep their sources on the
 /// first layer: seating them there re-laid the drawings, dense-td's
-/// drawn crossings 27 % up and its `route()` 40 % slower); a source that
-/// leads, inside the box, to an entry (a member something outside
-/// ranks into: the source already sits above it, where the entry needs
-/// it); a source a cycle breaker reaches from outside the box (as every
-/// later layer move leaves a cycle's end, [`NodeLinks`]); a feeder the
-/// box's own sources reach, or a source the box it leads into leads
-/// back to (each would close a cycle); and every box whose seating
-/// would move a node outside the box and the boxes it leads into — it
-/// re-laid the rest of the drawing for one box's rows (dense-lr: 25 of
-/// its 54 nodes a layer down).
+/// drawn crossings 27 % up and its `route()` 40 % slower); a source a
+/// cycle breaker reaches from outside the box (as every later layer
+/// move leaves a cycle's end, [`NodeLinks`]); a feeder the box's own
+/// sources reach, or a source the box it leads into leads back to (each
+/// would close a cycle); and every box whose seating would move a node
+/// outside it that does not hang below the move — it re-laid the rest
+/// of the drawing for one box's rows (dense-lr: 25 of its 52 nodes a
+/// layer down, six of them also ranked by nodes that stay).
 ///
 /// Links with an id from `stacks_from` on (narrowing's stackings and
 /// wraps) and cycle breakers neither feed a box nor make a member less
@@ -2532,33 +2541,13 @@ fn seat_box_sources(
         }
     }
     let inside = |u: usize, c: usize| u < n && nc[u].contains(&c);
-    // An entry of `c`: a member something outside `c` ranks into.
-    let entry = |u: usize, c: usize| preds[u].iter().any(|&p| !inside(p, c));
-    let leads_to_entry = |v: usize, c: usize| -> bool {
-        let mut seen = vec![false; n];
-        let mut stack = vec![v];
-        while let Some(u) = stack.pop() {
-            if std::mem::replace(&mut seen[u], true) {
-                continue;
-            }
-            if u != v && entry(u, c) {
-                return true;
-            }
-            for &(w, ei) in &adj[u] {
-                if seats(ei) && inside(w, c) {
-                    stack.push(w);
-                }
-            }
-        }
-        false
-    };
     let mut seat: Vec<Option<usize>> = (0..n)
         .map(|v| {
             if is_lead[v] || preds[v].iter().any(|&p| p >= n || !is_lead[p]) {
                 return None;
             }
             let c = nc[v].iter().copied().find(|&c| !feeders[c].is_empty())?;
-            let quiet = !back_in[v].iter().any(|&p| !inside(p, c)) && !leads_to_entry(v, c);
+            let quiet = !back_in[v].iter().any(|&p| !inside(p, c));
             quiet.then_some(c)
         })
         .collect();
@@ -2593,12 +2582,22 @@ fn seat_box_sources(
     // Longest path over the layering graph with the seats in `seat`, a
     // min-node taking its topmost feeder's row; also each seated box's
     // links into the boxes that follow it. `None` if a cycle is left.
-    let relay = |seat: &[Option<usize>]| -> Option<(Vec<usize>, Vec<Vec<usize>>)> {
+    let relay = |seat: &[Option<usize>],
+                 chain: &[(usize, usize, usize)]|
+     -> Option<(Vec<usize>, Vec<Vec<usize>>)> {
         let mut out = base.clone();
         // Links kept only where they close no cycle: (from, min- or
         // max-node).
         let mut cond: Vec<(usize, usize)> = Vec::new();
         let mut leads: Vec<Vec<usize>> = vec![Vec::new(); boxes];
+        for &(c, u, y) in chain {
+            if !cond.contains(&(u, after(y))) {
+                cond.push((u, after(y)));
+            }
+            if !leads[c].contains(&y) {
+                leads[c].push(y);
+            }
+        }
         for (v, s) in seat.iter().enumerate() {
             let Some(c) = *s else { continue };
             out[top(c)].push(v);
@@ -2681,21 +2680,37 @@ fn seat_box_sources(
         }
         (done == total).then_some((value, leads))
     };
+    // The boxes around each box.
+    let mut outer: Vec<Vec<usize>> = vec![Vec::new(); boxes];
+    for path in nc {
+        for (i, &c) in path.iter().enumerate() {
+            for &a in &path[..i] {
+                if !outer[c].contains(&a) {
+                    outer[c].push(a);
+                }
+            }
+        }
+    }
+    // Boxes that follow a seated box down a chain of moved members:
+    // (seated box, moved member outside the follower, follower).
+    let mut chain: Vec<(usize, usize, usize)> = Vec::new();
     // Unseat every box whose seating moves a node outside it and the
-    // boxes it leads into, until none does.
-    for _ in 0..=boxes {
+    // boxes it leads into, unless that node hangs below the move alone,
+    // until none does.
+    for _ in 0..=4 * boxes + 2 {
         if seat.iter().all(Option::is_none) {
             return;
         }
-        let Some((value, leads)) = relay(&seat) else {
+        let Some((value, leads)) = relay(&seat, &chain) else {
             return;
         };
         let moved = |u: usize| u < nx && value[u] > layer[u];
         let mut spills = vec![false; boxes];
+        let mut grown = false;
         for c in 0..boxes {
-            // A member the seats leave above the first row (a source
-            // above its entry) keeps the frame on the feeder's row: the
-            // seats would move the rest for nothing.
+            // A member the seats leave above the first row (a source a
+            // cycle breaker from outside reaches) keeps the frame on the
+            // feeder's row: the seats would move the rest for nothing.
             if (0..n).any(|u| seat[u] == Some(c))
                 && (0..n).any(|u| inside(u, c) && value[u] < value[top(c)])
             {
@@ -2714,8 +2729,26 @@ fn seat_box_sources(
                 }
                 let own = inside(u, c) || leads[c].iter().any(|&y| inside(u, y));
                 if u < n && moved(u) && !own {
-                    spills[c] = true;
-                    break;
+                    // A node every link into which moved too hangs below
+                    // the move alone: it moves along, no line stretches.
+                    // A box it belongs to follows the box down whole.
+                    let hangs = preds[u].iter().all(|&p| moved(p) || (p < n && is_lead[p]));
+                    let follower = nc[u].iter().copied().find(|&y| !outer[c].contains(&y));
+                    match (hangs, follower) {
+                        (false, _) => {
+                            spills[c] = true;
+                            break;
+                        }
+                        (true, Some(y)) => {
+                            for &p in preds[u].iter().filter(|&&p| moved(p) && !inside(p, y)) {
+                                if !chain.contains(&(c, p, y)) {
+                                    chain.push((c, p, y));
+                                    grown = true;
+                                }
+                            }
+                        }
+                        (true, None) => {}
+                    }
                 }
                 // Only a node that moved passes a move on.
                 if u >= nx || moved(u) || (u < n && seat[u] == Some(c)) {
@@ -2726,7 +2759,7 @@ fn seat_box_sources(
                 }
             }
         }
-        if !spills.iter().any(|&s| s) {
+        if !spills.iter().any(|&s| s) && !grown {
             layer.copy_from_slice(&value[..nx]);
             return;
         }
@@ -2735,6 +2768,7 @@ fn seat_box_sources(
                 *s = None;
             }
         }
+        chain.retain(|&(c, _, _)| !spills[c]);
     }
 }
 
@@ -2896,6 +2930,25 @@ fn stagger_proposals(
         picks
     };
     let mut out: Vec<Vec<usize>> = Vec::new();
+    // A source steps up only within its outermost box's rows: above
+    // them it would draw the frame across the row of the node feeding
+    // the box ([`seat_box_sources`]; h284's `queue queue` stepped back
+    // up beside the hub `search`, whose edges then struck its frame).
+    let mut box_rows: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    if let Some(nc) = node_cluster {
+        for v in 0..n {
+            if let Some(&c) = nc[v].first() {
+                let top = box_rows.entry(c).or_insert(layer[v]);
+                *top = (*top).min(layer[v]);
+            }
+        }
+    }
+    let box_top = |v: usize| -> bool {
+        match node_cluster.and_then(|nc| nc[v].first()) {
+            Some(c) => box_rows.get(c).is_some_and(|&top| top < layer[v]),
+            None => true,
+        }
+    };
     // Leaves: +1 = steps down (sink or edge-less), -1 = steps up.
     let leaves = every_second(&|v| {
         if nl.outs[v].is_empty() && layer[v] < nl.deepest[v] {
@@ -2903,6 +2956,7 @@ fn stagger_proposals(
         } else if nl.ins[v].is_empty()
             && !nl.outs[v].is_empty()
             && layer[v] as isize > nl.shallowest[v]
+            && box_top(v)
         {
             Some(-1)
         } else {
@@ -5519,14 +5573,18 @@ mod tests {
     /// through their frame to reach the member), a chain only the box's
     /// own members join starts on the member's row, and a nested box
     /// nothing links out of takes its parent's top row. A box nothing
-    /// outside the boxes feeds keeps its place, and so does a box whose
-    /// seating would move a node outside it (`src2 -> out2`).
+    /// outside the boxes feeds keeps its place. A node outside the box
+    /// that only the seated sources link into moves down with them
+    /// (`src2 -> out2`, B8b r1); one that something else ranks too
+    /// keeps the box where it was (`src3 -> out3` beside `pin -> out3`).
     #[test]
     fn a_box_seats_its_loose_parts_on_its_top_layer() {
         let src = "flowchart TB\nhub\nsubgraph g[box]\nlinked\nloose1\nloose2\nc1 --> c2\n\
                    subgraph inner[inner]\ni1\nend\nend\nsubgraph island[island]\nx1\nend\n\
                    subgraph o[outer]\nsrc2\nsubgraph in2[in2]\nx2\ny2\nend\nend\n\
-                   hub --> linked\nsrc2 --> out2\nhub --> y2\n";
+                   subgraph p[pinned]\nsrc3\nfed3\nend\n\
+                   hub --> linked\nsrc2 --> out2\nhub --> y2\n\
+                   hub --> fed3\nsrc3 --> out3\npin --> out3\n";
         let g = crate::parser::parse(src).unwrap();
         let sc = crate::scene::scene(&g);
         let y = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap().y;
@@ -5542,11 +5600,19 @@ mod tests {
         assert!(y("c2") > row + 30.0, "the chain keeps its own step");
         // The island box has no feeder: it stays on the first row.
         assert!((y("x1") - y("hub")).abs() < 1.0);
-        // Seating the outer box's source src2 would push out2, outside
-        // it, a row down: the box keeps its first row (src2's), and x2
-        // stays there, above its own box's member y2.
-        assert!((y("x2") - y("src2")).abs() < 1.0);
-        assert!(y("y2") > y("x2") + 30.0);
+        // Seating the outer box's source src2 pushes out2, outside it,
+        // a row down; nothing else ranks out2, so it moves along and
+        // the whole box sits on the hub's next row.
+        for id in ["src2", "x2", "y2"] {
+            assert!((y(id) - row).abs() < 1.0, "{id} off the box's row");
+        }
+        assert!(y("out2") > row + 30.0);
+        // out3 also hangs below `pin`, a top-level node on the first
+        // row: seating src3 would stretch pin's line, so the box keeps
+        // src3 on the hub's row (dense-lr: 25 of its 52 nodes a layer
+        // down otherwise).
+        assert!((y("src3") - y("hub")).abs() < 1.0);
+        assert!(y("fed3") > y("src3") + 30.0);
     }
 
     /// A box a hub feeds sits wholly below the hub (B8b P1), with its
@@ -5555,8 +5621,8 @@ mod tests {
     /// the hub, dragging the frame up across the hub's row and its
     /// edges, and the box that source leads into follows it, wholly a
     /// row further down, so the line between them leaves one row for
-    /// the next. A source that leads to a member the hub feeds stays
-    /// above it, and so does its box.
+    /// the next. A source that leads to a member the hub feeds takes
+    /// the first row too, a row above that member (B8b r1).
     #[test]
     fn a_hub_fed_box_sits_below_its_hub() {
         let src = "flowchart TB\nhub\n\
@@ -5580,9 +5646,77 @@ mod tests {
         // `next` follows the source that leads into it, whole.
         assert!(frame("h").y > frame("g").y + 30.0, "next box beside box");
         assert!((y("also") - y("other")).abs() < 1.0);
-        // `up` leads to `down`, which the hub feeds: it stays above it.
-        assert!(y("up") < y("down") - 30.0);
-        assert!((y("up") - y("hub")).abs() < 1.0);
+        // `up` leads to `down`, which the hub feeds: `up` takes the
+        // box's first row and pushes `down` a row further (B8b r1:
+        // f051's `n8 -> n9`), so the frame clears the hub's row too.
+        assert!(frame("k").y > below_hub, "the kept box spans the hub's row");
+        assert!((y("up") - y("fed")).abs() < 1.0);
+        assert!(y("down") > y("up") + 30.0);
+    }
+
+    /// A box member that is a source and links out to a node outside
+    /// every box (x7's `nightly job --> mail relay`, B8b r1) takes the
+    /// box's first row like the rest: the node it links to hangs below
+    /// it alone, so it moves a row down along with it. The frame no
+    /// longer spans the gateway's row, and none of the gateway's edges
+    /// strikes it, in `scene()` or `route()`.
+    #[test]
+    fn a_box_source_takes_its_sink_down_with_it() {
+        let src = "flowchart TB\n  api[API gateway]\n  subgraph svc[Services]\n    s1[orders]\n\
+                   s2[payments]\n    s3[nightly job]\n  end\n  api --> s1\n  api --> s2\n\
+                   api --> health[health check]\n  api --> docs[docs site]\n  s3 --> mail[mail relay]\n";
+        let g = crate::parser::parse(src).unwrap();
+        let sc = crate::scene::scene(&g);
+        let y = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap().y;
+        let api = sc.nodes.iter().find(|n| n.id == "api").unwrap();
+        let svc = sc.clusters.iter().find(|c| c.id == "svc").unwrap();
+        assert!(
+            svc.y > api.y + api.h / 2.0,
+            "the box spans the gateway's row"
+        );
+        assert!(
+            (y("s3") - y("s1")).abs() < 1.0,
+            "nightly job off the box's row"
+        );
+        assert!(
+            y("mail") > y("s3") + 30.0,
+            "mail relay level with its source"
+        );
+        let rep = crate::quality::measure_source(src, false).unwrap();
+        assert_eq!((rep.statik.edge_frame_x, rep.routed.edge_frame_x), (0, 0));
+    }
+
+    /// Boxes a chain of moved members leads through follow the seated
+    /// box down whole (x1, B8b r1): the hub feeds Alpha and Gamma, an
+    /// Alpha source links into Beta, a Beta source into Gamma. Seating
+    /// Alpha below the hub moves Beta a row below it, and Gamma, whose
+    /// linked member only Beta ranks, follows Beta down whole instead of
+    /// spanning three rows beside it — each zone one row, one under the
+    /// other, as mermaid draws it.
+    #[test]
+    fn boxes_a_moved_chain_leads_through_follow_it_down_whole() {
+        let src = "flowchart TB\n  hub[Gateway]\n\
+                   subgraph A[Alpha zone]\n a1[alpha entry]\n a2[alpha source]\n a3[alpha idle]\nend\n\
+                   subgraph B[Beta zone]\n b1[beta in]\n b2[beta source]\nend\n\
+                   subgraph C[Gamma zone]\n c1[gamma in]\n c2[gamma fed]\n c3[gamma idle]\nend\n\
+                   hub --> a1\n hub --> c2\n hub --> leaf1[leaf one]\n hub --> leaf2[leaf two]\n\
+                   a2 --> b1\n b2 --> c1\n";
+        let g = crate::parser::parse(src).unwrap();
+        let sc = crate::scene::scene(&g);
+        let y = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap().y;
+        let rows = [y("a1"), y("b1"), y("c1")];
+        assert!(y("hub") + 30.0 < rows[0] && rows[0] + 30.0 < rows[1] && rows[1] + 30.0 < rows[2]);
+        for (ids, row) in [
+            (&["a1", "a2", "a3"][..], rows[0]),
+            (&["b1", "b2"][..], rows[1]),
+            (&["c1", "c2", "c3"][..], rows[2]),
+        ] {
+            for id in ids {
+                assert!((y(id) - row).abs() < 1.0, "{id} off its zone's row");
+            }
+        }
+        let rep = crate::quality::measure_source(src, false).unwrap();
+        assert_eq!((rep.statik.edge_frame_x, rep.routed.edge_frame_x), (0, 0));
     }
 
     /// Narrowing's stackings and wraps rank-link every member of the
