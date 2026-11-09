@@ -893,8 +893,8 @@ fn a_one_px_drag_leaves_unrelated_edges_put() {
 
 /// Moving one top-level node declaration of dense-td (report §2.9's
 /// repro: the `n45` line) to other top-level lines keeps its width
-/// within [`SHUFFLE_WIDTH_MAX`] of the source order's. Over all 57 such
-/// positions it lays out 4 197 – 4 347 px (+3.6 %); it was 4 155 –
+/// within [`SHUFFLE_WIDTH_MAX`] of the source order's. Over all 56 such
+/// positions it lays out 4 249 – 4 492 px (+5.7 %); it was 4 155 –
 /// 5 740 px, a third either way of the 4 : 1 entry to narrowing and of
 /// a stacking refused for its node hits (B8 review r1 #3).
 #[test]

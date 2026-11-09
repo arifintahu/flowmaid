@@ -7,6 +7,54 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **A subgraph fed by a hub sits wholly below it** (report §2.9, B8b
+  P1). 0.35.0 started a subgraph's edge-less members on its first row,
+  but read that row off the members that link out of the subgraph: a
+  member that only links onward (a source) still sat on the drawing's
+  first layer, level with the hub, and dragged the frame up across the
+  hub's row and its edges (a generated hub-and-subgraphs drawing went
+  from no defects to 7, four of its edges through a frame, and 1 938 to
+  3 387 px wide). And once narrowing stacked or folded a subgraph, the
+  ranking-only links it adds joined every member to the hub, so the
+  edge-less members went back to the first layer too. Now a subgraph's
+  first row is the row just below the topmost node outside every
+  subgraph that links into it; its members nothing links into (edge-less,
+  in a chain of their own, or only linking onward) start there, and a
+  subgraph one of them links into follows it a row further down, so the
+  line between them leaves one row for the next. Narrowing's stackings
+  rank a subgraph below its sibling but no longer decide where it starts.
+  Left alone: a subgraph fed only from other subgraphs (the dense corpus
+  fixtures: seating there re-laid them, 27 % more drawn crossings and
+  `route()` 40 % slower), a member that leads, inside its subgraph, to a
+  member the hub feeds (it already sits above it), and a subgraph whose
+  seating would move a node outside it and the subgraph it leads into.
+  No corpus or fixture drawing changes; over a 5 337-input set, the 68
+  ordinary flowchart and state diagrams that change lose two thirds of
+  their defects (static 135 -> 46, `route()` 136 -> 58) and of their
+  edges through frames (72 -> 20), with fewer crossings (279 -> 205).
+  Eight of them gain an edge through a frame: a line from one subgraph to
+  a sibling that the ordering keeps two subgraphs away, or a dotted line
+  clipping a frame's corner where the way round runs a 20 px channel.
+- **Large random graphs keep their cycle breakers in source order** (B8b
+  P2). 0.35.0 took them from whichever of two depth-first walks reversed
+  fewer edges; on a 518-element random graph that shallower layering read
+  as a ribbon and was packed tight (10 368 -> 3 726 px, `route()` edges
+  through nodes 24 -> 71). Graphs of more than 400 nodes and edges now
+  keep the walk in source order and draw as in 0.34.0; smaller ones, where
+  the second walk keeps a drawing off the order its lines are written in,
+  keep the choice. A narrowing step that adds edges through nodes now must
+  save two crossings per such edge.
+
+### Documentation
+
+- 0.35.0's note on narrowing mentioned it only in passing: class diagrams
+  share the flowchart layout, and the 2.5 : 1 entry to narrowing re-laid
+  34 of 1 583 generated class diagrams (most equal or better; a dense
+  stress diagram came out 23 % smaller but with one long diagonal line
+  across its bundle). This release changes no class diagram.
+
 ## [0.35.0] - 2026-11-04
 
 ### Highlights
