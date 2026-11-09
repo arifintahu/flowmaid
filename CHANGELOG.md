@@ -7,6 +7,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A double-quoted `|…|` edge label may now hold a `|`: `A -->|"a | b"| B`
+  used to fail with `unknown edge operator`, while `A -- "a | b" --> B`
+  and a quoted node label already worked. The label ends at the closing
+  quote when a `|` follows it; unquoted labels still end at the first `|`.
+
 ## [0.37.0] - 2026-11-09
 
 ### Highlights
