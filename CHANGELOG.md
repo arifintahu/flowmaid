@@ -7,6 +7,162 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-11-09
+
+### Highlights
+
+Flowchart parity phase B: the B8 follow-up (layering) and the
+non-flowchart leftovers from phase A. No public API is removed or changed;
+two small additions.
+
+- **Subgraphs fed by a hub sit below it, whole.** A member that only links
+  onward, or the members of a subgraph that narrowing stacked, no longer
+  stay on the hub's row and drag the frame across its edges. Over a 5 337-
+  input set the 96 flowchart and state diagrams that change lose most of
+  their defects (168 -> 35), edges through frames (89 -> 16) and crossings
+  (364 -> 243). No corpus diagram changes.
+- **Large random graphs draw as in 0.34.0 again.** 0.35.0 packed them so
+  tight that `route()` ran edges through nodes; graphs of more than 400
+  nodes and edges keep their cycle breakers in source order.
+- **Journey and timeline text wraps balanced** — no last word left alone —
+  and a timeline's `<b>` / `<i>` survive a line break.
+- **gitGraph merges look like merges** (the elbow goes by link kind, as in
+  mermaid), and `order: 0` ties as mermaid's do.
+- **ER labels stay off neighbouring lines.**
+- **Pies past sixteen slices and journeys past ten actors** give repeated
+  colours a second cue (hatching, dot shapes); smaller ones draw exactly as
+  before. New: `pie::slice_hatch`, `journey::actor_mark` / `ActorMark`.
+
+### Added
+
+- `pie::slice_hatch(i)` (with `pie::HATCH_W`, `HATCH_PITCH`,
+  `HATCH_OPACITY`): the hatching a host draws over slice `i` past the
+  sixteenth, so a painter of `PieScene` matches the SVG.
+  `journey::actor_mark(i)` and `journey::ActorMark`
+  (`Circle`/`Square`/`Diamond`/`Triangle`, `#[non_exhaustive]`): the
+  shape of actor `i`'s dots, for painters of `JourneyScene`.
+
+### Changed
+
+- **A subgraph fed from outside every subgraph starts below its feeder**
+  (report §2.9, B8b P1). 0.35.0 started a subgraph's edge-less members on
+  its first row, but read that row off the members that link out of the
+  subgraph: a member that only links onward (a source) still sat on the
+  drawing's first layer, level with the hub, and dragged the frame up across
+  the hub's row and its edges (a generated hub-and-subgraphs drawing went
+  from no defects to 7, four of its edges through a frame, and 1 938 to
+  3 387 px wide). And once narrowing stacked or folded a subgraph, the
+  ranking-only links it adds joined every member to the hub, so the
+  edge-less members went back to the first layer too. Now a subgraph's
+  first row is the row just below the topmost node outside every subgraph
+  that links into it, and every member nothing links into starts there:
+  edge-less members, chains of their own, members linking onward (to a
+  plain node or into another subgraph), and members leading to one the hub
+  feeds, which then sits a row lower. A node outside the subgraph that only
+  such members link into moves down with them (`nightly job --> mail
+  relay`), and a subgraph they link into follows a row further down, whole,
+  even along a chain of subgraphs (hub → Alpha, Alpha → Beta, Beta →
+  Gamma: one zone per row, as mermaid draws it). Narrowing's stackings rank
+  a subgraph below its sibling but no longer decide where it starts, and
+  leaf staggering no longer lifts a member above its subgraph's first row.
+  Left alone, so the drawing keeps its 0.35.0 layering there: a subgraph fed
+  only from other subgraphs (the dense corpus fixtures: seating there
+  re-laid them, 27 % more drawn crossings and `route()` 40 % slower), a
+  member a cycle breaker reaches from outside, and a subgraph whose seating
+  would move a node outside it that another node also links into (moving
+  it would stretch that node's line: dense-lr would move 25 of its 52
+  nodes a row). No corpus or fixture drawing changes. Over a 5 337-input
+  set, the 96 ordinary flowchart and state diagrams that change (three
+  large random graphs aside) lose most of their defects (static 168 -> 35,
+  0.34.0 had 275; `route()` 166 -> 52), edges through frames (89 -> 16;
+  `route()` 87 -> 17), lines under title chips (48 -> 31) and crossings
+  (364 -> 243). Nine of them gain one or two edges through a frame against
+  0.35.0: eight where the ordering puts a subgraph between two nodes linked
+  to each other — a line from a node in one subgraph to another subgraph
+  placed beyond a third, or two linked plain nodes on either side of a
+  frame that spans their rows — and one (a TB load balancer feeding four
+  tiers) where a dotted line clips the corner of a one-column subgraph whose
+  title fills its top. Two of the nine (a cyclic stress input with dotted
+  links, and a two-hub diagram of zones) are also worse than in 0.34.0,
+  with two edges through a frame where it had none.
+- **Large random graphs keep their cycle breakers in source order** (B8b
+  P2). 0.35.0 took them from whichever of two depth-first walks reversed
+  fewer edges; on a 518-element random graph that shallower layering read
+  as a ribbon and was packed tight (10 368 -> 3 726 px, `route()` edges
+  through nodes 24 -> 71). Graphs of more than 400 nodes and edges now
+  keep the walk in source order and draw as in 0.34.0; smaller ones, where
+  the second walk keeps a drawing off the order its lines are written in,
+  keep the choice. A narrowing step that adds edges through nodes now must
+  save two crossings per such edge. The 1 000-node synthetic benchmark
+  therefore draws as in 0.34.0 again (a 7.9 MB SVG instead of 6.8 MB), and its
+  layout takes about as long as 0.34.0's: roughly twice 0.35.0's on a shared
+  4-vCPU box (1.9–2.5 s against 1.0 s), the full render 2.8–3.3 s against
+  2.5 s.
+
+### Fixed
+
+- **Journey and timeline text wraps balanced, and keeps its styling.**
+  Long journey task names and timeline periods and events were cut
+  greedily, so a last word could be left alone on its line ("… report
+  for the | team"); they now wrap like node labels — as few lines as
+  before, evened out, a word wider than the column kept whole. A
+  timeline's `<b>` / `<i>` run that a break cuts used to lose its style
+  on the later lines (each drawn line is read on its own); every line it
+  reaches now opens it again. Journeys print tags verbatim (as mermaid
+  does) and now measure them as the characters they are, so a name
+  with tags keeps within its wrap width and its column. Text that fits
+  is drawn as before.
+- **A gitGraph merge into a farther lane is drawn as a merge.** The elbow
+  between two lanes ran along whichever lane was farther from main, so
+  `checkout feat` then `merge main` came out as a fork out of main's
+  commit, in feat's colour, and a fork into a nearer lane (a branch
+  given a lower `order:` than its parent) as a merge. Like mermaid, a
+  fork now leaves its parent across the lanes and runs along the new
+  branch, and a merge runs along the merged branch, in its colour, and
+  climbs into the merge commit, whichever lane is farther out. (A commit
+  sitting on the run's stretch still moves it to the other lane.)
+- **`branch x order: 0` ties the way mermaid's does.** Mermaid reads a
+  branch without `order:` as `order: 0` and keeps creation order among
+  ties, so an explicit `order: 0` branch sits among the unordered ones
+  in the order they were created; flowmaid put every `order: 0` branch
+  before all unordered ones. Main still comes first, and `order: 1` and
+  up still follow.
+- **An ER label no longer sits on a neighbouring relationship's line.**
+  Where two relationships run close (a pair between the same entities, a
+  cycle), a label pill could cover the other line, which then read as
+  passing under the wrong label ("employs" over "works in"). A pill that
+  covers another line now moves along its own line, or beside it, to a
+  spot clear of every other line and every crow's foot — only when that
+  spot covers no more pills or tables than where it was (a pill over a
+  pill hides more than one over a line), so in the tightest layouts it
+  can still stay. A pill clear of the other lines stays where it was;
+  the corpus, example and fixture diagrams are unchanged. (The crossing
+  "X" a pair of relationships drew under `direction LR` was already gone
+  with 0.34.0's pair-aware ports; a test now holds it for LR, RL, TB and
+  BT.)
+- **Pies with more than sixteen slices tell every slice apart.** The
+  sixteen slice colours start over at the seventeenth slice, which then
+  took the first one's colour — and on a full pie sits right beside it —
+  with the same legend swatch. Each later turn of the colours is now
+  hatched over its fill, wedge and swatch alike (stripes in the canvas
+  colour at 45° for slices 17–32, then 135°, 0° and 90°), and a label
+  inside a hatched wedge keeps a halo in its slice colour. Pies of up to
+  sixteen slices draw exactly as before.
+- **Journeys with more than ten actors tell every actor apart.** The ten
+  actor colours start over at the eleventh actor, whose dots then
+  matched the first one's in the legend and on every task. Each later
+  turn of the colours now draws its dots as another shape — squares for
+  actors 11–20, diamonds for 21–30, triangles for 31–40. Journeys of up
+  to ten actors draw exactly as before.
+
+### Documentation
+
+- 0.35.0's note on narrowing mentioned it only in passing: class diagrams
+  share the flowchart layout, and the 2.5 : 1 entry to narrowing re-laid
+  34 of 1 583 generated class diagrams (most equal or better; a dense
+  stress diagram came out 23 % smaller but with one long diagonal line
+  across its bundle). This release changes no class diagram.
+
 ## [0.35.0] - 2026-11-04
 
 ### Highlights

@@ -4873,10 +4873,12 @@ fn parse_timeline(source: &str, header_line: usize) -> Result<Timeline, ParseErr
 /// merge commit whose second parent is the named branch's HEAD.
 ///
 /// `branch name order: n` places the branch's lane the way mermaid
-/// does: lanes sort by `order`, a branch without one sitting after
-/// main (and any `order: 0` branch) and before `order: 1`, branches
-/// that tie keeping creation order. The resulting lane rank is what
-/// each [`GitBranch::order`] holds once parsing is done.
+/// does: lanes sort by `order`, a branch without one counting as
+/// `order: 0` (mermaid's `order ?? 0`, as main's own order is), and
+/// branches that tie keep creation order — so main comes first, then
+/// every `order: 0` or unordered branch as created, then `order: 1`.
+/// The resulting lane rank is what each [`GitBranch::order`] holds
+/// once parsing is done.
 fn parse_gitgraph(source: &str, header_line: usize) -> Result<GitGraph, ParseError> {
     let mut d = GitGraph::default();
     // The `order:` each branch was declared with, by branch index;
@@ -5051,15 +5053,14 @@ fn parse_gitgraph(source: &str, header_line: usize) -> Result<GitGraph, ParseErr
         return Err(err(lineno, format!("unknown gitGraph command: '{}'", line)));
     }
 
-    // Rank the lanes: by declared order, an undeclared branch between
-    // order 0 and order 1, ties in creation order. (Mermaid keys an
-    // undeclared branch `0.<index>`, which puts the 10th branch level
-    // with the 1st; creation order is what that key means to say.)
+    // Rank the lanes: by declared order, an undeclared branch counting
+    // as 0, ties in creation order. Mermaid 12's parser gives every
+    // branch `order ?? 0` and its sort is stable, so an explicit
+    // `order: 0` ties with main and with the unordered branches alike.
+    // (Its renderer's `0.<index>` key for an order-less branch, which
+    // would put the 10th level with the 1st, never applies.)
     let mut by_lane: Vec<usize> = (0..d.branches.len()).collect();
-    by_lane.sort_by_key(|&i| match declared_order[i] {
-        Some(n) => (n, 0, i),
-        None => (0, 1, i),
-    });
+    by_lane.sort_by_key(|&i| (declared_order[i].unwrap_or(0), i));
     for (lane, i) in by_lane.into_iter().enumerate() {
         d.branches[i].order = lane;
     }
@@ -8714,7 +8715,7 @@ mod tests {
 
     /// Report P1: `branch dev order: 2` made a branch literally named
     /// "dev order: 2". The option now orders the lanes as in mermaid:
-    /// by `order`, an unordered branch after main and before order 1.
+    /// by `order ?? 0`, ties (main first) in creation order.
     #[test]
     fn gitgraph_branch_order_is_an_option_not_part_of_the_name() {
         let g = gitgraph(
@@ -8738,6 +8739,18 @@ mod tests {
                 lane("dev")
             ],
             [0, 1, 2, 3, 4, 5]
+        );
+        // Mermaid's `order ?? 0`: an explicit `order: 0` ties with main
+        // and the unordered branches, all in creation order (it used to
+        // sort before every unordered branch).
+        let g = gitgraph(
+            "gitGraph\ncommit\nbranch b\ncommit\ncheckout main\nbranch a order: 0\n\
+             commit\nbranch c order: 1\nbranch d",
+        );
+        let lane = |n: &str| g.branches.iter().find(|b| b.name == n).unwrap().order;
+        assert_eq!(
+            [lane("main"), lane("b"), lane("a"), lane("d"), lane("c")],
+            [0, 1, 2, 3, 4]
         );
         // `checkout` / `merge` find the branch by its bare name.
         let g = gitgraph("gitGraph\ncommit\nbranch dev order: 1\ncommit\ncheckout main\nmerge dev");

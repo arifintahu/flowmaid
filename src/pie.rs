@@ -7,8 +7,8 @@
 //! draggable. [`scene`] computes all geometry a GUI painter needs
 //! (canvas, circle, per-slice angles, percentage labels, legend rows,
 //! title anchor) and [`to_svg`] serialises it; slice `i` uses
-//! [`slice_color`] with index `i` in both, so painters match the SVG
-//! exactly.
+//! [`slice_color`] (and, past the sixteenth slice, [`slice_hatch`])
+//! with index `i` in both, so painters match the SVG exactly.
 //!
 //! Every slice of at least 1% gets a percentage label, as in mermaid.
 //! A label sits inside its wedge when its text box fits there (tested
@@ -71,6 +71,54 @@ const LABEL_HALF_H: f64 = 5.0;
 /// `accent` would start over.
 pub fn slice_color(i: usize) -> &'static str {
     crate::style::accent_wide(i)
+}
+
+/// Slices per turn of the [`slice_color`] cycle: the seventeenth slice
+/// takes the first one's colour again (and on a full pie sits beside
+/// it), so from there on [`slice_hatch`] adds a second cue.
+const COLOR_TURN: usize = 16;
+
+/// Stripe angles of [`slice_hatch`], one per later turn of the colour
+/// cycle (the fifth turn starts over).
+const HATCH_ANGLES: [f64; 4] = [45.0, 135.0, 0.0, 90.0];
+
+/// Width (px) of a [`slice_hatch`] stripe.
+pub const HATCH_W: f64 = 2.5;
+/// Distance (px) from one [`slice_hatch`] stripe to the next.
+pub const HATCH_PITCH: f64 = 6.0;
+/// Opacity of the [`slice_hatch`] stripes, drawn in the canvas colour:
+/// strong enough to read, light enough to keep the slice's hue.
+pub const HATCH_OPACITY: f64 = 0.55;
+
+/// The second cue of slice `i` (wedge and legend swatch alike) where
+/// its colour repeats: `None` for the first sixteen slices, which
+/// [`slice_color`] alone tells apart; past them, hatching of
+/// [`HATCH_W`]-wide stripes every [`HATCH_PITCH`] px in the canvas
+/// colour at [`HATCH_OPACITY`] over the fill, at this angle — degrees,
+/// clockwise, of stripes that would otherwise run vertically: 45 for
+/// slices 17–32, 135 for 33–48, 0 for 49–64, 90 for 65–80, then 45
+/// again. So slice 17 no longer reads as part of slice 1 beside it, and
+/// its legend swatch no longer matches slice 1's.
+pub fn slice_hatch(i: usize) -> Option<f64> {
+    let turn = i / COLOR_TURN;
+    (turn > 0).then(|| HATCH_ANGLES[(turn - 1) % HATCH_ANGLES.len()])
+}
+
+/// A short, content-derived suffix for this chart's hatching ids — see
+/// [`crate::scene::DefsKey`] for why it is a hash and not a counter.
+fn scene_key(ps: &PieScene) -> String {
+    let mut k = crate::scene::DefsKey::new();
+    for sl in &ps.slices {
+        k.eat(sl.label.as_bytes());
+        k.eat_f64(sl.value);
+    }
+    k.finish()
+}
+
+/// The id of the hatching `<pattern>` at `angle` for the chart keyed
+/// `key`.
+fn hatch_id(key: &str, angle: f64) -> String {
+    format!("fmpie-{key}-{angle:.0}")
 }
 
 /// Geometry of one slice. Angles are radians measured from
@@ -511,6 +559,33 @@ pub(crate) fn to_svg_a11y_with(ps: &PieScene, a11y: &A11y, opts: &SvgOptions) ->
         ));
     }
 
+    // Hatching for the slices whose colour repeats ([`slice_hatch`]),
+    // one pattern per angle in use; none at all up to sixteen slices.
+    let mut angles: Vec<f64> = (0..ps.slices.len()).filter_map(slice_hatch).collect();
+    angles.sort_by(f64::total_cmp);
+    angles.dedup();
+    let key = if angles.is_empty() {
+        String::new()
+    } else {
+        scene_key(ps)
+    };
+    if !angles.is_empty() {
+        s.push_str("<defs>\n");
+        for &a in &angles {
+            s.push_str(&format!(
+                "<pattern id=\"{}\" width=\"{HATCH_PITCH:.1}\" height=\"{HATCH_PITCH:.1}\" \
+                 patternUnits=\"userSpaceOnUse\" patternTransform=\"rotate({a:.0})\">\
+                 <rect width=\"{HATCH_W:.1}\" height=\"{HATCH_PITCH:.1}\" fill=\"{}\" \
+                 fill-opacity=\"{HATCH_OPACITY:.2}\"/></pattern>\n",
+                hatch_id(&key, a),
+                pal.background
+            ));
+        }
+        s.push_str("</defs>\n");
+    }
+    // `fill` for slice `i`'s hatching over its colour, if it has one.
+    let hatch_fill = |i: usize| slice_hatch(i).map(|a| format!("url(#{})", hatch_id(&key, a)));
+
     // Slices. Zero-value slices are skipped (nothing to draw; their
     // legend row remains). A ~100% slice becomes a <circle>: one SVG
     // arc cannot draw a full 360° sweep (its endpoints coincide).
@@ -537,26 +612,32 @@ pub(crate) fn to_svg_a11y_with(ps: &PieScene, a11y: &A11y, opts: &SvgOptions) ->
         // vanishes). Draw a full circle instead. The pixel-distance
         // test catches any value ratio, not just near-exact 1.0.
         let coincident = (a.0 - b.0).hypot(a.1 - b.1) < 0.2;
+        // The wedge once in its colour, then again in its hatching.
+        let fills = std::iter::once(color.to_string()).chain(hatch_fill(i));
         if sl.frac >= 1.0 - 1e-9 || (sl.frac > 0.5 && coincident) {
-            s.push_str(&format!(
-                "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{}\"/>\n",
-                ps.cx, ps.cy, ps.r, color
-            ));
+            for fill in fills {
+                s.push_str(&format!(
+                    "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{}\"/>\n",
+                    ps.cx, ps.cy, ps.r, fill
+                ));
+            }
         } else {
             let large = i32::from(sl.frac > 0.5);
-            s.push_str(&format!(
-                "<path d=\"M {:.1} {:.1} L {:.1} {:.1} A {r:.1} {r:.1} 0 {} 1 {:.1} {:.1} Z\" \
-                 fill=\"{}\"/>\n",
-                ps.cx,
-                ps.cy,
-                a.0,
-                a.1,
-                large,
-                b.0,
-                b.1,
-                color,
-                r = ps.r
-            ));
+            for fill in fills {
+                s.push_str(&format!(
+                    "<path d=\"M {:.1} {:.1} L {:.1} {:.1} A {r:.1} {r:.1} 0 {} 1 {:.1} {:.1} Z\" \
+                     fill=\"{}\"/>\n",
+                    ps.cx,
+                    ps.cy,
+                    a.0,
+                    a.1,
+                    large,
+                    b.0,
+                    b.1,
+                    fill,
+                    r = ps.r
+                ));
+            }
         }
     }
     // Separators: one radial line per boundary between drawn wedges
@@ -583,7 +664,17 @@ pub(crate) fn to_svg_a11y_with(ps: &PieScene, a11y: &A11y, opts: &SvgOptions) ->
     // Percentage labels: inside ones in white or dark ink by contrast
     // with their wedge; outside ones in the diagram ink on a leader.
     for l in &ps.labels {
+        // An inside label over hatching is haloed in its slice colour,
+        // so the stripes never cut through its digits.
+        let mut halo = String::new();
         let fill = if l.inside {
+            if slice_hatch(l.slice).is_some() {
+                halo = format!(
+                    " stroke=\"{}\" stroke-width=\"3\" stroke-linejoin=\"round\" \
+                     paint-order=\"stroke\"",
+                    slice_color(l.slice)
+                );
+            }
             crate::style::text_on(slice_color(l.slice))
         } else {
             let pts: Vec<String> = l
@@ -600,25 +691,28 @@ pub(crate) fn to_svg_a11y_with(ps: &PieScene, a11y: &A11y, opts: &SvgOptions) ->
         };
         s.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" text-anchor=\"{}\" \
-             font-weight=\"bold\" fill=\"{}\">{}</text>\n",
+             font-weight=\"bold\" fill=\"{}\"{}>{}</text>\n",
             l.x,
             l.y,
             l.anchor,
             fill,
+            halo,
             escape(&l.text)
         ));
     }
 
     // Legend: color swatch + label (+ raw value under showData).
     for (i, row) in ps.legend.iter().enumerate() {
-        s.push_str(&format!(
-            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{sw:.0}\" height=\"{sw:.0}\" rx=\"2\" \
-             fill=\"{}\"/>\n",
-            row.x,
-            row.y - SWATCH / 2.0,
-            slice_color(i),
-            sw = SWATCH
-        ));
+        for fill in std::iter::once(slice_color(i).to_string()).chain(hatch_fill(i)) {
+            s.push_str(&format!(
+                "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{sw:.0}\" height=\"{sw:.0}\" rx=\"2\" \
+                 fill=\"{}\"/>\n",
+                row.x,
+                row.y - SWATCH / 2.0,
+                fill,
+                sw = SWATCH
+            ));
+        }
         s.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" fill=\"{}\">{}</text>\n",
             row.x + SWATCH + 8.0,
@@ -1128,6 +1222,71 @@ mod tests {
 
     /// Report pie palette wrap: slice 9 repeated slice 1's colour (and
     /// with nine slices the last touched the first at 12 o'clock).
+    /// Phase A follow-up: past sixteen slices the colours start over,
+    /// so slice 17 took slice 1's colour — beside it at 12 o'clock on a
+    /// full pie, and with the same legend swatch. Each later turn of the
+    /// colours now carries hatching as a second cue; up to sixteen
+    /// slices nothing changes (no pattern is even defined).
+    #[test]
+    fn repeated_slice_colours_are_hatched_apart() {
+        for i in 0..16 {
+            assert_eq!(slice_hatch(i), None, "{i}");
+        }
+        assert_eq!(slice_hatch(16), Some(45.0));
+        assert_eq!(slice_hatch(31), Some(45.0));
+        assert_eq!(slice_hatch(32), Some(135.0));
+        assert_eq!(slice_hatch(48), Some(0.0));
+        assert_eq!(slice_hatch(64), Some(90.0));
+        assert_eq!(slice_hatch(80), Some(45.0));
+        // (colour, cue) pairs never repeat in the first eighty slices.
+        let cues: Vec<(&str, Option<u64>)> = (0..80)
+            .map(|i| (slice_color(i), slice_hatch(i).map(f64::to_bits)))
+            .collect();
+        for (i, c) in cues.iter().enumerate() {
+            assert!(!cues[i + 1..].contains(c), "slice {i} repeats {c:?}");
+        }
+
+        let rows = |n: usize| -> String { (0..n).map(|i| format!("\"s{i}\" : 5\n")).collect() };
+        let sixteen = to_svg(&scene(&pie(&format!("pie\n{}", rows(16)))));
+        assert!(!sixteen.contains("<pattern") && !sixteen.contains("fmpie"));
+        let ps = scene(&pie(&format!("pie\n{}", rows(17))));
+        let svg = to_svg(&ps);
+        assert_eq!(slice_color(16), slice_color(0));
+        assert_eq!(svg.matches("<pattern ").count(), 1, "{svg}");
+        let id_at = svg.find("<pattern id=\"").unwrap() + "<pattern id=\"".len();
+        let id = &svg[id_at..id_at + svg[id_at..].find('"').unwrap()];
+        assert!(svg.contains("patternTransform=\"rotate(45)\""), "{svg}");
+        // The 17th wedge and its swatch, each once in colour and once hatched.
+        assert_eq!(
+            svg.matches(&format!("fill=\"url(#{id})\"")).count(),
+            2,
+            "{svg}"
+        );
+        let last = &ps.slices[16];
+        let a = polar(ps.cx, ps.cy, ps.r, last.start_angle);
+        let wedge = format!("L {:.1} {:.1} A", a.0, a.1);
+        let paths: Vec<&str> = svg.lines().filter(|l| l.contains(&wedge)).collect();
+        assert_eq!(paths.len(), 2, "{svg}");
+        assert!(paths[0].contains(&format!("fill=\"{}\"", slice_color(16))));
+        assert!(paths[1].contains(&format!("fill=\"url(#{id})\"")));
+        // ... and it still touches slice 1 at 12 o'clock.
+        assert!((last.end_angle - TAU).abs() < 1e-9 && ps.slices[0].start_angle.abs() < 1e-9);
+        // Its inside label keeps a halo in its colour over the stripes.
+        let l = ps.labels.iter().find(|l| l.slice == 16).unwrap();
+        if l.inside {
+            assert!(svg.contains(&format!(
+                "stroke=\"{}\" stroke-width=\"3\" stroke-linejoin=\"round\" \
+                 paint-order=\"stroke\">{}</text>",
+                slice_color(16),
+                l.text
+            )));
+        }
+        // Ids are namespaced per chart and the output is deterministic.
+        assert_eq!(svg, to_svg(&scene(&pie(&format!("pie\n{}", rows(17))))));
+        let other = to_svg(&scene(&pie(&format!("pie\n{}\"x\" : 1\n", rows(17)))));
+        assert!(!other.contains(id), "{other}");
+    }
+
     #[test]
     fn up_to_sixteen_slices_get_distinct_colors() {
         let colors: Vec<&str> = (0..16).map(slice_color).collect();
