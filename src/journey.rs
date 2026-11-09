@@ -6,7 +6,8 @@
 //! satisfaction curve. Sections are pale bands spanning their tasks,
 //! with a gutter between neighbours, and each participant gets a stable
 //! color — chosen away from the score colors — shown in a legend and as
-//! per-task dots.
+//! per-task dots (past ten participants the colors repeat, and the dots
+//! change shape: [`actor_mark`]).
 //!
 //! Like `pie`/`mindmap` there is nothing draggable and no `route()`:
 //! [`scene`] computes every coordinate and [`to_svg`] serialises it.
@@ -101,9 +102,94 @@ pub fn section_color(i: usize) -> &'static str {
 const ACTOR_ACCENTS: &[usize] = &[0, 5, 4, 7, 3, 8, 13, 12, 15, 11];
 
 /// Color of actor `i` (legend dot and per-task dots). Never a score
-/// color look-alike, so a dot can't be read as a rating.
+/// color look-alike, so a dot can't be read as a rating. The ten colors
+/// repeat from the eleventh actor on; [`actor_mark`] tells the repeats
+/// apart.
 pub fn actor_color(i: usize) -> &'static str {
     crate::style::accent_wide(ACTOR_ACCENTS[i % ACTOR_ACCENTS.len()])
+}
+
+/// The shape an actor's dots (legend and per-task alike) are drawn as:
+/// the second cue beside [`actor_color`], whose colors repeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ActorMark {
+    /// A disc of radius [`DOT_R`]: the first ten actors.
+    Circle,
+    /// A square of the disc's area (side `1.8 *` [`DOT_R`], corners
+    /// rounded by 1 px): actors 11–20.
+    Square,
+    /// A square on its point, `1.25 *` [`DOT_R`] from centre to tip
+    /// (the disc's area): actors 21–30.
+    Diamond,
+    /// An upward triangle whose corners lie `1.25 *` [`DOT_R`] from its
+    /// centre: actors 31–40 (then the circle again).
+    Triangle,
+}
+
+/// The mark actor `i`'s dots take: one per turn of the [`actor_color`]
+/// cycle, so the eleventh actor — the first one's color again — reads
+/// apart from it in the legend and on every task.
+pub fn actor_mark(i: usize) -> ActorMark {
+    match (i / ACTOR_ACCENTS.len()) % 4 {
+        0 => ActorMark::Circle,
+        1 => ActorMark::Square,
+        2 => ActorMark::Diamond,
+        _ => ActorMark::Triangle,
+    }
+}
+
+/// SVG for one actor dot centred on `(cx, cy)` in `mark`'s shape,
+/// carrying `tip` (a `<title>`) when there is one. A circle without a
+/// tip is written as it always was, self-closed.
+fn dot_svg(cx: f64, cy: f64, color: &str, mark: ActorMark, tip: Option<&str>) -> String {
+    let close = |open: String| match tip {
+        Some(t) => format!(
+            "{open}>{t}</{}>\n",
+            open[1..].split(' ').next().unwrap_or("")
+        ),
+        None => format!("{open}/>\n"),
+    };
+    let reach = 1.25 * DOT_R;
+    match mark {
+        ActorMark::Circle => close(format!(
+            "<circle cx=\"{cx:.1}\" cy=\"{cy:.1}\" r=\"{DOT_R:.1}\" fill=\"{color}\""
+        )),
+        ActorMark::Square => {
+            let h = 0.9 * DOT_R;
+            close(format!(
+                "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"1\" \
+                 fill=\"{color}\"",
+                cx - h,
+                cy - h,
+                2.0 * h,
+                2.0 * h
+            ))
+        }
+        ActorMark::Diamond => close(format!(
+            "<polygon points=\"{:.1},{:.1} {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}\" fill=\"{color}\"",
+            cx,
+            cy - reach,
+            cx + reach,
+            cy,
+            cx,
+            cy + reach,
+            cx - reach,
+            cy
+        )),
+        ActorMark::Triangle => {
+            let dx = reach * 3f64.sqrt() / 2.0;
+            close(format!(
+                "<polygon points=\"{:.1},{:.1} {:.1},{:.1} {:.1},{:.1}\" fill=\"{color}\"",
+                cx,
+                cy - reach,
+                cx + dx,
+                cy + reach / 2.0,
+                cx - dx,
+                cy + reach / 2.0
+            ))
+        }
+    }
 }
 
 /// A colored band behind one section's tasks.
@@ -459,10 +545,11 @@ pub(crate) fn to_svg_a11y_with(js: &JourneyScene, a11y: &A11y, opts: &SvgOptions
                 .and_then(|&a| js.legend.get(a))
                 .map(|it| format!("<title>{}</title>", escape(&it.name)))
                 .unwrap_or_default();
-            s.push_str(&format!(
-                "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{}\">{}</circle>\n",
-                dx, dy, DOT_R, color, tip
-            ));
+            let mark = t
+                .actor_ids
+                .get(k)
+                .map_or(ActorMark::Circle, |&a| actor_mark(a));
+            s.push_str(&dot_svg(*dx, *dy, color, mark, Some(&tip)));
         }
         s.push_str(&face_svg(t));
         // `label_pos` is the first line; the block centre sits lower.
@@ -492,14 +579,8 @@ pub(crate) fn to_svg_a11y_with(js: &JourneyScene, a11y: &A11y, opts: &SvgOptions
     }
 
     // Legend.
-    for it in &js.legend {
-        s.push_str(&format!(
-            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{}\"/>\n",
-            it.x + DOT_R,
-            it.y,
-            DOT_R,
-            it.color
-        ));
+    for (a, it) in js.legend.iter().enumerate() {
+        s.push_str(&dot_svg(it.x + DOT_R, it.y, it.color, actor_mark(a), None));
         s.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" dy=\"0.33em\" fill=\"{}\">{}</text>\n",
             it.x + 2.0 * DOT_R + 6.0,
@@ -892,6 +973,59 @@ mod tests {
         let widest = t.label.lines().map(literal_width).fold(0.0, f64::max) * scale;
         let x0 = js.sections[0].x;
         assert!(t.cx - widest / 2.0 >= x0 - 1e-9, "label inside its band");
+    }
+
+    /// Phase A follow-up: the ten actor colours start over at the
+    /// eleventh actor, whose dots then matched the first one's in the
+    /// legend and on every task. Each later turn of the colours now
+    /// takes another dot shape; up to ten actors the dots are the same
+    /// discs as ever.
+    #[test]
+    fn repeated_actor_colours_take_another_mark() {
+        for i in 0..10 {
+            assert_eq!(actor_mark(i), ActorMark::Circle, "{i}");
+        }
+        assert_eq!(actor_mark(10), ActorMark::Square);
+        assert_eq!(actor_mark(20), ActorMark::Diamond);
+        assert_eq!(actor_mark(30), ActorMark::Triangle);
+        assert_eq!(actor_mark(40), ActorMark::Circle);
+        // (colour, mark) pairs never repeat in the first forty actors.
+        let cues: Vec<_> = (0..40).map(|i| (actor_color(i), actor_mark(i))).collect();
+        for (i, c) in cues.iter().enumerate() {
+            assert!(!cues[i + 1..].contains(c), "actor {i} repeats {c:?}");
+        }
+        let names: Vec<String> = (1..=12).map(|i| format!("A{i}")).collect();
+        let svg = crate::render_svg(&format!(
+            "journey\n  section S\n    Plan: 5: {}\n    Ship: 2: A11, A1\n",
+            names.join(", ")
+        ))
+        .unwrap();
+        let (a1, a11) = (actor_color(0), actor_color(10));
+        assert_eq!(a1, a11);
+        // A1 stays a disc, A11 is a square: in the legend (untitled)...
+        assert!(svg.contains(&format!("r=\"{DOT_R:.1}\" fill=\"{a1}\"/>")));
+        assert!(svg.contains(&format!("rx=\"1\" fill=\"{a11}\"/>")), "{svg}");
+        // ... and on the tasks, each named in its tooltip.
+        assert!(
+            svg.contains(&format!("fill=\"{a11}\"><title>A11</title></rect>")),
+            "{svg}"
+        );
+        assert!(svg.contains(&format!("fill=\"{a1}\"><title>A1</title></circle>")));
+        assert_eq!(svg.matches("<title>A11</title></rect>").count(), 2, "{svg}");
+        // The square keeps within the dot's slot and about its area.
+        let side = 1.8 * DOT_R;
+        assert!(side <= 2.0 * DOT_R);
+        assert!((side * side / (std::f64::consts::PI * DOT_R * DOT_R) - 1.0).abs() < 0.05);
+        // Ten actors or fewer: no mark but the disc.
+        let ten = crate::render_svg(&format!(
+            "journey\n  section S\n    Plan: 5: {}\n",
+            names[..10].join(", ")
+        ))
+        .unwrap();
+        assert!(
+            !ten.contains("rx=\"1\"") && !ten.contains("<polygon"),
+            "{ten}"
+        );
     }
 
     /// Report journey frown-cramped: the sad mouth rose from a high
