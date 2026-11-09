@@ -11,7 +11,7 @@
 //! Like `pie`/`mindmap` there is nothing draggable and no `route()`:
 //! [`scene`] computes every coordinate and [`to_svg`] serialises it.
 
-use crate::layout::{line_count, text_width, wrap_text, LINE_H, TEXT_CALIBRATION};
+use crate::layout::{line_count, text_width, LINE_H, TEXT_CALIBRATION};
 use crate::model::Journey;
 use crate::scene::{escape, svg_open_a11y, svg_text_lines, A11y, SvgOptions, TEXT_COLOR};
 
@@ -134,8 +134,9 @@ pub struct TaskGlyph {
     pub label_pos: (f64, f64),
     /// (x, y, color) per participating actor.
     pub actor_dots: Vec<(f64, f64, &'static str)>,
-    /// The label as drawn: `name` word-wrapped at [`LABEL_WRAP_W`]
-    /// (`\n` between lines).
+    /// The label as drawn: `name` wrapped at [`LABEL_WRAP_W`] into as
+    /// few lines as it needs, evened out so no word is left stranded
+    /// on the last (`\n` between lines).
     pub label: String,
     /// Actor index (into [`JourneyScene::legend`]) per entry of
     /// `actor_dots` — the dot's tooltip names that actor.
@@ -171,7 +172,31 @@ pub struct JourneyScene {
 
 /// Width of `s` drawn at `size` px (bold when `bold`).
 fn width_at(s: &str, size: f64, bold: bool) -> f64 {
-    text_width(s) * size / TEXT_CALIBRATION * if bold { BOLD } else { 1.0 }
+    literal_width(s) * size / TEXT_CALIBRATION * if bold { BOLD } else { 1.0 }
+}
+
+/// Width of `s` as a journey draws it, at [`TEXT_CALIBRATION`]: every
+/// text here is written verbatim (mermaid's journey prints tags as
+/// they are), so a `<b>` or a `$$` is as wide as its characters, where
+/// [`text_width`] would read them as styling and math fences that
+/// measure nothing. `<` and `$` are the characters that start those;
+/// each measures as a plain letter, as `a` does, and `text_width` of a
+/// line without either is the plain per-character sum.
+fn literal_width(s: &str) -> f64 {
+    if s.contains(['<', '$']) {
+        text_width(&s.replace(['<', '$'], "a"))
+    } else {
+        text_width(s)
+    }
+}
+
+/// Task name `name` as drawn: wrapped at [`LABEL_WRAP_W`] (at [`FONT`])
+/// into as few lines as it needs, evened out so no word is left
+/// stranded on the last ([`crate::wrap::wrap_block`]); its tags stay
+/// text.
+fn wrap_label(name: &str) -> String {
+    let scale = f64::from(FONT) / TEXT_CALIBRATION;
+    crate::wrap::wrap_block(name, LABEL_WRAP_W, |t| literal_width(t) * scale, false)
 }
 
 /// Compute all geometry.
@@ -188,10 +213,7 @@ pub fn scene(d: &Journey) -> JourneyScene {
         .enumerate()
         .flat_map(|(si, s)| s.tasks.iter().map(move |t| (si, t)))
         .collect();
-    let labels: Vec<String> = flat
-        .iter()
-        .map(|(_, t)| wrap_text(&t.name, LABEL_WRAP_W, font / TEXT_CALIBRATION))
-        .collect();
+    let labels: Vec<String> = flat.iter().map(|(_, t)| wrap_label(&t.name)).collect();
 
     // Per-task column width: fits the label and the actor-dot row.
     let mut widths: Vec<f64> = flat
@@ -840,6 +862,36 @@ mod tests {
         // Task text stays literal (mermaid prints tags verbatim).
         let svg = crate::render_svg("journey\n  a <b>b</b>: 3: Me\n").unwrap();
         assert!(svg.contains("a &lt;b&gt;b&lt;/b&gt;</text>"), "{svg}");
+    }
+
+    /// Phase A follow-up: task names wrapped greedily, stranding a last
+    /// word ("… report for the | team"), and their tags — drawn verbatim
+    /// — were measured as styling, worth nothing, so a name with tags
+    /// overran its wrap width and its column.
+    #[test]
+    fn task_names_wrap_balanced_and_measure_their_tags() {
+        let name = "Sit down and write the weekly report for the team";
+        let js = scene(&journey(&format!("journey\n  {name}: 3: Me\n")));
+        let label = &js.tasks[0].label;
+        assert_eq!(label.replace('\n', " "), name);
+        assert_ne!(label.lines().last(), Some("team"), "{label:?}");
+        let tagged = "Make a <b>very strong cup of coffee</b> before the meeting";
+        let js = scene(&journey(&format!("journey\n  {tagged}: 3: Me\n")));
+        let t = &js.tasks[0];
+        assert_eq!(t.label.replace('\n', " "), tagged);
+        assert_eq!(t.label.matches("<b>").count(), 1, "tags stay text");
+        let scale = 13.0 / TEXT_CALIBRATION;
+        for line in t.label.lines() {
+            assert!(literal_width(line) * scale <= LABEL_WRAP_W, "{line:?}");
+        }
+        // The tags count as the characters they are drawn as.
+        assert!(literal_width("<b>x</b>") > text_width("<b>x</b>"));
+        assert_eq!(literal_width("<b>x</b>"), text_width("ab>xa/b>"));
+        assert_eq!(literal_width("plain"), text_width("plain"));
+        // The column holds the widest line as drawn.
+        let widest = t.label.lines().map(literal_width).fold(0.0, f64::max) * scale;
+        let x0 = js.sections[0].x;
+        assert!(t.cx - widest / 2.0 >= x0 - 1e-9, "label inside its band");
     }
 
     /// Report journey frown-cramped: the sad mouth rose from a high
