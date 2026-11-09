@@ -13,7 +13,7 @@
 //! Like `pie`/`journey` there is nothing draggable and no `route()`:
 //! [`scene`] computes every coordinate and [`to_svg`] serialises it.
 
-use crate::layout::{text_width, wrap_text, LINE_H, TEXT_CALIBRATION};
+use crate::layout::{text_width, LINE_H, TEXT_CALIBRATION};
 use crate::model::{Timeline, TimelineDirection, TimelinePeriod};
 use crate::scene::{escape, svg_open_a11y, svg_text_lines, svg_text_multiline, A11y, SvgOptions};
 use crate::style::accent;
@@ -71,9 +71,13 @@ fn width_at(s: &str, size: f64, bold: bool) -> f64 {
     text_width(s) * size / TEXT_CALIBRATION * if bold { BOLD } else { 1.0 }
 }
 
-/// `s` wrapped at [`WRAP_W`] (measured at [`FONT`]).
+/// `s` wrapped at [`WRAP_W`] (measured at [`FONT`]): balanced, so no
+/// word is left stranded on a last line, and its `<b>` / `<i>` runs
+/// re-opened on every line they reach, as both are drawn styled
+/// ([`crate::wrap::wrap_block`]).
 fn wrap(s: &str) -> String {
-    wrap_text(s, WRAP_W, f64::from(FONT) / TEXT_CALIBRATION)
+    let scale = f64::from(FONT) / TEXT_CALIBRATION;
+    crate::wrap::wrap_block(s, WRAP_W, |t| text_width(t) * scale, true)
 }
 
 /// One period with its text wrapped for drawing.
@@ -820,6 +824,47 @@ mod tests {
 
     /// Report timeline long events: never wrapped, so one long event
     /// made a 657px column.
+    /// Phase A follow-up: wrapped periods and events were cut greedily,
+    /// stranding a last word ("… meeting | starts"), and a `<b>` / `<i>`
+    /// run cut by a break lost its style on its later lines (each drawn
+    /// line is read on its own). Lines are balanced now and every line
+    /// a run reaches opens it again.
+    #[test]
+    fn wrapped_text_is_balanced_and_keeps_its_style() {
+        let ev = "Make a <b>very strong cup of coffee</b> before the meeting starts";
+        let period = "A <i>rather long period name that wraps</i> twice";
+        let ts = scene(&timeline(&format!("timeline\n  {period} : {ev}\n")));
+        let p = &ts.sections[0].periods[0];
+        let (text, _) = &p.events[0];
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.len() >= 2, "{text:?}");
+        assert_ne!(*lines.last().unwrap(), "starts", "{text:?}");
+        let mut bold = Vec::new();
+        for l in &lines {
+            assert!(text_width(l) * 13.0 / TEXT_CALIBRATION <= WRAP_W, "{l:?}");
+            for (t, b, _) in crate::layout::spans(l) {
+                if b {
+                    bold.extend(t.split_whitespace().map(str::to_string));
+                }
+            }
+        }
+        assert_eq!(bold.join(" "), "very strong cup of coffee", "{text:?}");
+        assert!(p.label.contains('\n'), "{:?}", p.label);
+        assert!(p.label.lines().all(|l| l.contains("<i>")), "{:?}", p.label);
+        // The SVG draws the run's later lines styled too.
+        let svg = to_svg(&ts);
+        let bold_lines = lines.iter().filter(|l| l.contains("<b>")).count();
+        assert!(bold_lines >= 2, "{text:?}");
+        assert_eq!(
+            svg.matches("<tspan font-weight=\"bold\">").count(),
+            bold_lines
+        );
+        assert_eq!(
+            svg.matches("font-style=\"italic\"").count(),
+            p.label.lines().count()
+        );
+    }
+
     #[test]
     fn long_events_and_periods_wrap() {
         let ev = "The first iPhone was announced by Steve Jobs at Macworld in San Francisco";

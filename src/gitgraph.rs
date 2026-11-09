@@ -16,12 +16,12 @@
 //! Layout. A branch's lane is the rank of its `GitBranch::order`, and
 //! every commit gets a column (LR) / row (TB, BT) of its own in
 //! sequence order. A cross-lane edge is mermaid's elbow: a leg straight
-//! across the lanes at one end and a run along a lane to the other end,
-//! the run on the lane farther from main (a fork drops from its parent
-//! and runs along the new branch; a merge runs along its branch and
-//! climbs into the merge commit) — unless a commit sits on that
-//! stretch of the lane, when the run takes the other lane, whose
-//! stretch is always free. Labels stay off the lines: a commit id or
+//! across the lanes at one end and a run along a lane to the other end
+//! (a fork leaves its parent across the lanes and runs along the new
+//! branch; a merge runs along the merged branch and climbs into the
+//! merge commit, whichever of the two lanes is farther from main) —
+//! unless a commit sits on that stretch of the lane and none on the
+//! other's, when the run takes the other lane. Labels stay off the lines: a commit id or
 //! tag that its own commit's leg would cross steps aside of it, and in
 //! LR each column sits far enough right that no id, tag or leg reaches
 //! into the one before it (so long ids never run together); in TB/BT a
@@ -306,7 +306,8 @@ fn plan(d: &GitGraph) -> Plan {
         let (lo, hi) = (a.min(b), a.max(b));
         (lo + 1..hi).any(|c| lane[at_col[c]] == l)
     };
-    let link = |from: usize, to: usize| -> Link {
+    // `merge`: the link from a merge commit's second parent.
+    let link = |from: usize, to: usize, merge: bool| -> Link {
         let (lu, lv) = (lane[from], lane[to]);
         if lu == lv {
             return Link {
@@ -318,12 +319,17 @@ fn plan(d: &GitGraph) -> Plan {
             };
         }
         let (cu, cv) = (col[from], col[to]);
-        // Mermaid's elbow runs along the lane farther from main; take
-        // the other lane only when a commit sits on that stretch.
-        let at_from = if lv > lu {
-            !busy(lv, cu, cv) || busy(lu, cu, cv)
-        } else {
+        // Mermaid's elbow: a fork (any link but a merge's) leaves its
+        // parent across the lanes and runs along the new commit's lane;
+        // a merge runs along the merged branch's lane and climbs into
+        // the merge commit — whichever lane is farther from main (a
+        // merge into a farther lane is no fork, nor a fork into a
+        // nearer lane a merge). The run takes the other lane only when
+        // a commit sits on its stretch and none on the other's.
+        let at_from = if merge {
             busy(lu, cu, cv) && !busy(lv, cu, cv)
+        } else {
+            !busy(lv, cu, cv) || busy(lu, cu, cv)
         };
         Link {
             from,
@@ -341,15 +347,15 @@ fn plan(d: &GitGraph) -> Plan {
         let mut on: Vec<usize> = (0..n).filter(|&i| d.commits[i].branch == bi).collect();
         on.sort_by_key(|&i| col[i]);
         if let (Some(p), Some(&first)) = (b.parent_commit.filter(|&p| p < n), on.first()) {
-            links.push(link(p, first));
+            links.push(link(p, first, false));
         }
         for w in on.windows(2) {
-            links.push(link(w[0], w[1]));
+            links.push(link(w[0], w[1], false));
         }
     }
     for (i, c) in d.commits.iter().enumerate() {
         if let Some(sp) = c.second_parent.filter(|&sp| sp < n) {
-            links.push(link(sp, i));
+            links.push(link(sp, i, true));
         }
     }
 
@@ -1586,6 +1592,64 @@ mod tests {
     /// Report monochrome-edges / thin-strokes: every line takes the
     /// colour of the lane it runs along (a fork its new branch's, a
     /// merge its branch's) and is drawn 5px wide with round caps.
+    /// Phase A follow-up: the elbow's run took whichever lane was
+    /// farther from main, so `checkout feat` + `merge main` (a merge
+    /// into the farther lane) was drawn as a fork out of main's commit,
+    /// in feat's colour, and a fork into a nearer lane as a merge.
+    /// Mermaid's elbow goes by kind: a fork leaves its parent across
+    /// the lanes and runs along the new branch; a merge runs along the
+    /// merged branch and climbs into the merge commit.
+    #[test]
+    fn merges_and_forks_take_mermaid_elbows_whatever_the_lane_order() {
+        for (head, lr) in [
+            ("gitGraph", true),
+            ("gitGraph TB:", false),
+            ("gitGraph BT:", false),
+        ] {
+            // (flow, lane) coordinates of a point in this orientation.
+            let fl = |p: Pt| if lr { (p.0, p.1) } else { (p.1, p.0) };
+            let merge_far = scene(&git(&format!(
+                "{head}\ncommit id: \"m1\"\nbranch feat\ncommit id: \"f1\"\n\
+                 checkout main\ncommit id: \"m2\"\ncommit id: \"m3\"\n\
+                 checkout feat\nmerge main id: \"mg\"\ncommit id: \"f2\"\n"
+            )));
+            let fork_near = scene(&git(&format!(
+                "{head}\ncommit id: \"m1\"\nbranch dev order: 2\ncommit id: \"d1\"\n\
+                 branch feat order: 1\ncommit id: \"e1\"\ncheckout dev\ncommit id: \"d2\"\n\
+                 checkout feat\ncommit id: \"e2\"\n"
+            )));
+            let edge = |gs: &GitScene, a: &str, b: &str| {
+                gs.scene
+                    .edges
+                    .iter()
+                    .find(|e| e.from == a && e.to == b)
+                    .unwrap_or_else(|| panic!("{head}: no {a}->{b}"))
+                    .clone()
+            };
+            let stroke = |e: &SceneEdge| e.meta.style.stroke.clone().unwrap();
+
+            // The merge runs along main from m3 and climbs into mg.
+            let m = edge(&merge_far, "m3", "mg");
+            let (p0, c, p1) = (fl(m.bezier[0]), fl(m.bezier[1]), fl(m.bezier[3]));
+            assert_eq!(c.1, p0.1, "{head}: the merge runs along main");
+            assert!((c.0 - p1.0).abs() < R, "{head}: and climbs at the merge");
+            assert_eq!(stroke(&m), stroke(&edge(&merge_far, "m2", "m3")), "{head}");
+            // The fork from m1 to feat is still a fork.
+            let f = edge(&merge_far, "m1", "f1");
+            let (p0, c, p1) = (fl(f.bezier[0]), fl(f.bezier[1]), fl(f.bezier[3]));
+            assert!((c.0 - p0.0).abs() < R && c.1 == p1.1, "{head}: fork");
+
+            // feat (order 1) branches off dev (order 2): its lane is the
+            // nearer one, and still the fork leaves d1 and runs along it.
+            let f = edge(&fork_near, "d1", "e1");
+            let (p0, c, p1) = (fl(f.bezier[0]), fl(f.bezier[1]), fl(f.bezier[3]));
+            assert!(p1.1 < p0.1, "{head}: feat's lane is nearer main");
+            assert!((c.0 - p0.0).abs() < R, "{head}: the fork leaves its parent");
+            assert_eq!(c.1, p1.1, "{head}: and runs along feat");
+            assert_eq!(stroke(&f), stroke(&edge(&fork_near, "e1", "e2")), "{head}");
+        }
+    }
+
     #[test]
     fn lines_take_their_lane_colour() {
         let gs = scene(&git(CORPUS));

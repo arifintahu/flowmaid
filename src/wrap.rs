@@ -1,7 +1,7 @@
 //! Line breaking shared by every label that wraps (report M7): node
 //! labels ([`crate::layout::wrap_label`]), markdown strings
 //! ([`crate::markdown`]) and the fixed-column text of journeys and
-//! timelines ([`crate::layout`]'s `wrap_text`). A label line is cut into
+//! timelines ([`wrap_block`]). A label line is cut into
 //! [`Token`]s — its words, and each CJK character on its own, since
 //! those scripts break between characters without spaces — each token
 //! measured once ([`Widths`]: a run of tokens is as wide as their sum
@@ -301,6 +301,57 @@ pub(crate) fn wrap(w: &Widths, width: f64) -> Vec<usize> {
     starts
 }
 
+/// `s` wrapped at `width` for the fixed-column diagrams — journey task
+/// names, timeline periods and events — whose text would otherwise
+/// widen its column without bound: each of its own lines (`\n`) that
+/// `measure` finds wider than `width` broken as a node label is
+/// ([`wrap`]: as few lines as filling them greedily needs, evened out so
+/// no word is left stranded on the last — "Sit down and | write the
+/// weekly | report for the team", not "… weekly report for the | team"),
+/// a word wider than `width` kept whole on a line of its own. Lines
+/// that fit come back as written.
+///
+/// `styled`: the text's `<b>` / `<i>` markup is drawn as styling
+/// ([`crate::layout::spans`]), so it is kept and re-opened on every
+/// line a styled run reaches (a greedy cut used to leave the run's
+/// second line plain). Otherwise the tags are text like any other (a
+/// journey prints them verbatim) and are measured and broken as such.
+/// A line holding `$$…$$` math breaks as plain text, its fences kept.
+pub(crate) fn wrap_block(
+    s: &str,
+    width: f64,
+    measure: impl Fn(&str) -> f64,
+    styled: bool,
+) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in s.split('\n') {
+        if measure(line) <= width {
+            out.push(line.to_string());
+        } else if styled && line.contains('<') && !line.contains("$$") {
+            out.extend(wrap_runs(&crate::layout::spans(line), width, &measure));
+        } else {
+            out.extend(wrap_runs(&[(line, false, false)], width, &measure));
+        }
+    }
+    out.join("\n")
+}
+
+/// The styled `runs` of one line broken at `width` ([`wrap_block`]), as
+/// one markup string per line.
+fn wrap_runs<S: AsRef<str>>(
+    runs: &[(S, bool, bool)],
+    width: f64,
+    measure: &impl Fn(&str) -> f64,
+) -> Vec<String> {
+    let toks = Tokens::new(runs);
+    if toks.len() == 0 {
+        // Nothing but spaces: no word to start a line at.
+        return vec![markup(runs)];
+    }
+    let w = toks.widths(measure);
+    toks.lines(&wrap(&w, width))
+}
+
 /// Most words [`balanced`] balances: past it a label is a paragraph,
 /// not a label, and greedy filling (linear) is good enough.
 const BALANCE_MAX_WORDS: usize = 64;
@@ -447,6 +498,15 @@ pub(crate) fn into_lines(
     Some(out)
 }
 
+/// `crate::layout::wrap_text`, the greedy wrapper journeys and timelines
+/// used before [`wrap_block`], has no caller left. It lives in
+/// `layout.rs`, which a parallel change owns; until that file drops it
+/// (with its `lines_at` helper and its test), this reference keeps the
+/// unused function from failing the `-D warnings` build. Delete both
+/// together.
+#[allow(dead_code)]
+const RETIRED_GREEDY_WRAP: fn(&str, f64, f64) -> String = crate::layout::wrap_text;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,5 +645,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The 13 px text of journeys and timelines, measured as they do.
+    fn at_13(t: &str) -> f64 {
+        crate::layout::text_width(t) * 13.0 / crate::layout::TEXT_CALIBRATION
+    }
+
+    /// Phase A follow-up: journey and timeline text wrapped greedily,
+    /// leaving a stranded last word ("… report for the | team"); it is now
+    /// balanced like a node label, in as few lines as greedy takes.
+    #[test]
+    fn wrap_block_leaves_no_stranded_last_word() {
+        let s = "Sit down and write the weekly report for the team";
+        let words: Vec<&str> = s.split(' ').collect();
+        let line = |i: usize, j: usize| at_13(&words[i..j].join(" "));
+        let g = greedy(words.len(), 150.0, line);
+        let out = wrap_block(s, 150.0, at_13, false);
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert_eq!(lines.len(), g.len(), "{out:?}");
+        assert_eq!(lines.join(" "), s, "no word lost or reordered");
+        // Greedy strands a short tail; balanced evens the lines out.
+        let spread = |ws: &[f64]| {
+            ws.iter().cloned().fold(0.0, f64::max) - ws.iter().cloned().fold(f64::MAX, f64::min)
+        };
+        let ends = |st: &[usize]| -> Vec<f64> {
+            (0..st.len())
+                .map(|k| line(st[k], st.get(k + 1).copied().unwrap_or(words.len())))
+                .collect()
+        };
+        let ws: Vec<f64> = lines.iter().map(|l| at_13(l)).collect();
+        for w in &ws {
+            assert!(*w <= 150.0, "{out:?}");
+        }
+        assert!(spread(&ws) < spread(&ends(&g)), "{out:?} vs greedy {g:?}");
+        assert_ne!(*lines.last().unwrap(), "team", "{out:?}");
+        // A line that fits, and the text's own breaks, stay as written.
+        assert_eq!(wrap_block("short  text", 150.0, at_13, true), "short  text");
+        assert_eq!(wrap_block("x\ny", 1.0, at_13, true), "x\ny");
+        // A word wider than the limit keeps a line to itself, whole.
+        let out = wrap_block("a Pneumonoultramicroscopic b", 40.0, at_13, false);
+        assert!(
+            out.split('\n')
+                .any(|l| l.contains("Pneumonoultramicroscopic")),
+            "{out:?}"
+        );
+    }
+
+    /// Phase A follow-up: a `<b>` / `<i>` run cut by a wrap kept its
+    /// style on its first line only (each drawn line is read on its
+    /// own). Styled text re-opens the run on every line it reaches.
+    #[test]
+    fn wrap_block_carries_styles_across_its_breaks() {
+        let s = "Make a <b>very strong cup of coffee</b> before the meeting starts";
+        let out = wrap_block(s, 160.0, at_13, true);
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert!(lines.len() >= 2, "{out:?}");
+        let mut bold = Vec::new();
+        let mut plain = Vec::new();
+        for l in &lines {
+            assert!(at_13(l) <= 160.0, "{l:?}");
+            for (t, b, i) in crate::layout::spans(l) {
+                assert!(!i);
+                let to = if b { &mut bold } else { &mut plain };
+                to.extend(t.split(' ').filter(|w| !w.is_empty()).map(str::to_string));
+            }
+        }
+        assert_eq!(bold.join(" "), "very strong cup of coffee", "{out:?}");
+        assert_eq!(
+            plain.join(" "),
+            "Make a before the meeting starts",
+            "{out:?}"
+        );
+        // The run spans a break: each line it reaches opens its own tag.
+        assert!(
+            lines.iter().filter(|l| l.contains("<b>")).count() >= 2,
+            "{out:?}"
+        );
+        let it = wrap_block(
+            "A <i>rather long period name that wraps</i> twice",
+            160.0,
+            at_13,
+            true,
+        );
+        assert!(it.contains('\n'), "{it:?}");
+        assert!(it.split('\n').all(|l| l.contains("<i>")), "{it:?}");
+    }
+
+    /// Unstyled (journey) text keeps its tags as text: measured and
+    /// broken like any other characters, never re-opened.
+    #[test]
+    fn wrap_block_keeps_literal_tags_as_text() {
+        let width = |t: &str| t.chars().count() as f64;
+        let out = wrap_block("make a <b>very strong cup</b> of tea", 14.0, width, false);
+        assert!(out.contains('\n'), "{out:?}");
+        assert_eq!(
+            out.replace('\n', " "),
+            "make a <b>very strong cup</b> of tea"
+        );
+        assert_eq!(out.matches("<b>").count(), 1, "{out:?}");
+        for l in out.split('\n') {
+            assert!(width(l) <= 14.0, "{l:?}");
+        }
+        // Math keeps its fences when its line breaks.
+        let out = wrap_block(
+            "energy is $$E=mc^2$$ for a body at rest",
+            120.0,
+            at_13,
+            true,
+        );
+        assert!(out.contains('\n') && out.contains("$$E=mc^2$$"), "{out:?}");
     }
 }

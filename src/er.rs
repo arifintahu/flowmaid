@@ -769,13 +769,24 @@ fn rects_overlap(a: Rect, b: Rect) -> bool {
     a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
 }
 
-/// Keep every relationship label off the crow's feet. The flowchart
-/// label stages know only arrowheads (and an ER line has none), so a
-/// label lands on its line's midpoint whatever the glyphs cover — a
-/// pill over the circle of `o{` reads as `|{`, and on a short line it
-/// hides both ends. A label that covers a glyph moves to the middle
-/// of the stretch the glyphs leave free (the layout reserved one via
-/// `Edge::end_room`), else beside the line; a clear label stays put.
+/// Room kept between a label's pill and another relationship's line,
+/// past that line's half stroke.
+const LINE_AIR: f64 = 1.0;
+
+/// Keep every relationship label off the crow's feet and off the other
+/// relationships' lines. The flowchart label stages know only
+/// arrowheads (and an ER line has none), so a label lands on its line's
+/// midpoint whatever the glyphs cover — a pill over the circle of `o{`
+/// reads as `|{`, and on a short line it hides both ends; and where two
+/// lines run close (a pair of relationships between the same entities,
+/// a cycle) a pill on one can cover the other, which then reads as
+/// passing under the wrong label. A label that covers a glyph or
+/// another line moves to the middle of the stretch the glyphs leave
+/// free (the layout reserved one via `Edge::end_room`), else beside the
+/// line: a label over a glyph to the spot clear of the glyphs that
+/// covers the fewest boxes and labels (off the other lines where that
+/// ties), one only over a line to a spot off every line covering no
+/// more of them than it did, else it stays. A clear label stays put.
 fn labels_off_glyphs(sc: &mut Scene, cards: &[(Card, Card)]) {
     // Each glyph with its bounding box (strokes and air included): a
     // label is tested stroke by stroke only against glyphs near it.
@@ -801,6 +812,26 @@ fn labels_off_glyphs(sc: &mut Scene, cards: &[(Card, Card)]) {
             )
         })
         .collect();
+    // Each relationship's line as the painter strokes it, with its
+    // bounding box: a label is tested segment by segment only against
+    // lines near it.
+    let lines: Vec<(Vec<(f64, f64)>, Rect)> = sc
+        .edges
+        .iter()
+        .map(|e| {
+            let pts = edge_polyline(e);
+            let b = pts.iter().fold(
+                (
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ),
+                |b, p| (b.0.min(p.0), b.1.min(p.1), b.2.max(p.0), b.3.max(p.1)),
+            );
+            (pts, b)
+        })
+        .collect();
     let mut grow: Option<Rect> = None;
     for j in 0..sc.edges.len() {
         let Some((_, at, w)) = sc.edges[j].label.clone() else {
@@ -811,7 +842,22 @@ fn labels_off_glyphs(sc: &mut Scene, cards: &[(Card, Card)]) {
                 .iter()
                 .all(|(g, b)| !rects_overlap(r, *b) || !rect_hits_glyph(r, g, GLYPH_AIR))
         };
-        if clear(label_rect(at, w)) {
+        // Does `r` cover another relationship's line (its stroke and
+        // `LINE_AIR` past it)?
+        let on_other_line = |r: Rect| {
+            let k = LINE_W / 2.0 + LINE_AIR;
+            let r = (r.0 - k, r.1 - k, r.2 + k, r.3 + k);
+            lines.iter().enumerate().any(|(i, (pts, b))| {
+                i != j
+                    && rects_overlap(r, *b)
+                    && pts
+                        .windows(2)
+                        .any(|s| seg_aabb(s[0], s[1], r.0, r.1, r.2, r.3))
+            })
+        };
+        let here = label_rect(at, w);
+        let glyph_free = clear(here);
+        if glyph_free && !on_other_line(here) {
             continue;
         }
         let others: Vec<Rect> = sc
@@ -834,11 +880,20 @@ fn labels_off_glyphs(sc: &mut Scene, cards: &[(Card, Card)]) {
             glyph_reach(cards[j].0) + GLYPH_AIR,
             glyph_reach(cards[j].1) + GLYPH_AIR,
         );
+        // A label over a glyph takes the spot clear of the glyphs that
+        // covers the fewest boxes and labels, off the other lines where
+        // that ties. One that only lies on another line moves only to a
+        // spot off every line that covers no more than it does: a pill
+        // over another pill hides more than one over a line.
+        let stay = crowd(here);
         let best = free_stretch_spots(&sc.edges[j], reach, w)
             .into_iter()
             .map(|c| (c, label_rect(c, w)))
             .filter(|&(_, r)| clear(r))
-            .min_by_key(|&(_, r)| crowd(r));
+            .map(|(c, r)| (c, r, crowd(r), on_other_line(r)))
+            .filter(|&(_, _, n, on)| !glyph_free || (!on && n <= stay))
+            .min_by_key(|&(_, _, n, on)| (n, on))
+            .map(|(c, r, _, _)| (c, r));
         if let Some((c, r)) = best {
             if let Some(lbl) = &mut sc.edges[j].label {
                 lbl.1 = c;
@@ -1578,5 +1633,151 @@ CUSTOMER only one to zero or more ORDER : places
         let pos = vec![(a.x, a.y), (a.x + a.w / 2.0 + b.w / 2.0 + 40.0, a.y)];
         let s1 = route(&d, &pos);
         assert_no_glyph_under_a_label(&to_svg(&s1), "tight drag");
+    }
+
+    /// Every pair of drawn relationship lines in `es` that cross away
+    /// from the tables (inside a table they meet at its border anyway),
+    /// as `(j, k)`.
+    fn crossing_pairs(es: &ErScene) -> Vec<(usize, usize)> {
+        let boxes: Vec<Rect> = es
+            .scene
+            .nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.x - n.w / 2.0 - 2.0,
+                    n.y - n.h / 2.0 - 2.0,
+                    n.x + n.w / 2.0 + 2.0,
+                    n.y + n.h / 2.0 + 2.0,
+                )
+            })
+            .collect();
+        let inside = |p: (f64, f64)| {
+            boxes
+                .iter()
+                .any(|b| p.0 >= b.0 && p.0 <= b.2 && p.1 >= b.1 && p.1 <= b.3)
+        };
+        let cross = |a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)| {
+            let o = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+                (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+            };
+            let (d1, d2, d3, d4) = (o(c, d, a), o(c, d, b), o(a, b, c), o(a, b, d));
+            d1 * d2 < 0.0 && d3 * d4 < 0.0
+        };
+        let lines: Vec<Vec<(f64, f64)>> = es.scene.edges.iter().map(edge_polyline).collect();
+        let mut out = Vec::new();
+        for j in 0..lines.len() {
+            for k in j + 1..lines.len() {
+                let hit = lines[j].windows(2).any(|s| {
+                    lines[k]
+                        .windows(2)
+                        .any(|t| cross(s[0], s[1], t[0], t[1]) && !inside(s[0]) && !inside(s[1]))
+                });
+                if hit {
+                    out.push((j, k));
+                }
+            }
+        }
+        out
+    }
+
+    /// Phase A follow-up: under `direction LR` a pair of relationships
+    /// between the same two entities (one written the other way round,
+    /// so the layout takes it reversed) was drawn as a crossing X. The
+    /// flowchart pipeline's pair-aware ports now keep such pairs side by
+    /// side in every direction; this holds that for ER.
+    #[test]
+    fn relationships_between_the_same_entities_never_cross() {
+        let pairs = [
+            ("||--|{", "||--o{", false),
+            ("||--|{", "||--o{", true),
+            ("}o--||", "|o--o{", true),
+            ("}|..|{", "||--||", false),
+        ];
+        let extras = [
+            "",
+            "C ||--o{ A : x\n",
+            "B ||--o{ C : y\n",
+            "A ||--o{ C : z\nC }o--|| B : w\n",
+        ];
+        for dir in ["LR", "RL", "TB", "BT"] {
+            for (c1, c2, rev) in pairs {
+                for extra in extras {
+                    let second = if rev {
+                        format!("B {c2} A : employs\n")
+                    } else {
+                        format!("A {c2} B : employs\n")
+                    };
+                    let src = format!(
+                        "erDiagram\ndirection {dir}\nA {c1} B : \"works in\"\n{second}{extra}"
+                    );
+                    let es = scene(&er(&src));
+                    assert!(!crossing_pairs(&es).contains(&(0, 1)), "{src}");
+                }
+            }
+        }
+        // The phase A verifier's LR cycle: no relationship crosses another.
+        let src = "erDiagram\ndirection LR\nEMPLOYEE |o--o{ EMPLOYEE : manages\n\
+                   EMPLOYEE ||--|{ DEPT : \"works in\"\nDEPT ||--o{ EMPLOYEE : employs\n\
+                   DEPT }o--|| SITE : \"located at\"\nSITE ||..o{ EMPLOYEE : hosts\n";
+        assert_eq!(crossing_pairs(&scene(&er(src))), [], "{src}");
+    }
+
+    /// Phase A follow-up: where two relationships run close (a pair
+    /// between the same entities, a cycle), a label pill could sit on
+    /// the neighbouring line, which then reads as passing under the
+    /// wrong label ("employs" on "works in"). A pill that covers another
+    /// line moves along its own line or beside it when that is clear and
+    /// covers no other pill or table; a clear pill stays where it was.
+    #[test]
+    fn labels_stay_off_their_neighbours_lines() {
+        let on_other_line = |es: &ErScene, j: usize| {
+            let (_, c, w) = es.scene.edges[j].label.clone().unwrap();
+            let r = label_rect(c, w);
+            es.scene.edges.iter().enumerate().any(|(k, e)| {
+                k != j
+                    && edge_polyline(e)
+                        .windows(2)
+                        .any(|s| seg_aabb(s[0], s[1], r.0, r.1, r.2, r.3))
+            })
+        };
+        for dir in ["BT", "TB"] {
+            for second in ["A ||--o{ B : employs", "B ||--o{ A : employs"] {
+                let src = format!(
+                    "erDiagram\ndirection {dir}\nA ||--|{{ B : \"works in\"\n{second}\n\
+                     C ||--o{{ A : x\nB ||--o{{ C : y\n"
+                );
+                let es = scene(&er(&src));
+                for j in 0..es.scene.edges.len() {
+                    assert!(!on_other_line(&es, j), "{src}: label {j}");
+                }
+                // Moving off a line never puts a pill on another pill.
+                let rects: Vec<Rect> = es
+                    .scene
+                    .edges
+                    .iter()
+                    .filter_map(|e| e.label.as_ref().map(|(_, c, w)| label_rect(*c, *w)))
+                    .collect();
+                for (a, ra) in rects.iter().enumerate() {
+                    for rb in &rects[a + 1..] {
+                        assert!(!rects_overlap(*ra, *rb), "{src}: pills overlap");
+                    }
+                }
+                assert_no_glyph_under_a_label(&to_svg(&es), &src);
+            }
+        }
+        // The cycles the phase A verifier drew keep every pill on its own
+        // line (and the corpus' own diagrams draw as they did).
+        for dir in ["TB", "BT", "LR"] {
+            let src = format!(
+                "erDiagram\ndirection {dir}\nEMPLOYEE |o--o{{ EMPLOYEE : manages\n\
+                 EMPLOYEE ||--|{{ DEPT : \"works in\"\nDEPT ||--o{{ EMPLOYEE : employs\n\
+                 DEPT }}o--|| SITE : \"located at\"\nSITE ||..o{{ EMPLOYEE : hosts\n"
+            );
+            let es = scene(&er(&src));
+            for j in 0..es.scene.edges.len() {
+                assert!(!on_other_line(&es, j), "{src}: label {j}");
+            }
+        }
     }
 }
