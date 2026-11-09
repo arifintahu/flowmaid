@@ -797,6 +797,53 @@ impl Graph {
         self.index.get(id).copied()
     }
 
+    /// A graph of some of this one's nodes, flowing in `direction`: its
+    /// node `k` is `nodes[k]` ([`PartNode`]), and it keeps every
+    /// graph-wide setting of this one (wrapping width, layout hints,
+    /// accessibility text) and the per-node data of the nodes it takes
+    /// (links, markdown bodies, lead nodes). No edges or subgraphs: the
+    /// caller adds them. The parts of a compound layout
+    /// (`crate::compound`).
+    pub(crate) fn part(&self, direction: Direction, nodes: &[PartNode]) -> Graph {
+        let mut g = Graph {
+            direction,
+            acc_title: self.acc_title.clone(),
+            acc_descr: self.acc_descr.clone(),
+            rank_gap: self.rank_gap,
+            flat_leaves: self.flat_leaves,
+            tight_sources: self.tight_sources,
+            edge_paint_width: self.edge_paint_width,
+            wrap_width: self.wrap_width,
+            no_wrap: self.no_wrap,
+            ..Graph::default()
+        };
+        let mut at: Vec<Option<usize>> = vec![None; self.nodes.len()];
+        for (k, slot) in nodes.iter().enumerate() {
+            let node = match slot {
+                PartNode::Of(v) => {
+                    at[*v] = Some(k);
+                    self.nodes[*v].clone()
+                }
+                PartNode::New(n) => n.clone(),
+            };
+            g.index.entry(node.id.clone()).or_insert(k);
+            g.nodes.push(node);
+        }
+        let mapped = |v: &usize| at.get(*v).copied().flatten();
+        g.links = self
+            .links
+            .iter()
+            .filter_map(|(v, l)| Some((mapped(v)?, l.clone())))
+            .collect();
+        g.md_labels = self
+            .md_labels
+            .iter()
+            .filter_map(|(v, b)| Some((mapped(v)?, b.clone())))
+            .collect();
+        g.lead_nodes = self.lead_nodes.iter().filter_map(mapped).collect();
+        g
+    }
+
     /// Give node `i` the id `id` (free, else nothing changes): the parser
     /// moves a generated `__note_*` card off an id the source then names.
     pub(crate) fn rename_node(&mut self, i: usize, id: String) {
@@ -807,6 +854,14 @@ impl Graph {
         self.index.insert(id.clone(), i);
         self.nodes[i].id = id;
     }
+}
+
+/// A node of a [`Graph::part`].
+pub(crate) enum PartNode {
+    /// The whole graph's node.
+    Of(usize),
+    /// A node of the part's own.
+    New(Node),
 }
 
 /// One parsed Mermaid document of any supported diagram type.
