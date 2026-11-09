@@ -2890,6 +2890,13 @@ fn point_seg_dist(px: f64, py: f64, a: (f64, f64), b: (f64, f64)) -> f64 {
 /// Automatic layout: run the layout engine, then map all geometry
 /// to final coordinates. This is the source of truth that
 /// `render::render` uses as well.
+///
+/// A subgraph (state composite) with a `direction` of its own other
+/// than the one round it is laid out on its own in that direction while
+/// none of its nodes links to a node outside it (mermaid's rule; edges
+/// to the subgraph itself are fine), and placed in the drawing like one
+/// node the size of its frame, edges to it meeting the frame. [`route`]
+/// and [`route_partial`] route such a block in its own direction too.
 pub fn scene(g: &Graph) -> Scene {
     let (labels, sizes) = crate::layout::node_texts(g);
     scene_labelled(g, &sizes, &labels)
@@ -2923,14 +2930,22 @@ pub fn scene_sized_with(g: &Graph, sizes: &[(f64, f64)], measure: impl Fn(&str) 
 }
 
 /// [`scene_sized`] with each node's drawn label given (index-parallel
-/// with `g.nodes`).
-fn scene_labelled(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene {
+/// with `g.nodes`). A subgraph laid out in its own direction is a block
+/// of its own ([`crate::compound`], report B3): the graph is cut into
+/// such blocks and the rest, each laid out here on its own.
+pub(crate) fn scene_labelled(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene {
     assert_eq!(
         sizes.len(),
         g.nodes.len(),
         "number of sizes must match number of nodes"
     );
     let sizes = sane_sizes(sizes);
+    // Before the bars are fitted: each part fits its own across its flow.
+    if let Some(split) = crate::compound::split(g) {
+        if let Some(sc) = crate::compound::scene(g, &split, &sizes, labels) {
+            return sc;
+        }
+    }
     let sizes = &fit_bars(g, &sizes)[..];
     let mut sc = if g.subgraphs.is_empty() {
         scene_flat(g, sizes, labels)
@@ -4238,8 +4253,10 @@ pub fn route_sized_with(
 }
 
 /// [`route_sized`] with each node's drawn label given (index-parallel
-/// with `g.nodes`).
-fn route_labelled(
+/// with `g.nodes`). A graph with blocks laid out in their own directions
+/// ([`crate::compound`]) is routed block by block, as [`scene`] lays it
+/// out.
+pub(crate) fn route_labelled(
     g: &Graph,
     centers: &[(f64, f64)],
     sizes: &[(f64, f64)],
@@ -4256,6 +4273,11 @@ fn route_labelled(
         "number of sizes must match number of nodes"
     );
     let sizes = sane_sizes(sizes);
+    if let Some(split) = crate::compound::split(g) {
+        if let Some(sc) = crate::compound::route(g, &split, centers, &sizes, labels) {
+            return sc;
+        }
+    }
     let sizes = &fit_bars(g, &sizes)[..];
     let mut sc = route_built(g, centers, sizes, labels, true);
     crate::edgepass::finish(g, &mut sc, crate::edgepass::Mode::Routed);
@@ -4712,17 +4734,44 @@ pub fn route_partial(
     if base.nodes.len() != n || base_centers.len() != n || centers.len() != n {
         return route(g, centers);
     }
-    let moved: Vec<bool> = (0..n)
+    route_partial_with(g, centers, base, base_centers, &[])
+}
+
+/// [`route_partial`] (lengths checked) with the boxes of some nodes
+/// given: `sized` holds (node, size, whether it differs from its `base`
+/// box) for each proxy of a block laid out in its own direction
+/// ([`crate::compound`]) — its box is the block's frame, not one sized
+/// from a label — and a proxy whose box changed counts as moved however
+/// its centre lies. A graph with such blocks is re-routed block by block.
+pub(crate) fn route_partial_with(
+    g: &Graph,
+    centers: &[(f64, f64)],
+    base: &Scene,
+    base_centers: &[(f64, f64)],
+    sized: &[(usize, (f64, f64), bool)],
+) -> Scene {
+    let n = g.nodes.len();
+    let mut moved: Vec<bool> = (0..n)
         .map(|i| {
             (centers[i].0 - base_centers[i].0).abs() > 0.01
                 || (centers[i].1 - base_centers[i].1).abs() > 0.01
         })
         .collect();
+    for &(v, _, resized) in sized {
+        moved[v] |= resized;
+    }
     if !moved.iter().any(|&m| m) {
         return base.clone();
     }
+    if let Some(split) = crate::compound::split(g) {
+        return crate::compound::route_partial(g, &split, centers, base, base_centers)
+            .unwrap_or_else(|| route(g, centers));
+    }
     // Each label wrapped once for the frame (the fallbacks below reuse it).
-    let (labels, raw_sizes) = crate::layout::node_texts(g);
+    let (labels, mut raw_sizes) = crate::layout::node_texts(g);
+    for &(v, size, _) in sized {
+        raw_sizes[v] = size;
+    }
     let sizes = fit_bars(g, &raw_sizes);
     // No builder label pass: a redrawn edge's label starts at its spot
     // on the new line and the label stage moves it only if it covers
@@ -7197,23 +7246,37 @@ pub(crate) fn sane_sizes(sizes: &[(f64, f64)]) -> Cow<'_, [(f64, f64)]> {
 /// 60px bar. The reach is estimated before layout ([`bar_half`]), so the
 /// static and the interactive builders fit the same sizes and a drag
 /// never resizes a bar; fitting fitted sizes again changes nothing.
+/// A bar in a composite laid out in its own direction
+/// ([`crate::compound`]) lies across that direction's flow.
 /// Other sizes pass through untouched (borrowed when there is no bar).
 pub(crate) fn fit_bars<'a>(g: &Graph, sizes: &'a [(f64, f64)]) -> Cow<'a, [(f64, f64)]> {
     if !g.nodes.iter().any(|n| n.shape == Shape::ForkBar) {
         return Cow::Borrowed(sizes);
     }
-    let across = matches!(g.direction, Direction::LR | Direction::RL);
+    // Whether the flow round node `v` runs along x: the diagram's, or
+    // its block's own.
+    let flows = g
+        .subgraphs
+        .iter()
+        .any(|s| s.direction.is_some())
+        .then(|| crate::compound::Flows::new(g));
+    let across = |v: usize| {
+        let d = flows
+            .as_ref()
+            .map_or(g.direction, |f| f.of(End::Node(v), End::Node(v)));
+        matches!(d, Direction::LR | Direction::RL)
+    };
     let is_bar = |v: usize| g.nodes[v].shape == Shape::ForkBar;
     // A state's breadth across the flow (a bar inside a composite counts
     // at an unfitted bar's length, see below).
-    let breadth = |v: usize| match (is_bar(v), across) {
+    let breadth = |v: usize, across: bool| match (is_bar(v), across) {
         (true, _) => BAR_SIZE.0,
         (false, true) => sizes[v].1,
         (false, false) => sizes[v].0,
     };
-    let end_breadth = |end: End| match end {
-        End::Node(v) => breadth(v),
-        End::Sub(si) => frame_breadth(g, si, &breadth),
+    let end_breadth = |end: End, across: bool| match end {
+        End::Node(v) => breadth(v, across),
+        End::Sub(si) => frame_breadth(g, si, &|v| breadth(v, across)),
     };
     let bar = |end: End| match end {
         End::Node(v) if is_bar(v) => Some(v),
@@ -7290,18 +7353,18 @@ pub(crate) fn fit_bars<'a>(g: &Graph, sizes: &'a [(f64, f64)]) -> Cow<'a, [(f64,
     // the fit that gives it. When another path joins the two (a fork
     // straight to its join), the edge spans layers: the layer beside the
     // bar holds its lane, not the far bar.
-    let first = reach(&|end, _| end_breadth(end));
+    let first = reach(&|end, near| end_breadth(end, across(near)));
     let lengths = reach(&|end, near| match bar(end) {
         Some(far) if beside(g, near, far) => {
             first.get(&far).copied().unwrap_or(0.0).max(BAR_SIZE.0)
         }
-        _ => end_breadth(end),
+        _ => end_breadth(end, across(near)),
     });
     let mut out = sizes.to_vec();
     for v in (0..g.nodes.len()).filter(|&v| is_bar(v)) {
         let (w, h) = sizes[v];
         let len = w.max(h).max(lengths.get(&v).copied().unwrap_or(0.0));
-        out[v] = if across {
+        out[v] = if across(v) {
             (w.min(h), len)
         } else {
             (len, w.min(h))
@@ -16319,8 +16382,13 @@ mod tests {
         // edge is one alignment link with its twin, so a note beside one
         // of its states lands where its elbow would cross the return
         // edge drawn across the gap, and the link keeps its plain course.
+        // 61 since B9: the first source's `Outer` composite sets
+        // `direction TB` in an LR diagram and nothing links out of it, so
+        // it is laid out top-down as a block of its own; 'deep note' now
+        // sits level with D2 beside the TB run into it, and the LR rest
+        // puts 'done note' level with Done — both links run straight.
         assert!(
-            elbows >= 63,
+            elbows >= 61,
             "only {elbows} elbows: the sources lost their point"
         );
         // A sub-edge's course stops at its box's frame: run on to the
