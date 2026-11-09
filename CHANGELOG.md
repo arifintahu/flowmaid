@@ -7,6 +7,41 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-11-09
+
+### Highlights
+
+Flowchart parity phase B: the B8 follow-up (layering) and the
+non-flowchart leftovers from phase A. No public API is removed or changed;
+two small additions.
+
+- **Subgraphs fed by a hub sit below it, whole.** A member that only links
+  onward, or the members of a subgraph that narrowing stacked, no longer
+  stay on the hub's row and drag the frame across its edges. Over a 5 337-
+  input set the 96 flowchart and state diagrams that change lose most of
+  their defects (168 -> 35), edges through frames (89 -> 16) and crossings
+  (364 -> 243). No corpus diagram changes.
+- **Large random graphs draw as in 0.34.0 again.** 0.35.0 packed them so
+  tight that `route()` ran edges through nodes; graphs of more than 400
+  nodes and edges keep their cycle breakers in source order.
+- **Journey and timeline text wraps balanced** — no last word left alone —
+  and a timeline's `<b>` / `<i>` survive a line break.
+- **gitGraph merges look like merges** (the elbow goes by link kind, as in
+  mermaid), and `order: 0` ties as mermaid's do.
+- **ER labels stay off neighbouring lines.**
+- **Pies past sixteen slices and journeys past ten actors** give repeated
+  colours a second cue (hatching, dot shapes); smaller ones draw exactly as
+  before. New: `pie::slice_hatch`, `journey::actor_mark` / `ActorMark`.
+
+### Added
+
+- `pie::slice_hatch(i)` (with `pie::HATCH_W`, `HATCH_PITCH`,
+  `HATCH_OPACITY`): the hatching a host draws over slice `i` past the
+  sixteenth, so a painter of `PieScene` matches the SVG.
+  `journey::actor_mark(i)` and `journey::ActorMark`
+  (`Circle`/`Square`/`Diamond`/`Triangle`, `#[non_exhaustive]`): the
+  shape of actor `i`'s dots, for painters of `JourneyScene`.
+
 ### Changed
 
 - **A subgraph fed from outside every subgraph starts below its feeder**
@@ -59,8 +94,66 @@ project adheres to [Semantic Versioning](https://semver.org/).
   the second walk keeps a drawing off the order its lines are written in,
   keep the choice. A narrowing step that adds edges through nodes now must
   save two crossings per such edge. The 1 000-node synthetic benchmark
-  therefore draws as in 0.34.0 again (a 7.9 MB SVG instead of 6.8 MB) and,
-  like 0.34.0, renders 10–20 % slower than 0.35.0 did.
+  therefore draws as in 0.34.0 again (a 7.9 MB SVG instead of 6.8 MB), and its
+  layout takes about as long as 0.34.0's: roughly twice 0.35.0's on a shared
+  4-vCPU box (1.9–2.5 s against 1.0 s), the full render 2.8–3.3 s against
+  2.5 s.
+
+### Fixed
+
+- **Journey and timeline text wraps balanced, and keeps its styling.**
+  Long journey task names and timeline periods and events were cut
+  greedily, so a last word could be left alone on its line ("… report
+  for the | team"); they now wrap like node labels — as few lines as
+  before, evened out, a word wider than the column kept whole. A
+  timeline's `<b>` / `<i>` run that a break cuts used to lose its style
+  on the later lines (each drawn line is read on its own); every line it
+  reaches now opens it again. Journeys print tags verbatim (as mermaid
+  does) and now measure them as the characters they are, so a name
+  with tags keeps within its wrap width and its column. Text that fits
+  is drawn as before.
+- **A gitGraph merge into a farther lane is drawn as a merge.** The elbow
+  between two lanes ran along whichever lane was farther from main, so
+  `checkout feat` then `merge main` came out as a fork out of main's
+  commit, in feat's colour, and a fork into a nearer lane (a branch
+  given a lower `order:` than its parent) as a merge. Like mermaid, a
+  fork now leaves its parent across the lanes and runs along the new
+  branch, and a merge runs along the merged branch, in its colour, and
+  climbs into the merge commit, whichever lane is farther out. (A commit
+  sitting on the run's stretch still moves it to the other lane.)
+- **`branch x order: 0` ties the way mermaid's does.** Mermaid reads a
+  branch without `order:` as `order: 0` and keeps creation order among
+  ties, so an explicit `order: 0` branch sits among the unordered ones
+  in the order they were created; flowmaid put every `order: 0` branch
+  before all unordered ones. Main still comes first, and `order: 1` and
+  up still follow.
+- **An ER label no longer sits on a neighbouring relationship's line.**
+  Where two relationships run close (a pair between the same entities, a
+  cycle), a label pill could cover the other line, which then read as
+  passing under the wrong label ("employs" over "works in"). A pill that
+  covers another line now moves along its own line, or beside it, to a
+  spot clear of every other line and every crow's foot — only when that
+  spot covers no more pills or tables than where it was (a pill over a
+  pill hides more than one over a line), so in the tightest layouts it
+  can still stay. A pill clear of the other lines stays where it was;
+  the corpus, example and fixture diagrams are unchanged. (The crossing
+  "X" a pair of relationships drew under `direction LR` was already gone
+  with 0.34.0's pair-aware ports; a test now holds it for LR, RL, TB and
+  BT.)
+- **Pies with more than sixteen slices tell every slice apart.** The
+  sixteen slice colours start over at the seventeenth slice, which then
+  took the first one's colour — and on a full pie sits right beside it —
+  with the same legend swatch. Each later turn of the colours is now
+  hatched over its fill, wedge and swatch alike (stripes in the canvas
+  colour at 45° for slices 17–32, then 135°, 0° and 90°), and a label
+  inside a hatched wedge keeps a halo in its slice colour. Pies of up to
+  sixteen slices draw exactly as before.
+- **Journeys with more than ten actors tell every actor apart.** The ten
+  actor colours start over at the eleventh actor, whose dots then
+  matched the first one's in the legend and on every task. Each later
+  turn of the colours now draws its dots as another shape — squares for
+  actors 11–20, diamonds for 21–30, triangles for 31–40. Journeys of up
+  to ten actors draw exactly as before.
 
 ### Documentation
 
