@@ -98,6 +98,32 @@ or changed.
   edges bow sideways. The swimlane text-DSL example now renders: it had a
   trailing `#` comment, and comments are whole lines only. The
   sub-element example is now complete.
+- **README claims checked against the code.** An independent review of
+  every claim corrected overclaims that had built up:
+  - not every mermaid 12.2 header gets the "not supported yet" error (the
+    newer ones, such as `venn-beta` or `ishikawa`, are read as flowchart
+    text);
+  - sequence diagrams have eight arrows, not all of mermaid's;
+  - per-item `<title>`s exist in flowchart, state, journey and sankey
+    diagrams only;
+  - the 3:1 / 4.5:1 contrast holds for the mermaid themes, with two
+    named exceptions, and only they re-ink text on a dark `style` fill;
+  - an unknown theme name falls back to `flowmaid`;
+  - flowchart edge labels draw `<br/>` as a space;
+  - timeline labels keep entity codes as written;
+  - sankey's default `justify` puts every sink in the last column;
+  - the text DSL takes no `auto` port, and JSON edge styles read `color`,
+    not `stroke`;
+  - git lanes repeat colours past eight;
+  - `bench-75` has 21 nodes and 75 edges, not 75 nodes;
+  - the `--compact` example now folds;
+  - the `gitGraph` and `architecture-beta` version tags are corrected
+    (0.21.0 and 0.23.0);
+  - a block of unlinked members is drawn as a row, where mermaid draws a
+    column.
+- **Benchmark re-measured on 0.37.0:** about 126× faster than mermaid
+  12.2.0 (geometric mean over 25 diagrams; the 0.34.0 table said 105×),
+  SVG 1.5–23× smaller.
 
 ## [0.36.0] - 2026-11-09
 
