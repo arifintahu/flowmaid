@@ -7,6 +7,33 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-11-09
+
+### Highlights
+
+Flowchart parity phase B: B9, compound layout. No public API is removed
+or changed.
+
+- **`direction` inside a subgraph or a state composite now works, as in
+  mermaid.** A block that nothing inside links out of is laid out on its
+  own, in its own direction, and placed in the drawing like one node the
+  size of its frame (nested blocks too). Once a member links out, the
+  block takes the direction round it, which is mermaid's rule. The state
+  showcase's `Validating` composite (`direction LR` in a top-down diagram)
+  is now one row, 413 × 92, where it used to be a 126 × 368 column; the
+  canvas is 535 × 873 (mermaid: 459 × 109 in 649 × 886).
+- **Dragging and picking keep up.** `route()` and `route_partial()` route
+  each block in its own direction. Dragging a state inside a composite
+  grows the frame, and a drag outside a block leaves it alone: 0.5 ms a
+  frame on average on `examples/state.mmd` (2.0 ms before). Picking still
+  follows the drawn strokes.
+- **No corpus flowchart changes.** Over 1 351 flowchart and state sources
+  with a `direction` line, 277 change: crossings 1 110 -> 932, edges
+  through frames 78 -> 54, defects 376 -> 316 (but edges drawn on top of
+  each other 76 -> 106, mostly in hub fans to blocks).
+- **A tidier README:** a table of contents, one section per diagram type in
+  the same shape, and the overview brought up to date.
+
 ### Fixed
 
 - **`direction` inside a subgraph or a state composite is honoured**
@@ -52,6 +79,25 @@ project adheres to [Semantic Versioning](https://semver.org/).
   edges running on top of each other 76 -> 106 of them, mostly in hub
   fans to blocks), and the canvas grows a median 22 % (a row where there
   was a column).
+
+### Documentation
+
+- **README reorganised.** A table of contents and a diagram-type table
+  (header, example file, whether it can be dragged) up front; one section
+  per diagram type in the same shape (example, then a "Supported subset"
+  list), with new sections for user journeys, git graphs and architecture
+  diagrams, which had only a roadmap line; the flowchart syntax split
+  into subsections (shapes, metadata, labels, edges, edge ids, subgraphs,
+  styling, links, accessibility) instead of paragraphs of up to 4 900
+  characters; the interactive API gathered in one place; and the roadmap
+  reduced to a checklist (`$$math$$` was listed three times).
+- **README corrections.** The pipeline overview names what the layout
+  does today (cycle breakers from the walk that reverses fewer edges,
+  subgraph seating, narrowing, compound blocks, the edge-finishing
+  stages) and no longer says hosts must hit-test themselves or that long
+  edges bow sideways. The swimlane text-DSL example now renders: it had a
+  trailing `#` comment, and comments are whole lines only. The
+  sub-element example is now complete.
 
 ## [0.36.0] - 2026-11-09
 
