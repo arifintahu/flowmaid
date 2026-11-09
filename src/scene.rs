@@ -15861,11 +15861,15 @@ mod tests {
 
     #[test]
     fn lr_colliding_labels_grow_their_gap_only_to_the_widest_one() {
-        // Four labels share the gap after `laptop`, and their spans
-        // collide across the flow. They slide apart across it, so the
-        // gap needs room for the widest label — not for a row of
-        // labels laid side by side along the flow (which once more
-        // than doubled it, all of it empty).
+        // Labels share the gap after `laptop`, and their spans collide
+        // across the flow. They slide apart across it, so the gap needs
+        // room for the widest label — not for a row of labels laid side
+        // by side along the flow (which once more than doubled it, all
+        // of it empty). STANDBY, fed from `laptop`, sits in the column
+        // after it with its source `tunnel`, and PROD after STANDBY,
+        // whose `tunnel` leads into it: mermaid's three columns (B8b
+        // P1; `tunnel` used to sit level with `laptop`, its STANDBY
+        // frame spanning `laptop`'s column).
         let sc = assert_clean_geometry(
             "flowchart LR\n\
              subgraph prod[\"PROD\"]\n  direction TB\n  sshd[\"sshd\"]\n  src[\"source\"]\nend\n\
@@ -15877,18 +15881,31 @@ mod tests {
              laptop -->|\"write env, compose, cert\"| static",
         );
         let node = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap();
-        let (laptop, sshd) = (node("laptop"), node("sshd"));
-        let gap = (sshd.x - sshd.w / 2.0) - (laptop.x + laptop.w / 2.0);
+        let frame = |id: &str| sc.clusters.iter().find(|c| c.id == id).unwrap();
+        let laptop = node("laptop");
+        let (standby, prod) = (frame("standby"), frame("prod"));
+        assert!(
+            laptop.x + laptop.w / 2.0 < standby.x,
+            "STANDBY after laptop"
+        );
+        assert!(standby.x + standby.w < prod.x, "PROD after STANDBY");
+        let gap = (laptop.x + laptop.w / 2.0, standby.x);
         let widest = sc
             .edges
             .iter()
-            .filter_map(|e| e.label.as_ref().map(|l| l.2))
+            .filter_map(|e| e.label.as_ref())
+            .filter(|l| gap.0 < l.1 .0 && l.1 .0 < gap.1)
+            .map(|l| l.2)
             .fold(0.0, f64::max);
-        assert!(gap >= widest, "gap {gap} cannot hold a {widest} label");
+        assert!(widest > 0.0, "a label in the gap");
+        assert!(
+            gap.1 - gap.0 >= widest,
+            "gap {gap:?} cannot hold a {widest} label"
+        );
         // Plus the arrowhead the label keeps clear of (report M3).
         assert!(
-            gap <= widest + 2.0 * LABEL_BOX_H + ARROW_MARKER_PX,
-            "gap {gap} for {widest}"
+            gap.1 - gap.0 <= widest + 2.0 * LABEL_BOX_H + ARROW_MARKER_PX,
+            "gap {gap:?} for {widest}"
         );
     }
 
@@ -16101,7 +16118,9 @@ mod tests {
     /// (`nested-composite`). The link end is a pin to the ports stage and
     /// a link keeps the router's corners, so both draw every link alike
     /// from the same centres, and a 1 px drag of a node no link ends on
-    /// moves none of them.
+    /// moves none of them. `routed-around` keeps a link the router draws
+    /// round the nested composite's other state (`dn290`) in the set,
+    /// as `nested-composite`'s `in458` link no longer is (B8b P5).
     #[test]
     fn note_links_hold_their_ends_and_corners_in_scene_route_and_drag() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/notes");
@@ -16111,6 +16130,7 @@ mod tests {
             "nested-composite",
             "straight-link",
             "wide-frames",
+            "routed-around",
         ] {
             let src = std::fs::read_to_string(format!("{dir}/{name}.mmd")).expect("fixture");
             let g = match crate::parser::parse_document(&src).unwrap() {
@@ -16157,9 +16177,24 @@ mod tests {
                 // review r1 #3, the composites read left to right and
                 // the link is a plain curve, which `scene()` and
                 // `route()` bend as they bend any free curve.)
-                let routed = name == "nested-composite"
-                    && !a.waypoints.is_empty()
-                    && (card(&a.from) == Some("in458") || card(&a.to) == Some("in458"));
+                let routed = !a.waypoints.is_empty()
+                    && match name {
+                        "nested-composite" => {
+                            card(&a.from) == Some("in458") || card(&a.to) == Some("in458")
+                        }
+                        "routed-around" => {
+                            card(&a.from) == Some("dn290") || card(&a.to) == Some("dn290")
+                        }
+                        _ => false,
+                    };
+                if name == "routed-around"
+                    && (card(&a.from) == Some("dn290") || card(&a.to) == Some("dn290"))
+                {
+                    assert!(
+                        routed && !elbow_of(a),
+                        "routed-around: dn290's link is no router path"
+                    );
+                }
                 // A straight link (B7 review r1 #4, `straight-link`: a
                 // comb kept in `scene()` and not in `route()` pushed its
                 // pinned end 4.2 px aside): the same line.

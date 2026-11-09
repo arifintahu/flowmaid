@@ -7,6 +7,69 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **A subgraph fed from outside every subgraph starts below its feeder**
+  (report §2.9, B8b P1). 0.35.0 started a subgraph's edge-less members on
+  its first row, but read that row off the members that link out of the
+  subgraph: a member that only links onward (a source) still sat on the
+  drawing's first layer, level with the hub, and dragged the frame up across
+  the hub's row and its edges (a generated hub-and-subgraphs drawing went
+  from no defects to 7, four of its edges through a frame, and 1 938 to
+  3 387 px wide). And once narrowing stacked or folded a subgraph, the
+  ranking-only links it adds joined every member to the hub, so the
+  edge-less members went back to the first layer too. Now a subgraph's
+  first row is the row just below the topmost node outside every subgraph
+  that links into it, and every member nothing links into starts there:
+  edge-less members, chains of their own, members linking onward (to a
+  plain node or into another subgraph), and members leading to one the hub
+  feeds, which then sits a row lower. A node outside the subgraph that only
+  such members link into moves down with them (`nightly job --> mail
+  relay`), and a subgraph they link into follows a row further down, whole,
+  even along a chain of subgraphs (hub → Alpha, Alpha → Beta, Beta →
+  Gamma: one zone per row, as mermaid draws it). Narrowing's stackings rank
+  a subgraph below its sibling but no longer decide where it starts, and
+  leaf staggering no longer lifts a member above its subgraph's first row.
+  Left alone, so the drawing keeps its 0.35.0 layering there: a subgraph fed
+  only from other subgraphs (the dense corpus fixtures: seating there
+  re-laid them, 27 % more drawn crossings and `route()` 40 % slower), a
+  member a cycle breaker reaches from outside, and a subgraph whose seating
+  would move a node outside it that another node also links into (moving
+  it would stretch that node's line: dense-lr would move 25 of its 52
+  nodes a row). No corpus or fixture drawing changes. Over a 5 337-input
+  set, the 96 ordinary flowchart and state diagrams that change (three
+  large random graphs aside) lose most of their defects (static 168 -> 35,
+  0.34.0 had 275; `route()` 166 -> 52), edges through frames (89 -> 16;
+  `route()` 87 -> 17), lines under title chips (48 -> 31) and crossings
+  (364 -> 243). Nine of them gain one or two edges through a frame against
+  0.35.0: eight where the ordering puts a subgraph between two nodes linked
+  to each other — a line from a node in one subgraph to another subgraph
+  placed beyond a third, or two linked plain nodes on either side of a
+  frame that spans their rows — and one (a TB load balancer feeding four
+  tiers) where a dotted line clips the corner of a one-column subgraph whose
+  title fills its top. Two of the nine (a cyclic stress input with dotted
+  links, and a two-hub diagram of zones) are also worse than in 0.34.0,
+  with two edges through a frame where it had none.
+- **Large random graphs keep their cycle breakers in source order** (B8b
+  P2). 0.35.0 took them from whichever of two depth-first walks reversed
+  fewer edges; on a 518-element random graph that shallower layering read
+  as a ribbon and was packed tight (10 368 -> 3 726 px, `route()` edges
+  through nodes 24 -> 71). Graphs of more than 400 nodes and edges now
+  keep the walk in source order and draw as in 0.34.0; smaller ones, where
+  the second walk keeps a drawing off the order its lines are written in,
+  keep the choice. A narrowing step that adds edges through nodes now must
+  save two crossings per such edge. The 1 000-node synthetic benchmark
+  therefore draws as in 0.34.0 again (a 7.9 MB SVG instead of 6.8 MB) and,
+  like 0.34.0, renders 10–20 % slower than 0.35.0 did.
+
+### Documentation
+
+- 0.35.0's note on narrowing mentioned it only in passing: class diagrams
+  share the flowchart layout, and the 2.5 : 1 entry to narrowing re-laid
+  34 of 1 583 generated class diagrams (most equal or better; a dense
+  stress diagram came out 23 % smaller but with one long diagonal line
+  across its bundle). This release changes no class diagram.
+
 ## [0.35.0] - 2026-11-04
 
 ### Highlights
