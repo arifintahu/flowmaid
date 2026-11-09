@@ -924,6 +924,12 @@ struct Measured<'a> {
     /// Scene-cluster indices the edge may enter (ancestors of either
     /// endpoint, and an endpoint frame itself).
     allowed: Vec<usize>,
+    /// Whether the edge is laid out along x (LR / RL): the diagram's
+    /// direction, or a block's own inside a subgraph laid out in its own
+    /// direction (`crate::compound`).
+    horizontal: bool,
+    /// The edge flows towards lower coordinates (BT / RL).
+    reversed: bool,
 }
 
 impl Measured<'_> {
@@ -1010,6 +1016,16 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
         None => Vec::new(),
     };
 
+    // The direction each edge flows in (a block's own inside one).
+    let flows = crate::compound::Flows::new(g);
+    let model_end = |end: Option<End>| match end? {
+        End::Node(n) => Some(crate::model::End::Node(n)),
+        End::Frame(f) => g
+            .subgraphs
+            .iter()
+            .position(|s| s.id == sc.clusters[f].id)
+            .map(crate::model::End::Sub),
+    };
     let edges: Vec<Measured> = sc
         .edges
         .iter()
@@ -1022,7 +1038,13 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
             let (from, to) = (end_of(&e.from), to_of(e));
             let mut allowed = frames_of(from);
             allowed.extend(frames_of(to));
+            let dir = match (model_end(from), model_end(to)) {
+                (Some(a), Some(b)) => flows.of(a, b),
+                _ => g.direction,
+            };
             Measured {
+                horizontal: matches!(dir, Direction::LR | Direction::RL),
+                reversed: matches!(dir, Direction::BT | Direction::RL),
                 idx,
                 e,
                 dense: densify(&pts),
@@ -1601,10 +1623,11 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
         }
     }
 
-    // Wiggles along the flow axis.
+    // Wiggles along the flow axis (each edge's own: a block's inside one).
     let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
-    let along = |p: Pt| if horizontal { p.0 } else { p.1 };
+    let along = |me: &Measured, p: Pt| if me.horizontal { p.0 } else { p.1 };
     for me in &edges {
+        let along = |p: Pt| along(me, p);
         let (mut fwd, mut back) = (0.0f64, 0.0f64);
         for w in me.pts.windows(2) {
             let d = along(w[1]) - along(w[0]);
@@ -1632,7 +1655,7 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
                 let dx = (p.0 - r.0).abs().min((p.0 - r.2).abs());
                 let dy = (p.1 - r.1).abs().min((p.1 - r.3).abs());
                 // Nearest side across the flow = wrong side.
-                let across = if horizontal { dy < dx } else { dx < dy };
+                let across = if me.horizontal { dy < dx } else { dx < dy };
                 if across {
                     m.frame_side += 1;
                     m.details
@@ -1739,13 +1762,10 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
 
     // Sideways reversals (report §2.13): what `wiggles` measures along
     // the flow, across it. A back-edge keeps its deepest excursion.
-    let across = |p: Pt| if horizontal { p.1 } else { p.0 };
-    let flow = if matches!(g.direction, Direction::BT | Direction::RL) {
-        -1.0
-    } else {
-        1.0
-    };
     for me in &edges {
+        let across = |p: Pt| if me.horizontal { p.1 } else { p.0 };
+        let along = |p: Pt| along(me, p);
+        let flow = if me.reversed { -1.0 } else { 1.0 };
         let lat: Vec<f64> = me.pts.iter().map(|&p| across(p)).collect();
         let turns = zigzag(&lat, WIGGLE_TOL);
         let (c0, c1) = (turns[0], turns[turns.len() - 1]);

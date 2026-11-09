@@ -38,6 +38,7 @@ pub mod architecture;
 mod casing;
 pub mod class;
 pub(crate) mod clearance;
+mod compound;
 mod edgepass;
 pub mod emit;
 pub mod er;

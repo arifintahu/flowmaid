@@ -62,6 +62,52 @@ project adheres to [Semantic Versioning](https://semver.org/).
   therefore draws as in 0.34.0 again (a 7.9 MB SVG instead of 6.8 MB) and,
   like 0.34.0, renders 10–20 % slower than 0.35.0 did.
 
+### Fixed
+
+- **`direction` inside a subgraph or a state composite is honoured**
+  (report B3, P0 #10). It used to be read only to keep a subgraph's
+  edge-less members on one row: the showcase's `Validating` composite
+  (`direction LR` in a top-down state diagram) was a 126 × 368 column on a
+  403 × 1 133 canvas, where mermaid draws one row. A subgraph whose own
+  `direction` differs from the one round it is now laid out on its own, in
+  that direction, as one block placed in the drawing like a node the size
+  of its frame (recursively: mermaid's documentation example of `TB`, `RL`
+  and `BT` blocks nested in an `LR` chart draws as mermaid draws it). The
+  rule is mermaid's, for flowcharts and state diagrams alike: the
+  direction holds while none of the subgraph's nodes links to a node
+  outside it — edges to or from the subgraph itself are fine, and meet its
+  frame as they meet any node's border, labelled and ported as usual —
+  and the subgraph takes the direction round it once a member links out,
+  a member links to its own subgraph, or an edge reaches a subgraph nested
+  in it. Members with no links among them keep the row across the flow
+  they already had. `Validating` is now a 413 × 92 row and the canvas 535 ×
+  873 (mermaid: 459 × 109 in 649 × 886); a fork or join bar in such a
+  block lies across the block's own flow. `route()` and `route_partial()`
+  route each block in its own direction too, then the drawing round it
+  with the block's frame as it now stands: dragging a state inside a
+  composite grows the frame and redraws the edges to the frame, and a drag
+  outside a block leaves the block's drawing alone (`route_partial()` on
+  `examples/state.mmd`: 0.5 ms a drag frame on average, 1.6 ms at worst;
+  2.0 ms before). The scene contract is unchanged:
+  nodes index-parallel with the graph, its edges first, then its
+  sub-edges in order, frames outermost-first at their nesting depth, and
+  picking follows the drawn strokes. The quality harness reads an edge
+  inside such a block along the block's direction (`wiggles`,
+  `frame_side`, `lat_wiggles`). No corpus flowchart changes: every
+  subgraph `direction` in the flowchart corpus and quality fixtures is
+  either linked out of (`advanced`, `subgraph`, the dense fixtures) or set
+  on members with no links among them (`fanout-frames`); among the
+  test-suite sources only the first composite-note source changes (its
+  `Outer` composite, `direction TB` in an LR diagram, is now laid out
+  top-down; two of its note links run straight, so the elbow count floor
+  in `note_links_match_between_scene_and_route` is 61, was 63). Over a
+  1 351-input set of flowchart and state sources with a `direction` line,
+  277 change: crossings 1 110 -> 932 (`route()` 1 198 -> 1 100), edges
+  through frames 78 -> 54, defects 376 -> 316 (`route()` 396 -> 366;
+  edges running on top of each other 76 -> 106 of them, mostly in hub
+  fans to blocks), and the canvas grows a median 22 % (a row where there
+  was a column).
+
 ### Documentation
 
 - 0.35.0's note on narrowing mentioned it only in passing: class diagrams
