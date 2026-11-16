@@ -13,6 +13,11 @@ project adheres to [Semantic Versioning](https://semver.org/).
   drawing-quality work has shipped release by release, the subgraph
   layout in progress and its four steps, and what is listed for later.
 
+### Internal
+
+- **Subgraphs as blocks, step 1 of 4** (the tree of blocks, layering,
+  ordering), behind an internal switch that is off: no drawing changes.
+
 ## [0.40.0] - 2026-11-11
 
 ### Highlights

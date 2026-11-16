@@ -3461,13 +3461,343 @@ pub(crate) fn scene_labelled(g: &Graph, sizes: &[(f64, f64)], labels: &[String])
         }
     }
     let sizes = &fit_bars(g, &sizes)[..];
-    let mut sc = if g.subgraphs.is_empty() {
-        scene_flat(g, sizes, labels)
+    let (mut sc, blocks) = if g.subgraphs.is_empty() {
+        #[cfg(test)]
+        crate::levels::note_used(crate::levels::Entry::Scene, g, || false);
+        (scene_flat(g, sizes, labels), None)
     } else {
-        scene_clustered(g, sizes, labels)
+        // The switch of the block layout, read once for this call.
+        scene_clustered(g, sizes, labels, crate::levels::blocks_on())
     };
-    crate::edgepass::finish(g, &mut sc, crate::edgepass::Mode::Static);
+    // (A block layout's edge stages know which upstream edges are lanes.)
+    crate::edgepass::finish_blocks(g, &mut sc, blocks.as_deref());
+    if blocks.is_some() && embrace_own_edges(g, &mut sc) {
+        crate::edgepass::refit(
+            &mut sc,
+            crate::edgepass::Mode::Static,
+            g.edge_paint_width.is_none(),
+        );
+    }
     sc
+}
+
+/// A block layout's frames grown across the flow over the drawn paths
+/// of their own edges (spec 2.7 F3: a frame covers the drawn path of
+/// every edge with both ends in it, plus [`LANE_PAD`]). The layout's
+/// frames already cover the channels it laid inside them; this is the
+/// part only the edge stages decide: an edge between two members of a
+/// block that the router takes round a nested block's title chip, out
+/// past the side walls of the blocks between (blocks/nested-chain:
+/// `a -> c2` round the chip of `Inner target`, out of `Outer` too). The
+/// way it took stays; the block it belongs to grows over it, so the
+/// edge is drawn inside its block, beside the nested ones, as the
+/// channels of a flat layout are (a frame wider by the run and its pad).
+///
+/// A frame grows only where nothing foreign lies in the strip it would
+/// add: no node or frame it does not hold, no edge or label with
+/// neither end inside it, no line within [`crate::clearance::CHIP_SEP`]
+/// of its title chip where the chip moves to; else it stays as it is
+/// (and the edge outside it). Only across the flow: a path that leaves
+/// along the flow is not covered. Returns whether a frame changed.
+fn embrace_own_edges(g: &Graph, sc: &mut Scene) -> bool {
+    use crate::clearance::CHIP_SEP;
+    let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
+    let nc = node_cluster_paths(g);
+    let ne = g.edges.len().min(sc.edges.len());
+    // (breadth lo, breadth hi, layer lo, layer hi) of a screen box.
+    let span = |c: &SceneCluster| {
+        if horizontal {
+            (c.y, c.y + c.h, c.x, c.x + c.w)
+        } else {
+            (c.x, c.x + c.w, c.y, c.y + c.h)
+        }
+    };
+    let flow = |p: (f64, f64)| if horizontal { (p.1, p.0) } else { p };
+    let cluster_of: Vec<Option<usize>> = g
+        .subgraphs
+        .iter()
+        .map(|s| sc.clusters.iter().position(|c| c.id == s.id))
+        .collect();
+    // Per subgraph: the breadth its own edges' drawn paths reach.
+    let mut want: Vec<Option<(f64, f64)>> = vec![None; g.subgraphs.len()];
+    let mut paths: Vec<Option<Vec<(f64, f64)>>> = vec![None; sc.edges.len()];
+    for (i, e) in g.edges.iter().enumerate().take(ne) {
+        if e.from == e.to || !edge_drawn(&sc.edges[i]) {
+            continue;
+        }
+        let common: Vec<usize> = nc[e.from]
+            .iter()
+            .zip(&nc[e.to])
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| *a)
+            .collect();
+        for &s in &common {
+            let Some(k) = cluster_of[s] else { continue };
+            let (b0, b1, l0, l1) = span(&sc.clusters[k]);
+            let pts = paths[i].get_or_insert_with(|| edge_polyline(&sc.edges[i]));
+            for &p in pts.iter() {
+                let (b, l) = flow(p);
+                if l <= l0 || l >= l1 || (b >= b0 && b <= b1) {
+                    continue;
+                }
+                let w = want[s].get_or_insert((b0, b1));
+                w.0 = w.0.min(b - LANE_PAD);
+                w.1 = w.1.max(b + LANE_PAD);
+            }
+        }
+    }
+    if want.iter().all(Option::is_none) {
+        return false;
+    }
+    let depth: Vec<usize> = cluster_of
+        .iter()
+        .map(|k| k.map_or(0, |k| sc.clusters[k].depth))
+        .collect();
+    let ancestors = |s: usize| {
+        let mut out = vec![s];
+        let mut cur = g.subgraphs[s].parent;
+        while let Some(p) = cur {
+            out.push(p);
+            cur = g.subgraphs[p].parent;
+        }
+        out
+    };
+    // Whether scene edge `j` has an end inside subgraph `s`.
+    let end_in = |j: usize, s: usize| -> bool {
+        let e = &sc.edges[j];
+        [&e.from, &e.to].iter().any(|id| {
+            if let Some(v) = g.nodes.iter().position(|n| &n.id == *id) {
+                return nc[v].contains(&s);
+            }
+            g.subgraphs
+                .iter()
+                .position(|t| &t.id == *id)
+                .is_some_and(|t| ancestors(t).contains(&s))
+        })
+    };
+    let lines: Vec<Vec<(f64, f64)>> = sc
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(j, e)| paths[j].take().unwrap_or_else(|| edge_polyline(e)))
+        .collect();
+    let mut boxes: Vec<RawBox> = cluster_of
+        .iter()
+        .map(|k| {
+            k.map(|k| {
+                let c = &sc.clusters[k];
+                (c.x, c.y, c.w, c.h)
+            })
+        })
+        .collect();
+    // Deepest first, so a parent's growth sees its children grown.
+    let mut order: Vec<usize> = (0..g.subgraphs.len())
+        .filter(|&s| want[s].is_some())
+        .collect();
+    order.sort_by_key(|&s| (std::cmp::Reverse(depth[s]), s));
+    let mut changed = false;
+    for s in order {
+        let (Some((w0, w1)), Some((x, y, w, h))) = (want[s], boxes[s]) else {
+            continue;
+        };
+        let mut trial = boxes.clone();
+        trial[s] = Some(if horizontal {
+            let (b0, b1) = (y.min(w0), (y + h).max(w1));
+            (x, b0, w, b1 - b0)
+        } else {
+            let (b0, b1) = (x.min(w0), (x + w).max(w1));
+            (b0, y, b1 - b0, h)
+        });
+        renest_boxes(g, &depth, &mut trial);
+        let fits = (0..g.subgraphs.len()).all(|t| {
+            let (Some(old), Some(new)) = (boxes[t], trial[t]) else {
+                return true;
+            };
+            old == new || strip_is_free(g, sc, &nc, &lines, t, old, new, &end_in)
+        });
+        if !fits {
+            continue;
+        }
+        // The title chips of the frames that moved keep clear of every
+        // line, as the router kept them.
+        let moved_clusters = clusters_of(g, &trial, &depth);
+        let chips_clear = (0..g.subgraphs.len()).all(|t| {
+            if boxes[t] == trial[t] {
+                return true;
+            }
+            let Some(k) = moved_clusters
+                .iter()
+                .position(|c| c.id == g.subgraphs[t].id)
+            else {
+                return true;
+            };
+            let r = title_head(&moved_clusters, k, f64::INFINITY);
+            let r = (
+                r.0 - CHIP_SEP,
+                r.1 - CHIP_SEP,
+                r.2 + CHIP_SEP,
+                r.3 + CHIP_SEP,
+            );
+            lines.iter().all(|pts| {
+                pts.iter()
+                    .all(|p| !(p.0 > r.0 && p.0 < r.2 && p.1 > r.1 && p.1 < r.3))
+            })
+        });
+        if chips_clear {
+            boxes = trial;
+            changed = true;
+        }
+    }
+    if changed {
+        sc.clusters = clusters_of(g, &boxes, &depth);
+    }
+    changed
+}
+
+/// The parts of box `new` outside box `old` (both `(x, y, w, h)`), as
+/// open `(x0, y0, x1, y1)` rects: the strips a frame grown from `old`
+/// to `new` adds on each side ([`strip_is_free`]).
+fn added_strips(old: (f64, f64, f64, f64), new: (f64, f64, f64, f64)) -> Vec<(f64, f64, f64, f64)> {
+    let (o0, o1, o2, o3) = (old.0, old.1, old.0 + old.2, old.1 + old.3);
+    let (n0, n1, n2, n3) = (new.0, new.1, new.0 + new.2, new.1 + new.3);
+    let mut out = Vec::new();
+    if n0 < o0 {
+        out.push((n0, n1, o0.min(n2), n3));
+    }
+    if n2 > o2 {
+        out.push((o2.max(n0), n1, n2, n3));
+    }
+    let (m0, m2) = (n0.max(o0), n2.min(o2));
+    if m0 < m2 {
+        if n1 < o1 {
+            out.push((m0, n1, m2, o1.min(n3)));
+        }
+        if n3 > o3 {
+            out.push((m0, o3.max(n1), m2, n3));
+        }
+    }
+    out
+}
+
+/// Whether the strip that grows frame `t` from `old` to `new` holds
+/// nothing foreign ([`embrace_own_edges`]): no node outside `t`, no
+/// frame that is neither inside `t` nor round it, no stretch of a line
+/// (`lines`, index-parallel with `sc.edges`; each segment, not only its
+/// points: a long straight run crosses the strip between two of them)
+/// or label of an edge with no end inside `t`; and no end of an edge on
+/// `t`'s own frame (a whole block's pin) that the strip would take in:
+/// the edge's head would be left inside the grown frame.
+#[allow(clippy::too_many_arguments)]
+fn strip_is_free(
+    g: &Graph,
+    sc: &Scene,
+    nc: &[Vec<usize>],
+    lines: &[Vec<(f64, f64)>],
+    t: usize,
+    old: (f64, f64, f64, f64),
+    new: (f64, f64, f64, f64),
+    end_in: &dyn Fn(usize, usize) -> bool,
+) -> bool {
+    let within = |r: (f64, f64, f64, f64), p: (f64, f64)| {
+        p.0 > r.0 && p.0 < r.0 + r.2 && p.1 > r.1 && p.1 < r.1 + r.3
+    };
+    let meets = |a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)| {
+        a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+    };
+    let added = |p: (f64, f64)| within(new, p) && !within(old, p);
+    let strips = added_strips(old, new);
+    let crosses_strip = |pts: &[(f64, f64)]| {
+        pts.iter().any(|&p| added(p))
+            || pts.windows(2).any(|s| {
+                strips
+                    .iter()
+                    .any(|&r| crate::layout::seg_hits_box(s[0], s[1], r))
+            })
+    };
+    for (v, n) in sc.nodes.iter().enumerate() {
+        let r = (n.x - n.w / 2.0, n.y - n.h / 2.0, n.w, n.h);
+        if !nc[v].contains(&t) && meets(new, r) && !meets(old, r) {
+            return false;
+        }
+    }
+    for (u, c) in sc.clusters.iter().enumerate() {
+        let Some(ui) = g.subgraphs.iter().position(|s| s.id == c.id) else {
+            continue;
+        };
+        let related = {
+            let mut cur = Some(ui);
+            let mut inside = false;
+            while let Some(p) = cur {
+                inside |= p == t;
+                cur = g.subgraphs[p].parent;
+            }
+            let mut cur = Some(t);
+            let mut round = false;
+            while let Some(p) = cur {
+                round |= p == ui;
+                cur = g.subgraphs[p].parent;
+            }
+            inside || round
+        };
+        let r = (sc.clusters[u].x, c.y, c.w, c.h);
+        if !related && meets(new, r) && !meets(old, r) {
+            return false;
+        }
+    }
+    let own_id = &g.subgraphs[t].id;
+    for (j, e) in sc.edges.iter().enumerate() {
+        if end_in(j, t) {
+            // Its line belongs inside; only an end on this frame itself
+            // must stay on the border.
+            let pts = &lines[j];
+            let pinned =
+                |id: &String, p: Option<&(f64, f64)>| id == own_id && p.is_some_and(|&p| added(p));
+            if pinned(&e.from, pts.first()) || pinned(&e.to, pts.last()) {
+                return false;
+            }
+            continue;
+        }
+        if crosses_strip(&lines[j]) {
+            return false;
+        }
+        if let Some((_, m, w)) = &e.label {
+            let r = (m.0 - w / 2.0, m.1 - LABEL_BOX_H / 2.0, *w, LABEL_BOX_H);
+            if meets(new, r) && !meets(old, r) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether the block layout of subgraphs applies to `g` once it is
+/// switched on ([`crate::levels`]): `g`, or one of the parts it is laid
+/// out as when a subgraph sets its own direction ([`crate::compound`]),
+/// has a link across a subgraph's border. Each part is decided on its
+/// own, as [`scene`], [`route`] and [`route_partial`] lay it out.
+pub(crate) fn block_mode(g: &Graph) -> bool {
+    crate::compound::any_part(g, &|part| {
+        !part.subgraphs.is_empty() && crate::levels::Augmented::of(part).block_mode(part)
+    })
+}
+
+/// How a clustered graph `g` (one part of a diagram: no subgraph of it
+/// sets its own direction) is layered as blocks and as before blocks;
+/// `None` for a flat graph. For reports and tests.
+pub(crate) fn layerings(g: &Graph) -> Option<crate::layout::Layerings> {
+    if g.subgraphs.is_empty() {
+        return None;
+    }
+    let aug = crate::levels::Augmented::of(g);
+    let rank_only = aug.rank_only();
+    let (ga, stand_in) = aug.graph(g);
+    let links = aug.block_links(&stand_in, ga.edges.len());
+    Some(crate::layout::layerings(
+        &ga,
+        &aug.node_cluster,
+        &rank_only,
+        &links,
+    ))
 }
 
 /// A flat diagram's scene as its builder draws it, before the edge
@@ -3482,7 +3812,7 @@ pub(crate) fn built(g: &Graph) -> Scene {
 /// The classic single-level pipeline (no subgraphs).
 fn scene_flat(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene {
     let lo = layout_sized(g, sizes);
-    let lanes = static_lanes(g, &lo, None, g.edges.len());
+    let lanes = static_lanes(g, &lo, None, None, g.edges.len());
     let mut sc = scene_from_layout(g, sizes, labels, lo, &lanes, g.edges.len());
     let moved = avoid_label_overlaps(&sc.nodes, &[], &mut sc.edges, LABEL_STATIC_WORK);
     fit_moved_labels(&mut sc, &moved);
@@ -3493,11 +3823,14 @@ fn scene_flat(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene {
 /// `lo`'s abstract coordinates:
 /// planned on the layers as the layout planned them
 /// ([`crate::layout::back_lanes`]). Only the first `real` edges get one
-/// (the rest are `scene_clustered`'s stand-ins).
+/// (the rest are `scene_clustered`'s stand-ins). In a block layout
+/// (`blocks`, its [`crate::layout::BlockPaths`]) only an upstream edge
+/// between two plain nodes of one level has a lane.
 fn static_lanes(
     g: &Graph,
     lo: &LayoutResult,
     node_cluster: Option<&[Vec<usize>]>,
+    blocks: Option<&[Vec<usize>]>,
     real: usize,
 ) -> Vec<Option<crate::lanes::Lane>> {
     // The nodes with their layer index as `l`, and each channel's dummies
@@ -3535,7 +3868,8 @@ fn static_lanes(
         })
         .collect();
     let mut v = vec![None; g.edges.len()];
-    for (ei, lane) in crate::layout::back_lanes(g, &at, node_cluster, &chains, |d| dummies[d]) {
+    let lanes = crate::layout::back_lanes(g, &at, node_cluster, blocks, &chains, |d| dummies[d]);
+    for (ei, lane) in lanes {
         if ei < real {
             v[ei] = Some(lane);
         }
@@ -3829,7 +4163,7 @@ const TITLE_INSET: f64 = 6.0;
 /// Height of the strip a cluster title chip occupies at the frame top.
 const TITLE_STRIP: f64 = 21.0;
 /// Half-width of the strip a channel lane needs inside its cluster box.
-const LANE_PAD: f64 = 12.0;
+pub(crate) const LANE_PAD: f64 = 12.0;
 /// A subgraph needs at least this many members fed only by one outside
 /// node before they are packed into a grid instead of sharing one rank.
 const GRID_MIN_MEMBERS: usize = 3;
@@ -3842,36 +4176,30 @@ const GRID_MIN_EDGELESS: usize = 4;
 /// contiguous, then wrap each subgraph around its final members. This
 /// keeps cross-cluster edges ordered globally so they route through the
 /// gaps between boxes instead of tangling straight through them.
-fn scene_clustered(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene {
-    let node_cluster = node_cluster_paths(g);
-    let grid = grid_pairs(g, &node_cluster);
-    let proxies = sub_edge_proxies(g, &node_cluster, &grid);
-    let mut rank_only = proxies.clone();
-    rank_only.extend_from_slice(&grid);
+///
+/// With `blocks` (the block layout is switched on) a graph with a link
+/// across a subgraph's border is laid out as blocks
+/// ([`crate::levels::Augmented::block_mode`]).
+fn scene_clustered(
+    g: &Graph,
+    sizes: &[(f64, f64)],
+    labels: &[String],
+    blocks: bool,
+) -> (Scene, Option<crate::layout::BlockPaths>) {
     // Each sub-edge also gets one routed STAND-IN edge between a proxy
     // pair — mermaid lays `A --> box` out as an edge to one of the box's
     // members — so it owns a channel (and label slot) through the ranks
     // it spans; it is cut back to the frame when drawn. `ga` is `g` plus
-    // those edges, appended after the real ones.
+    // those edges, appended after the real ones
+    // ([`crate::levels::Augmented`], the one constructor of both).
+    let aug = crate::levels::Augmented::of(g);
+    let block_mode = blocks && aug.block_mode(g);
+    let rank_only = aug.rank_only();
     let ne = g.edges.len();
-    let mut ga = g.clone();
-    let mut stand_in: Vec<Option<usize>> = vec![None; g.sub_edges.len()];
-    for (i, (e, (from, to))) in g.sub_edges.iter().zip(&proxies).enumerate() {
-        let Some(&a) = from.first() else { continue };
-        let Some(&b) = to.iter().find(|&&b| b != a) else {
-            continue;
-        };
-        stand_in[i] = Some(ga.edges.len());
-        ga.edges.push(Edge {
-            from: a,
-            to: b,
-            label: e.label.clone(),
-            kind: e.kind,
-            ends: e.ends,
-            meta: e.meta.clone(),
-            end_room: (0.0, 0.0),
-        });
-    }
+    let (mut ga, stand_in) = aug.graph(g);
+    // Block mode goes to the layout with the augmented graph.
+    ga.block_links = block_mode.then(|| aug.block_links(&stand_in, ga.edges.len()));
+    let (node_cluster, proxies) = (aug.node_cluster, aug.proxies);
     // A member's edge to its own box is drawn as its stand-in, whole:
     // an edge to the box's entry member (see `own_box_targets`).
     let own_drawn: Vec<bool> = g
@@ -3918,9 +4246,38 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene 
         };
         ga.frame_cut[ei] = [cut(g.sub_edges[i].from), cut(g.sub_edges[i].to)];
     }
-    let (lo, groups) = layout_clustered_ranked(&ga, sizes, &node_cluster, &rank_only);
-    let lanes = static_lanes(&ga, &lo, Some(&node_cluster), ne);
+    let (lo, groups, blocks) = layout_clustered_ranked(&ga, sizes, &node_cluster, &rank_only);
+    // (A block layout's jog room per frame: `layout::title_jogs`.)
+    let (block_paths, title_jog) = match blocks {
+        Some((paths, jog)) => (Some(paths), jog),
+        None => (None, Vec::new()),
+    };
+    // (What the layout did, not what it was asked: a test compares it
+    // with what the other entry points decide.)
+    #[cfg(test)]
+    crate::levels::note_used(crate::levels::Entry::Scene, g, || block_paths.is_some());
+    let lanes = static_lanes(&ga, &lo, Some(&node_cluster), block_paths.as_deref(), ne);
     let mut sc = scene_from_layout(&ga, sizes, labels, lo, &lanes, ne);
+    // A block layout's chain carries its label at the slot the layout
+    // sized for it: the middle of its run between the end blocks
+    // ([`crate::layout::label_slot`]), not the middle of the whole chain.
+    if block_paths.is_some() {
+        for (ei, (ge, se)) in ga.edges.iter().zip(sc.edges.iter_mut()).enumerate() {
+            let (Some(label), false) = (se.label.as_mut(), groups[ei].is_empty()) else {
+                continue;
+            };
+            let common: Vec<usize> = node_cluster[ge.from]
+                .iter()
+                .zip(&node_cluster[ge.to])
+                .take_while(|(a, b)| a == b)
+                .map(|(a, _)| *a)
+                .collect();
+            let slot = crate::layout::label_slot(&groups[ei], &common);
+            if let Some(&at) = se.waypoints.get(slot + 1) {
+                label.1 = at;
+            }
+        }
+    }
     let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
 
     // Wrap boxes around the laid-out members, then widen each box to
@@ -3935,7 +4292,7 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene 
     // y in LR/RL).
     let frames: Vec<RawBox>;
     sc.clusters = {
-        let (mut boxes, depth) = cluster_raw_boxes(g, &sc.nodes);
+        let (mut boxes, depth) = cluster_boxes_with_jogs(g, &sc.nodes, &title_jog);
         // Member-only boxes: what a widened frame must stay clear of.
         let raw = boxes.clone();
         for si in 0..g.subgraphs.len() {
@@ -4008,7 +4365,7 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene 
     // rank gap the layout left, not diagonally across other nodes.
     let stand_edges = sc.edges.split_off(ne);
     if !g.sub_edges.is_empty() {
-        let (raw, _) = cluster_raw_boxes(g, &sc.nodes);
+        let (raw, _) = cluster_boxes_with_jogs(g, &sc.nodes, &title_jog);
         let end_placed = |end: End| -> Option<(Placed, Shape)> {
             match end {
                 End::Node(v) => Some((
@@ -4097,6 +4454,7 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene 
                     &frames,
                     e.from,
                     e.to,
+                    block_paths.is_some(),
                 )
             });
             let (pts, wps) = match routed {
@@ -4160,7 +4518,7 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene 
         sc.width = (maxx - minx) + 2.0 * MARGIN;
         sc.height = (maxy - miny) + 2.0 * MARGIN;
     }
-    sc
+    (sc, block_paths)
 }
 
 /// A stand-in's routed waypoints (screen coordinates) cut back to the
@@ -4170,24 +4528,41 @@ fn scene_clustered(g: &Graph, sizes: &[(f64, f64)], labels: &[String]) -> Scene 
 /// (kept within the frame). `None` without a channel, or when the run
 /// doesn't cross the side (the boxes aren't stacked along the flow) or
 /// too little of it is left to curve.
+///
+/// In a block layout (`blocks`) a channel that runs against the flow —
+/// the stand-in of an edge the layering turned — is cut the same way,
+/// seen from the other end of the flow: it leaves its source box by the
+/// upstream side and enters its target box by the downstream one.
+/// (Refused like a channel that turns back, the edge was drawn as one
+/// curve from frame to frame, straight through whatever block stood
+/// between: a state diagram's `Running --> Idle` through the composite
+/// between the two.)
 fn cut_to_frames(
     dir: Direction,
     wps: &[(f64, f64)],
     frames: &[RawBox],
     from: End,
     to: End,
+    blocks: bool,
 ) -> Option<Vec<(f64, f64)>> {
     if wps.len() < 3 {
         return None;
     }
+    let mut pts: Vec<(f64, f64)> = wps.iter().map(|&p| to_flow(dir, p)).collect();
+    // Against the flow all the way, in a block layout: mirrored along
+    // the flow, it is a channel running forward.
+    let up = blocks
+        && pts.windows(2).all(|w| w[1].1 <= w[0].1)
+        && pts.first().zip(pts.last()).is_some_and(|(a, b)| b.1 < a.1);
+    let turn = |(b, l): (f64, f64)| if up { (b, -l) } else { (b, l) };
     // Flow-space extent of a box end: (breadth lo, hi, layer lo, hi).
     let span = |end: End| -> Option<Option<(f64, f64, f64, f64)>> {
         match end {
             End::Node(_) => Some(None),
             End::Sub(s) => {
                 let (x, y, w, h) = frames.get(s).copied().flatten()?;
-                let (b0, l0) = to_flow(dir, (x, y));
-                let (b1, l1) = to_flow(dir, (x + w, y + h));
+                let (b0, l0) = turn(to_flow(dir, (x, y)));
+                let (b1, l1) = turn(to_flow(dir, (x + w, y + h)));
                 Some(Some((b0.min(b1), b0.max(b1), l0.min(l1), l0.max(l1))))
             }
         }
@@ -4196,7 +4571,9 @@ fn cut_to_frames(
     let clamp = |b: f64, (b0, b1, _, _): (f64, f64, f64, f64)| {
         b.max(b0 + SUB_PAD).min((b1 - SUB_PAD).max(b0 + SUB_PAD))
     };
-    let mut pts: Vec<(f64, f64)> = wps.iter().map(|&p| to_flow(dir, p)).collect();
+    for p in pts.iter_mut() {
+        *p = turn(*p);
+    }
     // The channel runs forward along the flow, or this isn't one.
     if pts.windows(2).any(|w| w[1].1 < w[0].1) {
         return None;
@@ -4222,7 +4599,7 @@ fn cut_to_frames(
     if pts.len() < 3 {
         return None;
     }
-    Some(pts.into_iter().map(|p| from_flow(dir, p)).collect())
+    Some(pts.into_iter().map(|p| from_flow(dir, turn(p))).collect())
 }
 
 /// A straight stub between member `n` and the frame `f` of a box
@@ -4392,7 +4769,11 @@ fn sub_edge_ported(
 /// box), as SOURCE for its exit members (no out-edge to inside it).
 /// `grid` pairs count as internal edges, so a packed box is entered
 /// through its first row only. One group per entry of `g.sub_edges`.
-fn sub_edge_proxies(g: &Graph, node_cluster: &[Vec<usize>], grid: &[RankGroup]) -> Vec<RankGroup> {
+pub(crate) fn sub_edge_proxies(
+    g: &Graph,
+    node_cluster: &[Vec<usize>],
+    grid: &[RankGroup],
+) -> Vec<RankGroup> {
     if g.sub_edges.is_empty() {
         return Vec::new();
     }
@@ -4570,7 +4951,7 @@ fn cycle_ends(
 /// flow (`direction LR` in a TB chart): there one row is what the
 /// author asked for. Each pair is a one-to-one [`RankGroup`].
 /// `node_cluster` holds each node's [`node_cluster_paths`] entry.
-fn grid_pairs(g: &Graph, node_cluster: &[Vec<usize>]) -> Vec<RankGroup> {
+pub(crate) fn grid_pairs(g: &Graph, node_cluster: &[Vec<usize>]) -> Vec<RankGroup> {
     let horizontal = |d: Direction| matches!(d, Direction::LR | Direction::RL);
     let n = g.nodes.len();
     // Per node: an out-edge or box edge (never loose), and its in-edge
@@ -4650,7 +5031,7 @@ fn clustered_drawn_edges(g: &Graph, node_cluster: &[Vec<usize>]) -> usize {
 
 /// Cluster path (outermost subgraph id first) for every node; empty
 /// for a top-level node. Constrains the global clustered layout.
-fn node_cluster_paths(g: &Graph) -> Vec<Vec<usize>> {
+pub(crate) fn node_cluster_paths(g: &Graph) -> Vec<Vec<usize>> {
     let mut owner: Vec<Option<usize>> = vec![None; g.nodes.len()];
     for (si, s) in g.subgraphs.iter().enumerate() {
         for &v in &s.nodes {
@@ -4837,9 +5218,23 @@ pub(crate) fn route_fitted(
     sizes: &[(f64, f64)],
     labels: &[String],
 ) -> Scene {
+    #[cfg(test)]
+    crate::levels::note_used(crate::levels::Entry::Route, g, || block_mode_decided(g));
     let mut sc = route_built(g, centers, sizes, labels, true);
     crate::edgepass::finish(g, &mut sc, crate::edgepass::Mode::Routed);
     sc
+}
+
+/// The block mode `route()` and `route_partial()` decide for the one
+/// part `g` (never split further): the switch and the predicate
+/// `scene()` asks the layout with, from the same constructor. Neither
+/// acts on it before it routes in corridors; the record says which
+/// parts they will, against what `scene()`'s layout did.
+#[cfg(test)]
+fn block_mode_decided(g: &Graph) -> bool {
+    crate::levels::blocks_on()
+        && !g.subgraphs.is_empty()
+        && crate::levels::Augmented::of(g).block_mode(g)
 }
 
 /// The scene [`route_sized`] draws before the edge stages: free curves
@@ -5340,6 +5735,8 @@ pub(crate) fn route_partial_with(
         return crate::compound::route_partial(g, &split, centers, base, base_centers)
             .unwrap_or_else(|| route(g, centers));
     }
+    #[cfg(test)]
+    crate::levels::note_used(crate::levels::Entry::Partial, g, || block_mode_decided(g));
     // Each label wrapped once for the frame (the fallbacks below reuse it).
     let (labels, mut raw_sizes) = crate::layout::node_texts(g);
     for &(v, size, _) in sized {
@@ -5784,6 +6181,17 @@ fn seg_meets_rect(a: (f64, f64), b: (f64, f64), r: (f64, f64, f64, f64)) -> bool
 /// parent encloses its children's boxes. `None` = empty subgraph.
 /// Also returns each subgraph's nesting depth.
 fn cluster_raw_boxes(g: &Graph, nodes: &[SceneNode]) -> (Vec<RawBox>, Vec<usize>) {
+    cluster_boxes_with_jogs(g, nodes, &[])
+}
+
+/// [`cluster_raw_boxes`] with each frame grown on its title side by its
+/// block layout's jog room (`jog`, by subgraph; missing entries 0: see
+/// `layout::title_jogs`), its ancestors wrapping the grown box.
+fn cluster_boxes_with_jogs(
+    g: &Graph,
+    nodes: &[SceneNode],
+    jog: &[f64],
+) -> (Vec<RawBox>, Vec<usize>) {
     let nsub = g.subgraphs.len();
     let mut depth = vec![0usize; nsub];
     for i in 0..nsub {
@@ -5815,11 +6223,14 @@ fn cluster_raw_boxes(g: &Graph, nodes: &[SceneNode]) -> (Vec<RawBox>, Vec<usize>
             continue; // empty subgraph: nothing to wrap
         }
         let (minx, maxx, miny, maxy) = bb.finish();
+        // (Summed in this order, as before the jog room: without one the
+        // box is the same to the last bit.)
+        let jog = jog.get(i).copied().unwrap_or(0.0);
         boxes[i] = Some((
             minx - SUB_PAD,
-            miny - SUB_PAD - SUB_HEADER - title_extra(&g.subgraphs[i].title),
+            miny - SUB_PAD - SUB_HEADER - title_extra(&g.subgraphs[i].title) - jog,
             (maxx - minx) + 2.0 * SUB_PAD,
-            (maxy - miny) + 2.0 * SUB_PAD + SUB_HEADER + title_extra(&g.subgraphs[i].title),
+            (maxy - miny) + 2.0 * SUB_PAD + SUB_HEADER + title_extra(&g.subgraphs[i].title) + jog,
         ));
     }
     (boxes, depth)
@@ -8704,6 +9115,7 @@ fn route_backs(g: &Graph, flow: &[Placed]) -> Vec<Back> {
                 label_half: label / 2.0,
                 spans: [port_span(sa, a), port_span(sb, b)],
                 ends: (e.from, e.to),
+                corridor: (f64::NEG_INFINITY, f64::INFINITY),
             }
         })
         .collect();
@@ -10118,6 +10530,56 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn a_frame_grows_only_over_a_strip_nothing_foreign_crosses() {
+        // `embrace_own_edges`' test of the strip a frame would add: a
+        // foreign line counts by its segments (a long straight run
+        // crosses the strip between two of its points), and an edge to
+        // the whole block whose end sits on the side that moves keeps the
+        // frame where it is (its head would be left inside).
+        let src = "flowchart TD\nsubgraph S[S]\na --> b\nend\nc --> S\nd --> e";
+        let g = crate::parser::parse(src).unwrap();
+        let sc = scene(&g);
+        let nc = node_cluster_paths(&g);
+        let k = sc.clusters.iter().position(|c| c.id == "S").unwrap();
+        let c = &sc.clusters[k];
+        let old = (c.x, c.y, c.w, c.h);
+        // Two px more on the left: nothing of the drawing lies there.
+        let new = (c.x - 2.0, c.y, c.w + 2.0, c.h);
+        assert_eq!(
+            added_strips(old, new),
+            vec![(c.x - 2.0, c.y, c.x, c.y + c.h)]
+        );
+        let edge_of = |from: &str, to: &str| {
+            sc.edges
+                .iter()
+                .position(|e| e.from == from && e.to == to)
+                .unwrap_or_else(|| panic!("{from} -> {to}"))
+        };
+        let (own, pin, foreign) = (edge_of("a", "b"), edge_of("c", "S"), edge_of("d", "e"));
+        let end_in = |j: usize, _t: usize| j == own || j == pin;
+        let mid = c.y + c.h / 2.0;
+        let free =
+            |lines: &[Vec<(f64, f64)>]| strip_is_free(&g, &sc, &nc, lines, 0, old, new, &end_in);
+        let mut lines = vec![Vec::new(); sc.edges.len()];
+        assert!(free(&lines));
+        // A foreign run across the strip, its two points outside it.
+        lines[foreign] = vec![(c.x - 50.0, mid), (c.x + c.w + 50.0, mid)];
+        assert!(!free(&lines));
+        // The same run beside the strip.
+        lines[foreign] = vec![(c.x - 50.0, mid), (c.x - 10.0, mid)];
+        assert!(free(&lines));
+        // An edge to the whole block ending on the side that moves.
+        lines[pin] = vec![(c.x - 40.0, mid), (c.x, mid)];
+        assert!(!free(&lines));
+        // ... and on a side that stays.
+        lines[pin] = vec![(c.x + c.w / 2.0, c.y - 40.0), (c.x + c.w / 2.0, c.y)];
+        assert!(free(&lines));
+        // The block's own edge may lie in the strip.
+        lines[own] = vec![(c.x - 1.0, mid - 5.0), (c.x - 1.0, mid + 5.0)];
+        assert!(free(&lines));
+    }
+
     use crate::layout::{intrinsic_size, LINE_H};
     use crate::parser::parse;
 
@@ -11383,7 +11845,28 @@ mod tests {
                     } else {
                         [cur, pts[0], pts[1], end]
                     };
-                    out.extend((1..=64).map(|k| cubic_at(&b, k as f64 / 64.0)));
+                    // 64 even steps of the parameter, each split further
+                    // where it spans more than four steps of `step`: a long
+                    // cubic whose first control point lies far along it
+                    // moves fast near its start, and the even steps left
+                    // a 5 px hole there (bench-75 as blocks: a probe 1 px
+                    // off a straight cubic leg read as 2 px clear).
+                    let mut prev = cur;
+                    for k in 1..=64 {
+                        let p = cubic_at(&b, k as f64 / 64.0);
+                        let gap = (p.0 - prev.0).hypot(p.1 - prev.1);
+                        let m = if gap > 4.0 * step {
+                            (gap / step).ceil() as usize
+                        } else {
+                            1
+                        };
+                        for j in 1..m {
+                            let t = (k as f64 - 1.0 + j as f64 / m as f64) / 64.0;
+                            out.push(cubic_at(&b, t));
+                        }
+                        out.push(p);
+                        prev = p;
+                    }
                 }
             }
             cur = end;
@@ -11406,7 +11889,12 @@ mod tests {
         // `route()` draws it and under a drag (`route_partial`), where
         // edges come to lie on one another (B11 review r1 #2).
         let root = env!("CARGO_MANIFEST_DIR");
-        let mut files: Vec<std::path::PathBuf> = ["tests/fixtures/quality", "examples"]
+        let dirs = [
+            "tests/fixtures/quality",
+            "tests/fixtures/blocks",
+            "examples",
+        ];
+        let mut files: Vec<std::path::PathBuf> = dirs
             .iter()
             .flat_map(|d| std::fs::read_dir(format!("{root}/{d}")).unwrap())
             .map(|f| f.unwrap().path())
@@ -17794,7 +18282,12 @@ mod tests {
     /// The `.mmd` fixtures every scene-wide test walks.
     fn fixture_files() -> Vec<std::path::PathBuf> {
         let root = env!("CARGO_MANIFEST_DIR");
-        let mut files: Vec<std::path::PathBuf> = ["tests/fixtures/quality", "examples"]
+        let dirs = [
+            "tests/fixtures/quality",
+            "tests/fixtures/blocks",
+            "examples",
+        ];
+        let mut files: Vec<std::path::PathBuf> = dirs
             .iter()
             .flat_map(|d| std::fs::read_dir(format!("{root}/{d}")).unwrap())
             .map(|f| f.unwrap().path())

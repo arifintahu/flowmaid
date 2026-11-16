@@ -119,6 +119,26 @@ pub const FAN_PITCH_TOL: f64 = 2.0;
 /// it, and a leg whose ends differ by less than this on one axis runs
 /// along it: how a straight edge, an S and a bow are told apart.
 pub const STRAIGHT_TOL: f64 = 0.5;
+/// A straight run of a drawn edge continues while a segment turns less
+/// than this (degrees) and stays within [`RUN_OFF`] of the run's line —
+/// how `bends_max` tells a leg from a corner's rounding.
+pub const RUN_TURN: f64 = 1.5;
+/// See [`RUN_TURN`] (px).
+pub const RUN_OFF: f64 = 0.75;
+/// Straight runs at least this long (px) are the legs `bends_max`
+/// counts the bends between: a corner's rounding is a string of shorter
+/// ones.
+pub const BEND_RUN_MIN: f64 = 8.0;
+/// `detour_max` reads edges at least this long (px): on a short edge a
+/// port a few px off its partner is no detour.
+pub const DETOUR_MIN_LEN: f64 = 200.0;
+/// Two sibling frames sit side by side when their extents along the
+/// flow overlap by more than this (px).
+pub const SIDE_MIN: f64 = 1.0;
+/// Two side-by-side sibling frames are level when one's extent along
+/// the flow contains the other's within this (px); else they are
+/// staggered (`sib_stagger`).
+pub const STAGGER_SLACK: f64 = 2.0;
 
 /// How a metric folds across many diagrams in a totals row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +370,76 @@ pub struct Metrics {
     /// counted: that end stays where its partner lies, and the others
     /// space round it (report M3).
     pub fan_uneven: usize,
+    /// Largest frame area over the box areas of the nodes inside it
+    /// (members of nested frames included): how much air a subgraph's
+    /// frame holds. 1 would be no air at all; a one-row block of
+    /// text-sized nodes is about 2 to 3.5. 0 without frames.
+    pub compact_max: f64,
+    /// Mean of that ratio over the frames (0 without frames).
+    pub compact_mean: f64,
+    /// Largest share of the canvas one frame takes along the flow
+    /// (frame extent / canvas extent; 0 without frames).
+    pub span_max: f64,
+    /// Pairs of sibling frames side by side along the flow (their
+    /// extents overlap by more than [`SIDE_MIN`]) where neither extent
+    /// contains the other within [`STAGGER_SLACK`]: interleaved, not one
+    /// level band.
+    pub sib_stagger: usize,
+    /// Frame titles drawn cut to an ellipsis (`scene::fit_cluster_title`).
+    pub title_cut: usize,
+    /// Total length of the drawn edges (px), each as painted.
+    pub edge_len: f64,
+    /// Most bends on one edge: its straight runs of [`BEND_RUN_MIN`] or
+    /// more ([`RUN_TURN`], [`RUN_OFF`]) less one.
+    pub bends_max: usize,
+    /// Largest drawn length over the Manhattan distance of the two drawn
+    /// ends, over the edges at least [`DETOUR_MIN_LEN`] long (0 when
+    /// there is none): how far round an edge goes.
+    pub detour_max: f64,
+    /// Mean distance (px, along its edge) from a label to the nearer end
+    /// of the edge (0 without labels).
+    pub lbl_end_mean: f64,
+    /// Edge labels with a stroke of another edge nearer than
+    /// [`CLEAR_GAP`] to their chip: labels in a corridor of lines that
+    /// cannot be told apart at a glance. (`lbl_crowd` counts pairs of
+    /// labels close to each other, another thing.)
+    pub chip_crowd: usize,
+    /// Smallest distance (px) from a label's chip to another edge's
+    /// stroke (0 = touched or struck; higher is better; capped at
+    /// [`GAP_PROBE`], which a drawing without labels reports).
+    pub chip_gap_min: f64,
+    /// Pairs of sibling frames side by side along the flow (as
+    /// `sib_stagger` reads them) that an edge joins, one end in or on
+    /// each: in a block layout two linked blocks are stacked.
+    pub sib_side_linked: usize,
+    /// Crossings of a frame's border through a lateral side (left or
+    /// right in TD / BT, top or bottom in LR / RL) by an edge with
+    /// exactly one end in or on that frame; a note's link counts. In a
+    /// block layout an edge crosses a frame through a side that faces
+    /// the flow.
+    pub lateral_x: usize,
+    /// Upstream edges with a block end (the far end lies wholly before
+    /// the near one along the flow, and the two lie in different
+    /// subgraphs or one is a subgraph) that do not leave their source
+    /// through its upstream side: returns drawn round as lanes, where a
+    /// block layout runs them straight up a channel. A note's link is
+    /// not counted.
+    pub up_lanes: usize,
+    /// Ends of edges with a block end (as `up_lanes` reads it, either
+    /// way along the flow) that meet their node on a lateral side. A
+    /// note's link is not counted, nor a lane between two nodes of one
+    /// level, nor a self-loop.
+    pub side_ends: usize,
+    /// Edges that should be one straight line and are not: `u -> v`
+    /// where `v` is `u`'s only link on its downstream side, `u` is
+    /// `v`'s only link on its upstream side (stand-ins of edges to a
+    /// subgraph count as links) and no node's centre lies between the
+    /// two along the flow, drawn with a bend or with its ends more than
+    /// [`STRAIGHT_TOL`] apart across the flow.
+    pub spine_off: usize,
+    /// Edge ends on a frame within a port's spacing (`PORT_SPACING`) of
+    /// one of its corners.
+    pub pin_corner: usize,
     /// One line per node/frame crossing, parallel overlap, close edge
     /// pair, label on a node or arrowhead, wiggle, wrong frame side and
     /// shared port, naming the elements (`from->to kind other`), for
@@ -450,8 +540,48 @@ impl Metrics {
             ("xhops", self.xhops as f64, Sum),
             ("fan_x", self.fan_x as f64, Sum),
             ("fan_uneven", self.fan_uneven as f64, Sum),
+            ("compact_max", self.compact_max, Max),
+            ("compact_mean", self.compact_mean, Mean),
+            ("span_max", self.span_max, Max),
+            ("sib_stagger", self.sib_stagger as f64, Sum),
+            ("title_cut", self.title_cut as f64, Sum),
+            ("edge_len", self.edge_len, Sum),
+            ("bends_max", self.bends_max as f64, Max),
+            ("detour_max", self.detour_max, Max),
+            ("lbl_end_mean", self.lbl_end_mean, Mean),
+            ("chip_crowd", self.chip_crowd as f64, Sum),
+            ("chip_gap_min", self.chip_gap_min, Min),
+            ("sib_side_linked", self.sib_side_linked as f64, Sum),
+            ("lateral_x", self.lateral_x as f64, Sum),
+            ("up_lanes", self.up_lanes as f64, Sum),
+            ("side_ends", self.side_ends as f64, Sum),
+            ("spine_off", self.spine_off as f64, Sum),
+            ("pin_corner", self.pin_corner as f64, Sum),
         ]
     }
+
+    /// The block-shape and edge-shape columns of [`Metrics::tail_fields`]
+    /// (from `compact_max` on): measures of how a drawing with subgraphs
+    /// is laid out, gated per fixture rather than as totals.
+    pub const BLOCK_FIELDS: [&'static str; 17] = [
+        "compact_max",
+        "compact_mean",
+        "span_max",
+        "sib_stagger",
+        "title_cut",
+        "edge_len",
+        "bends_max",
+        "detour_max",
+        "lbl_end_mean",
+        "chip_crowd",
+        "chip_gap_min",
+        "sib_side_linked",
+        "lateral_x",
+        "up_lanes",
+        "side_ends",
+        "spine_off",
+        "pin_corner",
+    ];
 
     /// Hard-defect count: everything a reader sees as broken (node /
     /// frame crossings, overlaps, label collisions, shared ports,
@@ -475,7 +605,10 @@ impl Metrics {
 }
 
 /// Both measurements of one diagram plus the interactive-path cost.
+/// Built by [`measure_source`] only; it gains fields as the harness
+/// learns to compare more, so it is `#[non_exhaustive]`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Report {
     /// The static layout (`scene::scene`).
     pub statik: Metrics,
@@ -487,9 +620,244 @@ pub struct Report {
     pub scene_ms: f64,
     /// Whether two renders of each path gave byte-identical SVG (G14).
     pub deterministic: bool,
+    /// Whether the block layout of subgraphs applies to the diagram (a
+    /// link crosses a subgraph's border), whether or not it is switched
+    /// on.
+    pub block_mode: bool,
+    /// Whether the diagram's layers as blocks are its layers before
+    /// blocks ([`layers_dump`]'s `rows_equal`, in every part): such a
+    /// diagram is judged by "not drawn worse than before".
+    pub rows_equal: bool,
+    /// Largest difference (px) of a frame's side between `scene()` and
+    /// `route()` at its centres: how far the frames snap when the
+    /// playground first paints the routed drawing.
+    pub fr_max: f64,
+    /// Edges with an end more than [`ENDS_APART`] from where it is in
+    /// the other of the two drawings.
+    pub ends_apart: usize,
     /// The two scenes, for callers that also want the SVGs.
     pub static_scene: Scene,
     pub routed_scene: Scene,
+}
+
+/// How far (px) an edge's end may lie between `scene()` and `route()`
+/// at its centres before `ends_apart` counts it.
+pub const ENDS_APART: f64 = 20.0;
+
+/// Run `f` with the block layout of subgraphs switched on or off on
+/// this thread (the internal switch of `crate::levels`), restoring
+/// the former setting afterwards, also when `f` unwinds. For the tests
+/// and measurements of that layout while it is being built.
+pub fn with_blocks<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    crate::levels::with_blocks(on, f)
+}
+
+/// Run `f` with the ordering of a block layout taking `starts` starts
+/// instead of what its work budget grants (for the table of crossings
+/// by starts).
+pub fn with_block_order_starts<T>(starts: usize, f: impl FnOnce() -> T) -> T {
+    crate::levels::with_order_starts(starts, f)
+}
+
+/// Whether the block layout of subgraphs is switched on for a call made
+/// now on this thread.
+pub fn blocks_on() -> bool {
+    crate::levels::blocks_on()
+}
+
+/// The two drawn ends of a scene edge.
+fn drawn_ends(e: &SceneEdge) -> (Pt, Pt) {
+    match (e.waypoints.first(), e.waypoints.last()) {
+        (Some(&a), Some(&b)) if e.waypoints.len() >= 2 => (a, b),
+        _ => (e.bezier[0], e.bezier[3]),
+    }
+}
+
+/// Largest difference (px) between the sides of frame `id` in `a` and
+/// in `b`; `None` when one of them does not draw it.
+fn frame_delta(a: &Scene, b: &Scene, id: &str) -> Option<f64> {
+    let x = a.clusters.iter().find(|c| c.id == id)?;
+    let y = b.clusters.iter().find(|c| c.id == id)?;
+    Some(
+        (x.x - y.x)
+            .abs()
+            .max((x.y - y.y).abs())
+            .max((x.x + x.w - y.x - y.w).abs())
+            .max((x.y + x.h - y.y - y.h).abs()),
+    )
+}
+
+/// How far frames move when one node is dragged by 1 px from the scene
+/// `base` of `g` ([`scene::route_partial`], every node in turn):
+/// (`dfr_own`, `dfr_far`), the largest move (px) of a frame the drag
+/// may redraw, and of any other frame. A drag may redraw the frames
+/// that hold the dragged node, and the frames round the far end of a
+/// link across a subgraph's border whose near end is the dragged node
+/// or lies in a block beside it that holds it (the link's class, and
+/// with it the room its entry takes, can change). No other frame has a
+/// reason to move.
+pub fn frame_drags(g: &Graph, base: &Scene) -> (f64, f64) {
+    let at: Vec<Pt> = base.nodes.iter().map(|n| (n.x, n.y)).collect();
+    let nc = scene::node_cluster_paths(g);
+    let tree = crate::levels::Tree::new(&nc, g.subgraphs.len());
+    // The links: the real edges and the stand-ins of edges to a subgraph.
+    let aug = crate::levels::Augmented::of(g);
+    let links: Vec<(usize, usize)> = g
+        .edges
+        .iter()
+        .map(|e| (e.from, e.to))
+        .chain(aug.pairs.iter().flatten().copied())
+        .filter(|&(a, b)| tree.border(a, b))
+        .collect();
+    let (mut own, mut far) = (0.0f64, 0.0f64);
+    for v in 0..at.len() {
+        let mut c = at.clone();
+        c[v].0 += 1.0;
+        let p = scene::route_partial(g, &c, base, &at);
+        // The subgraphs the drag may redraw.
+        let mut redrawn: Vec<usize> = tree.chain(v).to_vec();
+        for &(a, b) in &links {
+            for (near, other) in [(a, b), (b, a)] {
+                let (cn, co) = (tree.chain(near), tree.chain(other));
+                let k = cn.iter().zip(co).take_while(|(x, y)| x == y).count();
+                // `v` is the near end, or lies in the near end's unit at
+                // the link's level.
+                let holds = near == v || cn.get(k).is_some_and(|s| tree.chain(v).contains(s));
+                if holds {
+                    redrawn.extend_from_slice(&co[k..]);
+                }
+            }
+        }
+        for (si, s) in g.subgraphs.iter().enumerate() {
+            let Some(d) = frame_delta(base, &p, &s.id) else {
+                continue;
+            };
+            if redrawn.contains(&si) {
+                own = own.max(d);
+            } else {
+                far = far.max(d);
+            }
+        }
+    }
+    (own, far)
+}
+
+/// The level tree of `g` (`crate::levels::Tree`) as text, one line
+/// per level: the subgraph it is, the level round it, its depth and its
+/// units in declaration order (each with its key).
+pub fn levels_dump(g: &Graph) -> Vec<String> {
+    let nc = scene::node_cluster_paths(g);
+    let tree = crate::levels::Tree::new(&nc, g.subgraphs.len());
+    let name = |l: &crate::levels::Level| l.sub.map_or("(root)", |s| g.subgraphs[s].id.as_str());
+    tree.levels
+        .iter()
+        .map(|l| {
+            let units: Vec<String> = l
+                .units
+                .iter()
+                .map(|&u| match u {
+                    crate::levels::Unit::Node(v) => format!("{}:{}", tree.key(u), g.nodes[v].id),
+                    crate::levels::Unit::Block(s) => {
+                        format!("{}:[{}]", tree.key(u), g.subgraphs[s].id)
+                    }
+                })
+                .collect();
+            let parent = l.parent.map_or("-", |p| name(&tree.levels[p]));
+            format!(
+                "{} in {parent} depth {}: {}",
+                name(l),
+                l.depth,
+                units.join(" ")
+            )
+        })
+        .collect()
+}
+
+/// How `g` is layered as blocks and how it was layered before blocks,
+/// as text. Per part of the diagram that has subgraphs (the whole
+/// diagram unless a subgraph sets its own direction): a header line
+/// `part <k> block_mode <0|1> rows_equal <0|1>`, the block layers as one
+/// line (`layers a b / c / ...`), one line `upstream a -> b` per edge
+/// that runs against the flow, one line `block <subgraph> rows <a>-<b>`
+/// per subgraph laid out as a block, one line `lanes <subgraph>` per
+/// level the lane rule keeps side by side, and one line per node
+/// `node <id> <block layer> <layer before>`.
+pub fn layers_dump(g: &Graph) -> Vec<String> {
+    let out = std::cell::RefCell::new(Vec::new());
+    let part = std::cell::Cell::new(0usize);
+    crate::compound::any_part(g, &|p| {
+        let k = part.replace(part.get() + 1);
+        let Some(l) = scene::layerings(p) else {
+            return false;
+        };
+        let mut out = out.borrow_mut();
+        let mode = crate::levels::Augmented::of(p).block_mode(p);
+        out.push(format!(
+            "part {k} block_mode {} rows_equal {}",
+            u8::from(mode),
+            u8::from(l.block == l.before)
+        ));
+        let rows = l.block.iter().copied().max().map_or(0, |m| m + 1);
+        let by_row: Vec<String> = (0..rows)
+            .map(|r| {
+                let ids: Vec<&str> = (0..p.nodes.len())
+                    .filter(|&v| l.block[v] == r)
+                    .map(|v| p.nodes[v].id.as_str())
+                    .collect();
+                ids.join(" ")
+            })
+            .collect();
+        out.push(format!("layers {}", by_row.join(" / ")));
+        // Stand-ins come after the part's own edges: name those by
+        // their end nodes too.
+        for &ei in &l.upstream {
+            let ends = match p.edges.get(ei) {
+                Some(e) => Some((e.from, e.to)),
+                None => stand_in_ends(p, ei - p.edges.len()),
+            };
+            if let Some((a, b)) = ends {
+                out.push(format!("upstream {} -> {}", p.nodes[a].id, p.nodes[b].id));
+            }
+        }
+        for (s, sub) in p.subgraphs.iter().enumerate() {
+            let on: Vec<usize> = (0..p.nodes.len())
+                .filter(|&v| l.paths[v].contains(&s))
+                .map(|v| l.block[v])
+                .collect();
+            if let (Some(lo), Some(hi)) = (on.iter().min(), on.iter().max()) {
+                out.push(format!("block {} rows {lo}-{hi}", sub.id));
+            }
+        }
+        for lane in &l.lanes {
+            out.push(format!(
+                "lanes {}",
+                lane.map_or("(root)", |s| p.subgraphs[s].id.as_str())
+            ));
+        }
+        for (v, node) in p.nodes.iter().enumerate() {
+            out.push(format!("node {} {} {}", node.id, l.block[v], l.before[v]));
+        }
+        false
+    });
+    out.into_inner()
+}
+
+/// Whether every part of `g` with subgraphs has the same layers as
+/// blocks as before blocks.
+fn rows_equal(g: &Graph) -> bool {
+    !crate::compound::any_part(g, &|p| {
+        scene::layerings(p).is_some_and(|l| l.block != l.before)
+    })
+}
+
+/// The member pair the `k`-th stand-in of `g`'s augmented graph joins.
+fn stand_in_ends(g: &Graph, k: usize) -> Option<(usize, usize)> {
+    crate::levels::Augmented::of(g)
+        .pairs
+        .iter()
+        .flatten()
+        .nth(k)
+        .copied()
 }
 
 /// Fastest of [`ROUTE_RUNS`] calls of `f` (ms).
@@ -529,7 +897,25 @@ pub fn measure_source(src: &str, time_route: bool) -> Result<Report, String> {
     };
     let deterministic = scene::to_svg(&statik) == scene::to_svg(&scene::scene(&g))
         && scene::to_svg(&routed) == scene::to_svg(&scene::route(&g, &centers));
+    let fr_max = statik
+        .clusters
+        .iter()
+        .filter_map(|c| frame_delta(&statik, &routed, &c.id))
+        .fold(0.0, f64::max);
+    let ends_apart = statik
+        .edges
+        .iter()
+        .zip(&routed.edges)
+        .filter(|(a, b)| {
+            let ((a0, a1), (b0, b1)) = (drawn_ends(a), drawn_ends(b));
+            dist(a0, b0).max(dist(a1, b1)) > ENDS_APART
+        })
+        .count();
     Ok(Report {
+        block_mode: scene::block_mode(&g),
+        rows_equal: rows_equal(&g),
+        fr_max,
+        ends_apart,
         statik: measure(&g, &statik),
         routed: measure(&g, &routed),
         route_ms,
@@ -908,6 +1294,160 @@ fn bounds(pts: &[Pt]) -> Rect {
         ),
         |r, p| Rect(r.0.min(p.0), r.1.min(p.1), r.2.max(p.0), r.3.max(p.1)),
     )
+}
+
+/// Distance from segment `a`–`b` to the box `r` (0 when it touches).
+fn seg_rect_dist(a: Pt, b: Pt, r: Rect) -> f64 {
+    if r.hits_seg(a, b) {
+        return 0.0;
+    }
+    let corners = [(r.0, r.1), (r.2, r.1), (r.2, r.3), (r.0, r.3)];
+    corners
+        .iter()
+        .map(|&c| seg_dist(c, a, b))
+        .fold(r.dist(a).min(r.dist(b)), f64::min)
+}
+
+/// The sides of the box `r` (`'L'`, `'R'`, `'T'`, `'B'`, the screen's)
+/// the polyline `pts` crosses between its inside and its outside, one
+/// per crossing in the order it makes them. A point on the border is
+/// outside, so a path that ends on it or runs along it crosses nothing;
+/// a crossing exactly through a corner goes to the side the segment
+/// runs across.
+fn border_crossings(pts: &[Pt], r: Rect) -> Vec<char> {
+    let mut out = Vec::new();
+    if r.2 <= r.0 || r.3 <= r.1 {
+        return out;
+    }
+    let side_at = |p: Pt, d: Pt| {
+        let mut near = [
+            ('L', (p.0 - r.0).abs()),
+            ('R', (p.0 - r.2).abs()),
+            ('T', (p.1 - r.1).abs()),
+            ('B', (p.1 - r.3).abs()),
+        ];
+        near.sort_by(|a, b| a.1.total_cmp(&b.1));
+        if near[1].1 - near[0].1 > 1e-6 {
+            return near[0].0;
+        }
+        let level = d.0.abs() >= d.1.abs();
+        let across = |s: char| (s == 'L' || s == 'R') == level;
+        if across(near[0].0) || !across(near[1].0) {
+            near[0].0
+        } else {
+            near[1].0
+        }
+    };
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let d = (b.0 - a.0, b.1 - a.1);
+        // The stretch t0 < t < t1 of the segment strictly inside the box
+        // (Liang-Barsky).
+        let (mut t0, mut t1) = (0.0f64, 1.0f64);
+        let mut inside = true;
+        for (p, q) in [
+            (-d.0, a.0 - r.0),
+            (d.0, r.2 - a.0),
+            (-d.1, a.1 - r.1),
+            (d.1, r.3 - a.1),
+        ] {
+            if p == 0.0 {
+                if q <= 0.0 {
+                    inside = false;
+                    break;
+                }
+            } else if p < 0.0 {
+                t0 = t0.max(q / p);
+            } else {
+                t1 = t1.min(q / p);
+            }
+        }
+        if !inside || t1 - t0 <= 1e-9 {
+            continue;
+        }
+        if t0 > 1e-9 {
+            out.push(side_at((a.0 + d.0 * t0, a.1 + d.1 * t0), d));
+        }
+        if t1 < 1.0 - 1e-9 {
+            out.push(side_at((a.0 + d.0 * t1, a.1 + d.1 * t1), d));
+        }
+    }
+    out
+}
+
+/// Lengths of the maximal straight runs of the polyline `pts`. Exactly
+/// collinear samples are one leg; the legs are then grown into runs
+/// longest first, each taking its neighbours on either side while they
+/// turn less than [`RUN_TURN`] off it and end within [`RUN_OFF`] of its
+/// line. Growing from the long legs outwards makes a corner's easing
+/// part of the leg it runs into, whichever way the path is read (a run
+/// grown from its first sample splits a leg from the last degree of the
+/// rounding before it, some 13 px of a spline's corner).
+fn straight_runs(pts: &[Pt]) -> Vec<f64> {
+    // Collinear neighbours merged: (start, end) per leg.
+    let mut legs: Vec<(Pt, Pt)> = Vec::new();
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let len = dist(a, b);
+        if len < 1e-9 {
+            continue;
+        }
+        if let Some(run) = legs.last_mut() {
+            let rl = dist(run.0, run.1);
+            let (ux, uy) = ((run.1 .0 - run.0 .0) / rl, (run.1 .1 - run.0 .1) / rl);
+            let cross = ((b.0 - run.0 .0) * uy - (b.1 - run.0 .1) * ux).abs();
+            let dot = ((b.0 - a.0) * ux + (b.1 - a.1) * uy) / len;
+            if cross < 1e-6 * (1.0 + rl + len) && dot > 0.999_999 {
+                run.1 = b;
+                continue;
+            }
+        }
+        legs.push((a, b));
+    }
+    let n = legs.len();
+    let len_of = |k: usize| dist(legs[k].0, legs[k].1);
+    let cos_tol = RUN_TURN.to_radians().cos();
+    // Longest leg first (the earlier one on a tie).
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| len_of(b).total_cmp(&len_of(a)).then(a.cmp(&b)));
+    // The run each leg belongs to.
+    let mut run_of: Vec<Option<usize>> = vec![None; n];
+    let mut runs: Vec<f64> = Vec::new();
+    for seed in order {
+        if run_of[seed].is_some() {
+            continue;
+        }
+        let (a, b) = legs[seed];
+        let l = len_of(seed);
+        let u = ((b.0 - a.0) / l, (b.1 - a.1) / l);
+        // Whether leg `k` carries the seed's line on: its heading and
+        // both its ends.
+        let fits = |k: usize| {
+            let (p, q) = legs[k];
+            let kl = dist(p, q);
+            let off = |x: Pt| ((x.0 - a.0) * u.1 - (x.1 - a.1) * u.0).abs();
+            ((q.0 - p.0) * u.0 + (q.1 - p.1) * u.1) / kl >= cos_tol
+                && off(p) <= RUN_OFF
+                && off(q) <= RUN_OFF
+        };
+        let id = runs.len();
+        let mut total = l;
+        run_of[seed] = Some(id);
+        let mut k = seed;
+        while k + 1 < n && run_of[k + 1].is_none() && fits(k + 1) {
+            k += 1;
+            run_of[k] = Some(id);
+            total += len_of(k);
+        }
+        let mut k = seed;
+        while k > 0 && run_of[k - 1].is_none() && fits(k - 1) {
+            k -= 1;
+            run_of[k] = Some(id);
+            total += len_of(k);
+        }
+        runs.push(total);
+    }
+    runs
 }
 
 /// Distance along the polyline `pts` (px) of its point nearest `p`.
@@ -1992,6 +2532,271 @@ pub fn measure(g: &Graph, sc: &Scene) -> Metrics {
         ink += len * edge_stroke_width(e);
     }
     m.ink = ink / (m.width * m.height).max(1.0);
+    // Block shape: how much air each frame holds, how much of the flow
+    // it spans, and whether sibling frames sharing a band are level.
+    let mut held = vec![0.0f64; sc.clusters.len()];
+    for (n, frames) in node_frames.iter().enumerate() {
+        for &f in frames {
+            held[f] += sc.nodes[n].w * sc.nodes[n].h;
+        }
+    }
+    let along = |r: &Rect| if horizontal { (r.0, r.2) } else { (r.1, r.3) };
+    let canvas = if horizontal { m.width } else { m.height };
+    let mut ratios = Vec::new();
+    for (f, r) in frame_rect.iter().enumerate() {
+        if held[f] > 0.0 {
+            ratios.push((r.2 - r.0) * (r.3 - r.1) / held[f]);
+        }
+        let (lo, hi) = along(r);
+        m.span_max = m.span_max.max((hi - lo) / canvas.max(1.0));
+    }
+    if !ratios.is_empty() {
+        m.compact_max = ratios.iter().copied().fold(0.0, f64::max);
+        m.compact_mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+    }
+    let parent = |f: usize| frame_chain[f].get(1).copied();
+    for i in 0..frame_rect.len() {
+        for j in i + 1..frame_rect.len() {
+            if parent(i) != parent(j) {
+                continue;
+            }
+            let ((a0, a1), (b0, b1)) = (along(&frame_rect[i]), along(&frame_rect[j]));
+            let inside = |p: (f64, f64), q: (f64, f64)| {
+                p.0 <= q.0 + STAGGER_SLACK && p.1 >= q.1 - STAGGER_SLACK
+            };
+            if a1.min(b1) - a0.max(b0) <= SIDE_MIN {
+                continue;
+            }
+            if !inside((a0, a1), (b0, b1)) && !inside((b0, b1), (a0, a1)) {
+                m.sib_stagger += 1;
+                m.details.push(format!(
+                    "{} sib_stagger {}",
+                    sc.clusters[i].id, sc.clusters[j].id
+                ));
+            }
+            // An edge with one end in or on each of the two.
+            let joined = edges.iter().any(|me| {
+                let (f, t) = (frames_of(me.from), frames_of(me.to));
+                (f.contains(&i) && t.contains(&j)) || (f.contains(&j) && t.contains(&i))
+            });
+            if joined {
+                m.sib_side_linked += 1;
+                m.details.push(format!(
+                    "{} sib_side_linked {}",
+                    sc.clusters[i].id, sc.clusters[j].id
+                ));
+            }
+        }
+    }
+    m.title_cut = (0..sc.clusters.len())
+        .filter(|&ci| {
+            scene::fit_cluster_title(&sc.clusters, ci, maxx + MARGIN) != sc.clusters[ci].title
+        })
+        .count();
+    // Edge shape: length, bends and detours of each edge as painted.
+    for me in &edges {
+        let len: f64 = me.pts.windows(2).map(|w| dist(w[0], w[1])).sum();
+        m.edge_len += len;
+        let legs = straight_runs(&me.pts)
+            .iter()
+            .filter(|&&l| l >= BEND_RUN_MIN)
+            .count();
+        m.bends_max = m.bends_max.max(legs.saturating_sub(1));
+        if let (Some(&a), Some(&b), true) = (me.pts.first(), me.pts.last(), len >= DETOUR_MIN_LEN) {
+            let manhattan = (b.0 - a.0).abs() + (b.1 - a.1).abs();
+            if manhattan > 1.0 {
+                m.detour_max = m.detour_max.max(len / manhattan);
+            }
+        }
+    }
+    // Edges across a subgraph's border: the frame sides they cross, the
+    // node sides they end on, and which way the upstream ones leave.
+    let nc = scene::node_cluster_paths(g);
+    let tree = crate::levels::Tree::new(&nc, g.subgraphs.len());
+    let is_card = |end: End| match end {
+        End::Node(v) => {
+            let n = &g.nodes[v];
+            crate::style::is_note_card(&n.id, n.shape, &n.style)
+        }
+        End::Frame(_) => false,
+    };
+    for me in &edges {
+        let (Some(from), Some(to)) = (me.from, me.to) else {
+            continue;
+        };
+        let name = format!("{}->{}", me.e.from, me.e.to);
+        let (hf, ht) = (frames_of(me.from), frames_of(me.to));
+        for (fi, r) in frame_rect.iter().enumerate() {
+            if hf.contains(&fi) == ht.contains(&fi) {
+                continue;
+            }
+            for side in border_crossings(&me.pts, *r) {
+                if (side == 'T' || side == 'B') == me.horizontal {
+                    m.lateral_x += 1;
+                    m.details
+                        .push(format!("{name} lateral_x {} {side}", sc.clusters[fi].id));
+                }
+            }
+        }
+        let (Some(&p0), Some(&p1)) = (me.pts.first(), me.pts.last()) else {
+            continue;
+        };
+        for (end, p) in [(from, p0), (to, p1)] {
+            if let End::Frame(f) = end {
+                let r = frame_rect[f];
+                let corners = [(r.0, r.1), (r.2, r.1), (r.2, r.3), (r.0, r.3)];
+                if corners
+                    .iter()
+                    .any(|&c| dist(c, p) <= crate::ports::PORT_SPACING)
+                {
+                    m.pin_corner += 1;
+                    m.details
+                        .push(format!("{name} pin_corner {}", sc.clusters[f].id));
+                }
+            }
+        }
+        // A block end: the two ends lie in different units of their
+        // common level and one of the units is a subgraph. (An edge
+        // between a subgraph and something inside it is not.)
+        let block_end = match (from, to) {
+            (End::Node(a), End::Node(b)) => {
+                let (_, ua, ub) = tree.join(a, b);
+                let block = |u| matches!(u, crate::levels::Unit::Block(_));
+                ua != ub && (block(ua) || block(ub))
+            }
+            (End::Frame(f), End::Node(v)) | (End::Node(v), End::Frame(f)) => {
+                !node_frames[v].contains(&f)
+            }
+            (End::Frame(a), End::Frame(b)) => {
+                !frame_chain[a].contains(&b) && !frame_chain[b].contains(&a)
+            }
+        };
+        if !block_end || is_card(from) || is_card(to) {
+            continue;
+        }
+        // The flow as a unit vector, and each end's side as the inward
+        // normal of the box side its point lies on.
+        let flow = match (me.horizontal, me.reversed) {
+            (false, false) => (0.0, 1.0),
+            (false, true) => (0.0, -1.0),
+            (true, false) => (1.0, 0.0),
+            (true, true) => (-1.0, 0.0),
+        };
+        let side_of = |end: End, p: Pt| {
+            let r = end_box(end);
+            box_side_in(
+                ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0),
+                ((r.2 - r.0) / 2.0, (r.3 - r.1) / 2.0),
+                p,
+            )
+        };
+        let along = |n: Pt| n.0 * flow.0 + n.1 * flow.1;
+        for (end, p) in [(from, p0), (to, p1)] {
+            if matches!(end, End::Node(_)) && along(side_of(end, p)) == 0.0 {
+                m.side_ends += 1;
+                m.details
+                    .push(format!("{name} side_ends {}", owner_id(end)));
+            }
+        }
+        // Upstream: the far end's box lies wholly before the near one's.
+        let span = |end: End| {
+            let r = end_box(end);
+            let (a, b) = (along((r.0, r.1)), along((r.2, r.3)));
+            (a.min(b), a.max(b))
+        };
+        if span(to).1 <= span(from).0 && along(side_of(from, p0)) <= 0.0 {
+            m.up_lanes += 1;
+            m.details.push(format!("{name} up_lanes"));
+        }
+    }
+    // Spines: a pair that only links to each other across one gap is one
+    // straight line.
+    let aug = crate::levels::Augmented::of(g);
+    let links: Vec<(usize, usize)> = g
+        .edges
+        .iter()
+        .map(|e| (e.from, e.to))
+        .chain(aug.pairs.iter().flatten().copied())
+        .filter(|&(a, b)| a != b)
+        .collect();
+    for me in &edges {
+        let (Some(End::Node(a)), Some(End::Node(b))) = (me.from, me.to) else {
+            continue;
+        };
+        // Position along and across this edge's flow.
+        let at = |v: usize| {
+            let n = &sc.nodes[v];
+            let (l, x) = if me.horizontal {
+                (n.x, n.y)
+            } else {
+                (n.y, n.x)
+            };
+            (if me.reversed { -l } else { l }, x)
+        };
+        let (u, v) = if at(a).0 <= at(b).0 { (a, b) } else { (b, a) };
+        if at(v).0 - at(u).0 <= STRAIGHT_TOL {
+            continue;
+        }
+        // The links of `w` towards later (earlier) positions along the flow.
+        let links_of = |w: usize, later: bool| {
+            links
+                .iter()
+                .filter(|&&(p, q)| p == w || q == w)
+                .filter(|&&(p, q)| {
+                    let o = if p == w { q } else { p };
+                    if later {
+                        at(o).0 > at(w).0 + STRAIGHT_TOL
+                    } else {
+                        at(o).0 < at(w).0 - STRAIGHT_TOL
+                    }
+                })
+                .count()
+        };
+        if links_of(u, true) != 1 || links_of(v, false) != 1 {
+            continue;
+        }
+        let between = (0..sc.nodes.len())
+            .any(|w| at(w).0 > at(u).0 + STRAIGHT_TOL && at(w).0 < at(v).0 - STRAIGHT_TOL);
+        if between {
+            continue;
+        }
+        let across = |p: Pt| if me.horizontal { p.1 } else { p.0 };
+        let b0 = me.pts.first().map_or(0.0, |&p| across(p));
+        if me
+            .pts
+            .iter()
+            .any(|&p| (across(p) - b0).abs() > STRAIGHT_TOL)
+        {
+            m.spine_off += 1;
+            m.details
+                .push(format!("{}->{} spine_off", me.e.from, me.e.to));
+        }
+    }
+    // Labels: how far along its edge each sits from the nearer end, and
+    // how close another edge's stroke comes to its chip.
+    m.chip_gap_min = GAP_PROBE;
+    let mut end_sum = 0.0;
+    for &(i, r) in &labels {
+        let me = &edges[i];
+        let len: f64 = me.pts.windows(2).map(|w| dist(w[0], w[1])).sum();
+        let at = arc_at(&me.pts, ((r.0 + r.2) / 2.0, (r.1 + r.3) / 2.0));
+        end_sum += at.min(len - at);
+        let gap = edges
+            .iter()
+            .enumerate()
+            .filter(|&(j, o)| j != i && o.bb.grow(GAP_PROBE).overlaps(r))
+            .flat_map(|(_, o)| o.pts.windows(2).map(move |w| seg_rect_dist(w[0], w[1], r)))
+            .fold(GAP_PROBE, f64::min);
+        m.chip_gap_min = m.chip_gap_min.min(gap);
+        if gap < CLEAR_GAP {
+            m.chip_crowd += 1;
+            m.details
+                .push(format!("{}->{} chip_crowd {gap:.1}px", me.e.from, me.e.to));
+        }
+    }
+    if !labels.is_empty() {
+        m.lbl_end_mean = end_sum / labels.len() as f64;
+    }
     // Ink off the canvas `to_svg` writes: the drawing's bounds and the
     // padding round them.
     let (x0, x1, y0, y1) = (minx - MARGIN, maxx + MARGIN, miny - MARGIN, maxy + MARGIN);
@@ -2314,6 +3119,269 @@ mod tests {
         assert_eq!(
             m.idiom_ortho + m.idiom_scubic + m.idiom_spline + m.idiom_bow,
             m.edges
+        );
+    }
+
+    /// B12.0: how much air a frame holds, how much of the flow it spans
+    /// and whether sibling frames sharing a band are level, read off the
+    /// scene's frames and node boxes.
+    #[test]
+    fn block_shape_reads_frames_against_their_nodes() {
+        let (g, mut sc) =
+            laid("flowchart TD\nsubgraph S[one]\na-->b\nend\nsubgraph T[two]\nc\nend\nx-->y");
+        let m = measure(&g, &sc);
+        let area = |id: &str| {
+            let n = sc.nodes.iter().find(|n| n.id == id).unwrap();
+            n.w * n.h
+        };
+        let frame = |id: &str| sc.clusters.iter().find(|c| c.id == id).unwrap();
+        let (s, t) = (frame("S"), frame("T"));
+        let (rs, rt) = (s.w * s.h / (area("a") + area("b")), t.w * t.h / area("c"));
+        assert!((m.compact_max - rs.max(rt)).abs() < 1e-9, "{m:?}");
+        assert!((m.compact_mean - (rs + rt) / 2.0).abs() < 1e-9, "{m:?}");
+        assert!((m.span_max - s.h.max(t.h) / m.height).abs() < 1e-9, "{m:?}");
+        // T's one row lies within S's two: side by side and level.
+        assert_eq!((m.sib_stagger, m.title_cut), (0, 0), "{m:?}");
+        // Slid half a row down it reaches past S's end: staggered.
+        let (si, ti) = (
+            sc.clusters.iter().position(|c| c.id == "S").unwrap(),
+            sc.clusters.iter().position(|c| c.id == "T").unwrap(),
+        );
+        sc.clusters[ti].y = sc.clusters[si].y + sc.clusters[si].h - 10.0;
+        assert_eq!(measure(&g, &sc).sib_stagger, 1);
+        // Below S altogether they are stacked: no pair to judge.
+        sc.clusters[ti].y = sc.clusters[si].y + sc.clusters[si].h + 20.0;
+        assert_eq!(measure(&g, &sc).sib_stagger, 0);
+        // A diagram without frames reads zero throughout.
+        let (g, sc) = laid("flowchart TD\nA-->B");
+        let m = measure(&g, &sc);
+        assert_eq!(
+            (m.compact_max, m.compact_mean, m.span_max, m.sib_stagger),
+            (0.0, 0.0, 0.0, 0),
+            "{m:?}"
+        );
+    }
+
+    /// B12.0: bends, detour and length of an edge as drawn; a corner's
+    /// rounding is no leg of its own.
+    #[test]
+    fn edge_shape_counts_legs_and_detours() {
+        let (g, mut sc) = laid("flowchart TD\nA-->B\nC-->D");
+        let (x, y) = (sc.nodes[0].x, sc.nodes[0].y);
+        // Down 100, right 60, down 100: two bends, no detour.
+        let z = [
+            (x, y),
+            (x, y + 100.0),
+            (x + 60.0, y + 100.0),
+            (x + 60.0, y + 200.0),
+        ];
+        draw_linear(&mut sc.edges[0], &z);
+        draw_linear(&mut sc.edges[1], &[(x + 300.0, y), (x + 300.0, y + 50.0)]);
+        let m = measure(&g, &sc);
+        assert_eq!(m.bends_max, 2, "{m:?}");
+        assert!((m.edge_len - 310.0).abs() < 1e-6, "{}", m.edge_len);
+        assert!((m.detour_max - 1.0).abs() < 1e-9, "{}", m.detour_max);
+        // The same Z with rounded corners still has two bends.
+        let round = crate::router::smooth(&z, crate::router::CORNER_R);
+        sc.edges[0].waypoints = round;
+        sc.edges[0].meta.curve = None;
+        assert_eq!(measure(&g, &sc).bends_max, 2);
+        // Round a block and back: 100 out, 200 down, 100 back in is 400 px
+        // for 200 px between the ends.
+        let u = [
+            (x, y),
+            (x + 100.0, y),
+            (x + 100.0, y + 200.0),
+            (x, y + 200.0),
+        ];
+        draw_linear(&mut sc.edges[0], &u);
+        let m = measure(&g, &sc);
+        assert!((m.detour_max - 2.0).abs() < 1e-9, "{}", m.detour_max);
+        // A leg shorter than BEND_RUN_MIN is a jog, not two bends more.
+        let jog = [
+            (x, y),
+            (x, y + 100.0),
+            (x + 5.0, y + 100.0),
+            (x + 5.0, y + 200.0),
+        ];
+        draw_linear(&mut sc.edges[0], &jog);
+        assert_eq!(measure(&g, &sc).bends_max, 1);
+        // An edge under DETOUR_MIN_LEN is not judged for its detour.
+        let short = [(x, y), (x + 50.0, y), (x + 50.0, y + 50.0), (x, y + 50.0)];
+        draw_linear(&mut sc.edges[0], &short);
+        assert_eq!(measure(&g, &sc).detour_max, 0.0);
+    }
+
+    /// B12.0: a chip with another edge's line beside it is crowded; the
+    /// label's distance to its nearer end is read along its own edge.
+    #[test]
+    fn a_chip_beside_a_foreign_line_is_crowded() {
+        let (g, mut sc) = laid("flowchart TD\nA-->|go|B\nC-->D");
+        let (x, y) = (sc.nodes[0].x, sc.nodes[0].y);
+        draw_linear(&mut sc.edges[0], &[(x, y), (x, y + 200.0)]);
+        // The chip 60 px down its 200 px line, 30 px wide.
+        sc.edges[0].label = Some(("go".to_string(), (x, y + 60.0), 30.0));
+        // The other line 40 px to the right of the chip's side: clear.
+        draw_linear(&mut sc.edges[1], &[(x + 55.0, y), (x + 55.0, y + 200.0)]);
+        let m = measure(&g, &sc);
+        assert_eq!(m.chip_crowd, 0, "{m:?}");
+        assert!(
+            (m.chip_gap_min - GAP_PROBE).abs() < 1e-9,
+            "{}",
+            m.chip_gap_min
+        );
+        assert!((m.lbl_end_mean - 60.0).abs() < 1e-6, "{}", m.lbl_end_mean);
+        // 5 px from the chip's side it crowds the label.
+        draw_linear(&mut sc.edges[1], &[(x + 20.0, y), (x + 20.0, y + 200.0)]);
+        let m = measure(&g, &sc);
+        assert_eq!(m.chip_crowd, 1, "{m:?}");
+        assert!((m.chip_gap_min - 5.0).abs() < 1e-9, "{}", m.chip_gap_min);
+        // Through the chip the gap is 0.
+        draw_linear(&mut sc.edges[1], &[(x + 5.0, y), (x + 5.0, y + 200.0)]);
+        let m = measure(&g, &sc);
+        assert_eq!((m.chip_crowd, m.chip_gap_min), (1, 0.0), "{m:?}");
+        // A line that ends short of the chip is as far as its end.
+        draw_linear(&mut sc.edges[1], &[(x, y + 80.0), (x, y + 200.0)]);
+        let m = measure(&g, &sc);
+        assert!((m.chip_gap_min - 10.0).abs() < 1e-9, "{}", m.chip_gap_min);
+    }
+
+    /// B12.1: the frame sides an edge across a border crosses, the node
+    /// sides it ends on, which way an upstream one leaves, and whether a
+    /// lone pair is joined by one straight line.
+    #[test]
+    fn block_edges_read_frame_sides_and_node_sides() {
+        let (g, mut sc) =
+            laid("flowchart TD\nsubgraph S[one]\na\nend\nsubgraph T[two]\nb\nend\na-->b");
+        let node = |sc: &Scene, id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap().clone();
+        let (a, b) = (node(&sc, "a"), node(&sc, "b"));
+        assert!(b.y > a.y, "T lies below S");
+        // Straight down, out of S's bottom and into T's top.
+        draw_linear(&mut sc.edges[0], &[bottom(&a), (a.x, b.y - b.h / 2.0)]);
+        let m = measure(&g, &sc);
+        assert_eq!(
+            (
+                m.lateral_x,
+                m.side_ends,
+                m.up_lanes,
+                m.spine_off,
+                m.sib_side_linked
+            ),
+            (0, 0, 0, 0, 0),
+            "{m:?}"
+        );
+        // Out of a's right side through S's right wall, down beside both
+        // frames, in through T's right wall to b's right side.
+        let right = sc.clusters.iter().map(|c| c.x + c.w).fold(0.0, f64::max) + 30.0;
+        let round = [
+            (a.x + a.w / 2.0, a.y),
+            (right, a.y),
+            (right, b.y),
+            (b.x + b.w / 2.0, b.y),
+        ];
+        draw_linear(&mut sc.edges[0], &round);
+        let m = measure(&g, &sc);
+        assert_eq!(
+            (m.lateral_x, m.side_ends, m.up_lanes, m.spine_off),
+            (2, 2, 0, 1),
+            "{m:?}"
+        );
+        // The same line read upstream (from b up to a): a return drawn
+        // as a lane, leaving its source by a lateral side.
+        let mut up = sc.clone();
+        up.edges[0].from = "b".to_string();
+        up.edges[0].to = "a".to_string();
+        let mut back = round;
+        back.reverse();
+        draw_linear(&mut up.edges[0], &back);
+        let m = measure(&g, &up);
+        assert_eq!((m.up_lanes, m.side_ends, m.lateral_x), (1, 2, 2), "{m:?}");
+        // Straight up out of b's top into a's bottom it is a channel.
+        draw_linear(&mut up.edges[0], &[top(&b), bottom(&a)]);
+        let m = measure(&g, &up);
+        assert_eq!((m.up_lanes, m.side_ends, m.lateral_x), (0, 0, 0), "{m:?}");
+        // The two frames side by side, joined by the edge.
+        let (si, ti) = (
+            sc.clusters.iter().position(|c| c.id == "S").unwrap(),
+            sc.clusters.iter().position(|c| c.id == "T").unwrap(),
+        );
+        sc.clusters[ti].x = sc.clusters[si].x + sc.clusters[si].w + 40.0;
+        sc.clusters[ti].y = sc.clusters[si].y;
+        assert_eq!(measure(&g, &sc).sib_side_linked, 1);
+        // An edge between two nodes of one subgraph is no block edge,
+        // however it is drawn.
+        let (g, mut sc) = laid("flowchart TD\nsubgraph S[one]\na-->b\nc\nend");
+        let (a, b) = (node(&sc, "a"), node(&sc, "b"));
+        let x = sc.clusters[0].x + sc.clusters[0].w + 30.0;
+        draw_linear(
+            &mut sc.edges[0],
+            &[
+                (a.x + a.w / 2.0, a.y),
+                (x, a.y),
+                (x, b.y),
+                (b.x + b.w / 2.0, b.y),
+            ],
+        );
+        let m = measure(&g, &sc);
+        assert_eq!((m.lateral_x, m.side_ends, m.up_lanes), (0, 0, 0), "{m:?}");
+    }
+
+    /// B12.1: an edge to a whole subgraph ends clear of the frame's
+    /// corners.
+    #[test]
+    fn a_pin_beside_a_frame_corner_is_counted() {
+        let (g, mut sc) = laid("flowchart TD\nx --> S\nsubgraph S[one]\na\nend");
+        let f = sc.clusters[0].clone();
+        let x = sc.nodes.iter().find(|n| n.id == "x").unwrap().clone();
+        let at = sc.edges.iter().position(|e| e.to == "S").unwrap();
+        draw_linear(&mut sc.edges[at], &[bottom(&x), (f.x + f.w / 2.0, f.y)]);
+        assert_eq!(measure(&g, &sc).pin_corner, 0);
+        draw_linear(&mut sc.edges[at], &[bottom(&x), (f.x + 5.0, f.y)]);
+        assert_eq!(measure(&g, &sc).pin_corner, 1);
+    }
+
+    #[test]
+    fn border_crossings_name_the_side_crossed() {
+        let r = Rect(20.0, 0.0, 50.0, 10.0);
+        assert_eq!(border_crossings(&[(0.0, 5.0), (100.0, 5.0)], r), ['L', 'R']);
+        assert_eq!(border_crossings(&[(30.0, -10.0), (30.0, 5.0)], r), ['T']);
+        assert_eq!(border_crossings(&[(30.0, 5.0), (30.0, 40.0)], r), ['B']);
+        // A run on the border, or an end on it, crosses nothing.
+        assert!(border_crossings(&[(0.0, 0.0), (100.0, 0.0)], r).is_empty());
+        assert!(border_crossings(&[(0.0, 5.0), (20.0, 5.0)], r).is_empty());
+        // In and out again on one polyline.
+        let z = [(30.0, -5.0), (30.0, 5.0), (60.0, 5.0)];
+        assert_eq!(border_crossings(&z, r), ['T', 'R']);
+    }
+
+    /// B12.1: a 1 px drag moves no frame it has no reason to redraw,
+    /// and the two drawings of a diagram are compared frame by frame.
+    #[test]
+    fn frames_are_compared_between_scene_route_and_a_drag() {
+        let src = include_str!("../tests/fixtures/blocks/hub5.mmd");
+        let rep = measure_source(src, false).unwrap();
+        assert!(rep.block_mode);
+        assert!(rep.fr_max.is_finite() && rep.fr_max >= 0.0);
+        let g = match parse_document(src).unwrap() {
+            Document::Flowchart(g) => g,
+            _ => unreachable!("a flowchart"),
+        };
+        let (own, far) = frame_drags(&g, &rep.static_scene);
+        assert!(
+            own >= 1.0 - 1e-9,
+            "the dragged node's frame follows it: {own}"
+        );
+        assert_eq!(far, 0.0);
+        // No subgraph, nothing to compare.
+        let flat = measure_source("flowchart TD\nA-->B", false).unwrap();
+        assert!(!flat.block_mode);
+        assert_eq!((flat.fr_max, flat.ends_apart), (0.0, 0));
+        // The level tree as text.
+        let dump = levels_dump(&g);
+        assert_eq!(dump.len(), 6, "{dump:?}");
+        assert!(
+            dump[0].starts_with("(root) in - depth 0: 0:HUB "),
+            "{dump:?}"
         );
     }
 

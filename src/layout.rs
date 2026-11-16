@@ -17,6 +17,7 @@
 
 use crate::clearance::{FRAME_SEP, NODE_SEP, TIGHT_RUN_MIN};
 use crate::labels::{FAN_FAR, FAN_SIBLING_GAP, LABEL_SIDE_AIR, LABEL_STRADDLE, STROKE_PAD};
+use crate::levels::{BlockLinks, Tree, Unit as LevelUnit};
 use crate::model::{Direction, EdgeKind, Graph, Node, Shape};
 use crate::ports::PORT_INSET;
 use crate::scene::{port_lean, ARROW_MARKER_PX};
@@ -1467,7 +1468,7 @@ pub(crate) fn node_labels(g: &Graph, measure: &dyn Fn(&str) -> f64) -> Vec<Strin
 /// height in pixels) — used by pipelines where node size doesn't
 /// come from the label, e.g. ER entity tables or icon nodes.
 pub fn layout_sized(g: &Graph, sizes: &[(f64, f64)]) -> LayoutResult {
-    layout_core(g, sizes, None, &[]).0
+    layout_core(g, sizes, None, &[], None).0
 }
 
 /// Cluster-aware layout. `node_cluster[v]` is v's subgraph path,
@@ -1482,12 +1483,48 @@ pub fn layout_clustered(
     sizes: &[(f64, f64)],
     node_cluster: &[Vec<usize>],
 ) -> LayoutResult {
-    layout_core(g, sizes, Some(node_cluster), &[]).0
+    // The switch of the block layout is read here, once, for a call that
+    // comes in through the public function ([`crate::levels`]).
+    let blocks = (crate::levels::blocks_on() && crate::levels::border_edge(g, node_cluster))
+        .then(BlockLinks::default);
+    layout_core(g, sizes, Some(node_cluster), &[], blocks).0
 }
 
 /// Per original edge, per channel waypoint: the cluster path the
 /// waypoint's dummy was laid out in (see [`layout_clustered_ranked`]).
 pub(crate) type EdgeGroups = Vec<Vec<Vec<usize>>>;
+
+/// Per node of a graph laid out as blocks: its chain of blocks as the
+/// layering took them, outermost first — its subgraph path without the
+/// subgraphs the lane rule dissolved ([`block_rank`]). Two nodes with
+/// the same chain are plain nodes of one level: an upstream edge
+/// between them keeps its lane ([`keeps_lane`]).
+pub(crate) type BlockPaths = Vec<Vec<usize>>;
+
+/// Whether an edge that runs against the flow is drawn as a back-edge
+/// lane: always before blocks; in a block layout (`blocks`) only
+/// between two plain nodes of one level. Every other upstream edge of a
+/// block layout runs in a channel, out of its source's upstream side
+/// and into its target's downstream side.
+pub(crate) fn keeps_lane(blocks: Option<&[Vec<usize>]>, from: usize, to: usize) -> bool {
+    blocks.map_or(true, |paths| paths[from] == paths[to])
+}
+
+/// The channel point that carries a chain's label in a block layout:
+/// the middle one of the chain's run at the level of its ends' common
+/// ancestor (`common`, their shared subgraph path), which lies outside
+/// both end blocks; without such a run, the middle of the whole chain.
+/// `paths` holds each channel point's subgraph path.
+pub(crate) fn label_slot(paths: &[Vec<usize>], common: &[usize]) -> usize {
+    let run: Vec<usize> = (0..paths.len())
+        .filter(|&i| paths[i].as_slice() == common)
+        .collect();
+    if run.is_empty() {
+        paths.len() / 2
+    } else {
+        run[run.len() / 2]
+    }
+}
 
 /// A rank-only link `(from, to)`: every `to` node ranks at least one
 /// layer below every `from` node.
@@ -1498,14 +1535,22 @@ pub(crate) type RankGroup = (Vec<usize>, Vec<usize>);
 /// ordering, but get no channel and are never drawn — the stand-ins for
 /// edges that end on a whole subgraph box. Also returns, for every
 /// edge, the cluster path of each channel waypoint, so the caller can
-/// tell which box a lane runs inside.
+/// tell which box a lane runs inside; and, when the graph was laid out
+/// as blocks (`Graph::block_links`), each node's chain of blocks as the
+/// layering took them ([`BlockPaths`]).
 pub(crate) fn layout_clustered_ranked(
     g: &Graph,
     sizes: &[(f64, f64)],
     node_cluster: &[Vec<usize>],
     rank_only: &[RankGroup],
-) -> (LayoutResult, EdgeGroups) {
-    layout_core(g, sizes, Some(node_cluster), rank_only)
+) -> (LayoutResult, EdgeGroups, Option<(BlockPaths, Vec<f64>)>) {
+    layout_core(
+        g,
+        sizes,
+        Some(node_cluster),
+        rank_only,
+        g.block_links.clone(),
+    )
 }
 
 fn layout_core(
@@ -1513,7 +1558,8 @@ fn layout_core(
     sizes: &[(f64, f64)],
     node_cluster: Option<&[Vec<usize>]>,
     rank_only: &[RankGroup],
-) -> (LayoutResult, EdgeGroups) {
+    blocks: Option<BlockLinks>,
+) -> (LayoutResult, EdgeGroups, Option<(BlockPaths, Vec<f64>)>) {
     assert_eq!(
         sizes.len(),
         g.nodes.len(),
@@ -1535,18 +1581,20 @@ fn layout_core(
     } else {
         Walk::Source
     };
-    let rk = rank(g, &groups, drawn, node_cluster, walk);
+    let rk = rank(g, &groups, drawn, node_cluster, walk, blocks.as_ref());
     let mut layer = rk.layer.clone();
     if g.tight_sources {
         if let Some(tight) = tighten_sources(g, &groups, &rk, &layer) {
             layer = tight;
         }
     }
-    let first = place(g, sizes, node_cluster, &groups, &rk, &layer, plain);
+    let first = place(g, sizes, node_cluster, &groups, &rk, &layer, plain, None);
     let mut st = State {
+        seed: first.order.clone(),
         groups,
         drawn,
         walk,
+        blocks,
         rk,
         layer,
         best: first,
@@ -1554,13 +1602,15 @@ fn layout_core(
         work: SEARCH_WORK,
     };
     if !search {
-        return (st.best.lo, st.best.groups);
+        let blocks = st.rk.blocks.map(|b| (b.paths, st.best.title_jog));
+        return (st.best.lo, st.best.groups, blocks);
     }
     if st.best.lo.total_b > RIBBON_ENTRY * st.best.depth {
         narrow(g, sizes, node_cluster, &mut st);
     }
     centre_largest(g, sizes, node_cluster, &mut st);
-    (st.best.lo, st.best.groups)
+    let blocks = st.rk.blocks.map(|b| (b.paths, st.best.title_jog));
+    (st.best.lo, st.best.groups, blocks)
 }
 
 /// Is `g` small enough for the layout search ([`SEARCH_MAX_ELEMENTS`])?
@@ -1591,6 +1641,12 @@ struct State {
     drawn: usize,
     /// The walk every candidate layering takes its cycle breakers from.
     walk: Walk,
+    /// Block mode ([`rank`]): every candidate layering is a block
+    /// layering.
+    blocks: Option<BlockLinks>,
+    /// A block layout: the first placement's final order, which every
+    /// later placement starts from ([`BlockOrder::run`]).
+    seed: Option<OrderSeed>,
     rk: Ranking,
     layer: Vec<usize>,
     best: Placement,
@@ -1640,6 +1696,7 @@ fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, 
         &st.rk,
         &st.layer,
         packed_opts,
+        st.seed.as_ref(),
     );
     if packed.lo.total_b <= st.best.lo.total_b && packed.crossings <= cap {
         st.best = packed;
@@ -1719,7 +1776,14 @@ fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, 
                 }
                 let mut cand_groups = st.groups.clone();
                 cand_groups.push(group);
-                let crk = rank(g, &cand_groups, st.drawn, node_cluster, st.walk);
+                let crk = rank(
+                    g,
+                    &cand_groups,
+                    st.drawn,
+                    node_cluster,
+                    st.walk,
+                    st.blocks.as_ref(),
+                );
                 let cand = place(
                     g,
                     sizes,
@@ -1728,6 +1792,7 @@ fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, 
                     &crk,
                     &crk.layer,
                     packed_opts,
+                    st.seed.as_ref(),
                 );
                 let cur = won.as_ref().map_or(&st.best, |w| &w.2);
                 let smaller = (area(&cand), cand.lo.total_b) < (area(cur), cur.lo.total_b);
@@ -1763,6 +1828,7 @@ fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, 
                 &st.rk,
                 &tight,
                 packed_opts,
+                st.seed.as_ref(),
             );
             if better(&cand, &st.best) {
                 st.best = cand;
@@ -1806,6 +1872,7 @@ fn narrow(g: &Graph, sizes: &[(f64, f64)], node_cluster: Option<&[Vec<usize>]>, 
                 &st.rk,
                 &cand_layer,
                 packed_opts,
+                st.seed.as_ref(),
             );
             let cur = won.as_ref().map_or(&st.best, |w| &w.1);
             if better(&cand, &st.best) && cand.lo.total_b < cur.lo.total_b {
@@ -1947,7 +2014,16 @@ fn centre_largest(
             hint: Some((c, key)),
             ..st.opts
         };
-        let cand = place(g, sizes, node_cluster, &st.groups, &st.rk, &st.layer, opts);
+        let cand = place(
+            g,
+            sizes,
+            node_cluster,
+            &st.groups,
+            &st.rk,
+            &st.layer,
+            opts,
+            st.seed.as_ref(),
+        );
         let o = off(&cand);
         if cand.crossings <= st.best.crossings
             && cand.hits <= st.best.hits
@@ -2237,6 +2313,25 @@ struct Ranking {
     group_eid: Vec<usize>,
     /// Longest-path layer per REAL node.
     layer: Vec<usize>,
+    /// Block mode: what the block layering adds ([`block_rank`]).
+    /// `None`: the layering as it was before blocks.
+    blocks: Option<BlockRanking>,
+}
+
+/// What a block layering ([`block_rank`]) hands on with its layers.
+#[derive(Clone, Debug, Default)]
+struct BlockRanking {
+    /// Per edge: a flagged stand-in ([`BlockLinks`]) — no link, so the
+    /// placement gives it no channel and no pull.
+    flagged: Vec<bool>,
+    /// Per node: its chain of blocks as the layering took them,
+    /// outermost first — its subgraph path without the subgraphs the
+    /// lane rule dissolved, whose members are units of the level round
+    /// them.
+    paths: Vec<Vec<usize>>,
+    /// The levels the lane rule fired on, in firing order (`None`: the
+    /// top level).
+    fired: Vec<Option<usize>>,
 }
 
 /// Steps 1 and 2: mark back-edges, then longest-path layering; with
@@ -2244,21 +2339,31 @@ struct Ranking {
 /// down to its first row ([`seat_box_sources`]). The groups from
 /// `rank_only[drawn..]` on are narrowing's stackings and wraps: they
 /// rank like the others but say nothing about where a box starts.
+///
+/// With `blocks` (block mode) only the back-edge marks are taken from
+/// here; the layers are [`block_rank`]'s, and a flagged pair is no link.
 fn rank(
     g: &Graph,
     rank_only: &[RankGroup],
     drawn: usize,
     node_cluster: Option<&[Vec<usize>]>,
     walk: Walk,
+    blocks: Option<&BlockLinks>,
 ) -> Ranking {
     let n = g.nodes.len();
+    // Block mode needs the subgraph paths; without them it is off.
+    let blocks = blocks.filter(|_| node_cluster.is_some());
+    let flagged_edge = |ei: usize| blocks.is_some_and(|b| b.flagged_edge(ei));
+    let flagged_group = |k: usize| blocks.is_some_and(|b| b.flagged_group(k));
     // Ranking graph: the real nodes, then one HUB per rank-only group
     // (`from -> hub` weighs one layer, `hub -> to` none), so a group
     // costs |from| + |to| links instead of every from x to pair.
     let nx = n + rank_only.len();
     let mut adj: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nx];
     for (ei, e) in g.edges.iter().enumerate() {
-        adj[e.from].push((e.to, ei));
+        if !flagged_edge(ei) {
+            adj[e.from].push((e.to, ei));
+        }
     }
     // Hub links ride the same DFS / layering as real edges, numbered
     // after them; `group_eid[k]` is group k's first link id.
@@ -2267,6 +2372,10 @@ fn rank(
     let mut group_eid = Vec::with_capacity(rank_only.len());
     for (k, (from, to)) in rank_only.iter().enumerate() {
         group_eid.push(nlinks);
+        if flagged_group(k) {
+            nlinks += from.len() + to.len();
+            continue;
+        }
         for &a in from {
             adj[a].push((n + k, nlinks));
             nlinks += 1;
@@ -2336,6 +2445,33 @@ fn rank(
         }
     }
 
+    // Block mode: the marks above are the raw marks of the block
+    // layering, which does the rest.
+    if let (Some(nc), Some(links)) = (node_cluster, blocks) {
+        let exact = walk == Walk::Fewest;
+        let (layer, blocks) = block_rank(g, nc, rank_only, &group_eid, &back, links, exact);
+        // An edge runs against the flow where its layers say so (the raw
+        // marks no longer do: one dropped, or turned back by the block
+        // order, points down again). A flagged group pulls nothing.
+        let mut back = vec![false; nlinks];
+        for (ei, e) in g.edges.iter().enumerate() {
+            back[ei] = e.from == e.to || layer[e.to] < layer[e.from];
+        }
+        for (k, (from, to)) in rank_only.iter().enumerate() {
+            if flagged_group(k) {
+                for id in group_eid[k]..group_eid[k] + from.len() + to.len() {
+                    back[id] = true;
+                }
+            }
+        }
+        return Ranking {
+            back,
+            group_eid,
+            layer,
+            blocks: Some(blocks),
+        };
+    }
+
     // --- 2. Longest-path layering on the DAG (back-edges excluded) ---
     let mut indeg = vec![0usize; nx];
     for links in &adj {
@@ -2402,7 +2538,775 @@ fn rank(
         back,
         group_eid,
         layer,
+        blocks: None,
     }
+}
+
+/// A clustered layout graph's layering as blocks and as it was before
+/// blocks, side by side ([`layerings`]).
+pub(crate) struct Layerings {
+    /// Each node's layer in the block layering.
+    pub(crate) block: Vec<usize>,
+    /// Each node's layer in the layering before blocks.
+    pub(crate) before: Vec<usize>,
+    /// The edges that run against the flow in the block layering.
+    pub(crate) upstream: Vec<usize>,
+    /// The levels the lane rule dissolved (`None`: the top level).
+    pub(crate) lanes: Vec<Option<usize>>,
+    /// Each node's chain of blocks in the block layering, outermost
+    /// first (its subgraph path without the dissolved subgraphs).
+    pub(crate) paths: Vec<Vec<usize>>,
+}
+
+/// Both layerings of the clustered layout graph `g` ([`rank`] with and
+/// without `links`), for the reports and tests that compare them: the
+/// inputs whose rows the block layout leaves as they were are judged by
+/// "not worse than before".
+pub(crate) fn layerings(
+    g: &Graph,
+    node_cluster: &[Vec<usize>],
+    rank_only: &[RankGroup],
+    links: &BlockLinks,
+) -> Layerings {
+    let walk = if g.nodes.len() + g.edges.len() <= WALK_MAX_ELEMENTS {
+        Walk::Fewest
+    } else {
+        Walk::Source
+    };
+    let drawn = rank_only.len();
+    let before = rank(g, rank_only, drawn, Some(node_cluster), walk, None);
+    let block = rank(g, rank_only, drawn, Some(node_cluster), walk, Some(links));
+    let upstream = (0..g.edges.len())
+        .filter(|&ei| g.edges[ei].from != g.edges[ei].to && block.back[ei])
+        .collect();
+    let blocks = block.blocks.unwrap_or_default();
+    Layerings {
+        block: block.layer,
+        before: before.layer,
+        upstream,
+        lanes: blocks.fired,
+        paths: blocks.paths,
+    }
+}
+
+/// A strongly connected component of a level's units is ordered exactly
+/// (the fewest drawn links against the flow, by a programme over its
+/// subsets) up to this many units: 4 096 subsets of 12 x 12 steps each.
+/// A larger one keeps the walk's order.
+const BLOCK_ORDER_EXACT_MAX: usize = 12;
+
+/// The lane rule's share, as a fraction: a level whose every stacking
+/// order turns MORE than this share of its drawn links (and in which a
+/// path enters one block twice) keeps its blocks side by side.
+const LANE_SHARE: (usize, usize) = (1, 3);
+
+/// One link of the block layering between two nodes: a real edge or a
+/// stand-in (`weight` 1, also an invisible one: the author asked for
+/// that order; 0 for a note card's link, which is never worth turning
+/// another link for), or one `from x to` pair of a rank-only group
+/// (`weight` 0).
+struct BlockLink {
+    a: usize,
+    b: usize,
+    weight: usize,
+    /// A cycle breaker of [`rank`]'s walk (a raw mark).
+    raw: bool,
+}
+
+/// Block layering: every subgraph is ONE unit of the level round it.
+/// Returns each node's layer and what the placement needs with it.
+///
+/// A level is the top level or a subgraph with members; its units are
+/// its own nodes and its child subgraphs (blocks), in declaration order
+/// ([`Tree`]). Every link belongs to the level of the lowest common
+/// ancestor of its two ends and joins two units there. Deepest level
+/// first:
+///
+/// - **Raw marks** (`raw`, [`rank`]'s cycle breakers) are kept only
+///   where they break a cycle of their own level: the link's two units
+///   lie in one strongly connected component of the level's links as
+///   written. A kept mark is used reversed. Every other mark is dropped:
+///   the node cycle it broke leaves its block and is broken once, at the
+///   level of the frames it crosses (kept, the cycle would cost two
+///   edges against the flow).
+/// - **Block order**: two depth-first walks over the units — from the
+///   units nothing links into first, and in plain declaration order,
+///   each following a unit's links in declaration order of their targets
+///   — turn the links into a unit still on the walk's path; the walk
+///   that turns fewer drawn links is taken, the first on a tie. Per
+///   strongly connected component of up to [`BLOCK_ORDER_EXACT_MAX`]
+///   units the exact minimum `M` is known (ties to the earliest
+///   declaration order), and the component takes that order instead when
+///   the walk turns more than `2 * M + 1` of its drawn links: the
+///   author's order stands until it costs over twice the minimum.
+/// - **Lane rule** ([`LANE_SHARE`]): where every order of the units
+///   turns more than a third of the level's drawn links as written AND
+///   some path enters one child block twice, the level's child blocks
+///   are dissolved for layering — their members and their own child
+///   blocks become units of this level — and the level is solved again:
+///   two swimlanes that hand a job back and forth stay side by side,
+///   every arrow forward. A there-and-back exchange meets the first test
+///   only and is stacked.
+/// - **Rows** ([`level_rows`]): longest path, a unit as deep as its own
+///   rows; a turned link constrains the other way round.
+///
+/// A node's layer is its own start plus the starts of the blocks round
+/// it. So, at every level the lane rule left alone: a block's members
+/// fill consecutive layers, two units a link joins never share a layer,
+/// and sibling blocks never interleave.
+///
+/// `exact` is off past [`WALK_MAX_ELEMENTS`]: no component is solved.
+/// Note cards are members of their composite and take a row there like
+/// any member; a lead card ([`Graph::lead_nodes`]) then sits one row
+/// before its target inside its level.
+fn block_rank(
+    g: &Graph,
+    nc: &[Vec<usize>],
+    rank_only: &[RankGroup],
+    group_eid: &[usize],
+    raw: &[bool],
+    blocks: &BlockLinks,
+    exact: bool,
+) -> (Vec<usize>, BlockRanking) {
+    let n = g.nodes.len();
+    let ns = g.subgraphs.len();
+    let card = |v: usize| {
+        let node = &g.nodes[v];
+        crate::style::is_note_card(&node.id, node.shape, &node.style)
+    };
+    let mut links: Vec<BlockLink> = Vec::new();
+    for (ei, e) in g.edges.iter().enumerate() {
+        if e.from != e.to && !blocks.flagged_edge(ei) {
+            links.push(BlockLink {
+                a: e.from,
+                b: e.to,
+                weight: usize::from(!card(e.from) && !card(e.to)),
+                raw: raw[ei],
+            });
+        }
+    }
+    // The drawn links end here: the lane rule's path test reads them.
+    let drawn_links = links.len();
+    for (k, (from, to)) in rank_only.iter().enumerate() {
+        if blocks.flagged_group(k) {
+            continue;
+        }
+        let nf = from.len();
+        for (fi, &a) in from.iter().enumerate() {
+            for (ti, &b) in to.iter().enumerate() {
+                if a != b {
+                    let raw = raw[group_eid[k] + fi] || raw[group_eid[k] + nf + ti];
+                    links.push(BlockLink {
+                        a,
+                        b,
+                        weight: 0,
+                        raw,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut paths: Vec<Vec<usize>> = nc.to_vec();
+    let mut tree = Tree::new(&paths, ns);
+    // Per level of `tree`, its links.
+    let bucket = |tree: &Tree| -> Vec<Vec<usize>> {
+        let mut by: Vec<Vec<usize>> = vec![Vec::new(); tree.levels.len()];
+        for (k, l) in links.iter().enumerate() {
+            by[tree.join(l.a, l.b).0].push(k);
+        }
+        by
+    };
+    let mut by_level = bucket(&tree);
+    // Deepest level first, the top level last. A level the lane rule
+    // dissolves has been solved by then, and is no level afterwards.
+    let mut order: Vec<(usize, usize)> = tree
+        .levels
+        .iter()
+        .filter_map(|l| l.sub.map(|s| (l.depth, s)))
+        .collect();
+    order.sort_by_key(|&(depth, s)| (std::cmp::Reverse(depth), s));
+    let order: Vec<Option<usize>> = order
+        .into_iter()
+        .map(|(_, s)| Some(s))
+        .chain([None])
+        .collect();
+
+    let mut rows = vec![1usize; ns];
+    let mut start_node = vec![0usize; n];
+    let mut start_sub = vec![0usize; ns];
+    let mut fired: Vec<Option<usize>> = Vec::new();
+    // Unit index within the level being solved.
+    let mut at_node = vec![usize::MAX; n];
+    let mut at_sub = vec![usize::MAX; ns];
+    // The node graph of the drawn links with every raw mark reversed
+    // (acyclic), in topological order: built when the lane rule first
+    // asks for it.
+    let mut dag: Option<(Vec<usize>, Vec<Vec<usize>>)> = None;
+    for lvl in order {
+        loop {
+            let li = match lvl {
+                None => 0,
+                Some(s) => match tree.level_of_sub[s] {
+                    Some(li) => li,
+                    None => break,
+                },
+            };
+            let units: Vec<LevelUnit> = tree.levels[li].units.clone();
+            let m = units.len();
+            for (i, &u) in units.iter().enumerate() {
+                match u {
+                    LevelUnit::Node(v) => at_node[v] = i,
+                    LevelUnit::Block(s) => at_sub[s] = i,
+                }
+            }
+            let at = |u: LevelUnit| match u {
+                LevelUnit::Node(v) => at_node[v],
+                LevelUnit::Block(s) => at_sub[s],
+            };
+            // The level's links as written, between unit indices.
+            let written: Vec<(usize, usize)> = by_level[li]
+                .iter()
+                .map(|&k| {
+                    let (_, ua, ub) = tree.join(links[k].a, links[k].b);
+                    (at(ua), at(ub))
+                })
+                .collect();
+            let weight = |i: usize| links[by_level[li][i]].weight;
+            let comp_w = components(m, &written);
+            // Kept marks reversed, dropped ones as written.
+            let kept = |i: usize| {
+                links[by_level[li][i]].raw && comp_w[written[i].0] == comp_w[written[i].1]
+            };
+            let oriented: Vec<(usize, usize)> = (0..written.len())
+                .map(|i| {
+                    let (x, y) = written[i];
+                    if kept(i) {
+                        (y, x)
+                    } else {
+                        (x, y)
+                    }
+                })
+                .collect();
+            // Parallel links are one arc with their summed weight.
+            let mut arcs: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+            for (i, &xy) in oriented.iter().enumerate() {
+                *arcs.entry(xy).or_insert(0) += weight(i);
+            }
+            let arcs: Vec<((usize, usize), usize)> = arcs.into_iter().collect();
+            let arc_of = |xy: (usize, usize)| {
+                arcs.binary_search_by_key(&xy, |a| a.0)
+                    .expect("every oriented link has its arc")
+            };
+            let is_block: Vec<bool> = units
+                .iter()
+                .map(|u| matches!(u, LevelUnit::Block(_)))
+                .collect();
+            let mut turned = block_order(&is_block, &arcs, exact);
+
+            // Lane rule.
+            let mut sizes_w = vec![0usize; m];
+            for &c in &comp_w {
+                sizes_w[c] += 1;
+            }
+            let has_block = is_block.iter().any(|&b| b);
+            if has_block && sizes_w.iter().any(|&k| k >= 2) {
+                let total: usize = (0..written.len()).map(weight).sum();
+                // The least number of drawn links, as written, any order
+                // turns: exact per component where it is small enough,
+                // else what the order found above turns.
+                let mut least = 0usize;
+                for c in (0..m).filter(|&c| sizes_w[c] >= 2) {
+                    let inside = |i: usize| comp_w[written[i].0] == c && comp_w[written[i].1] == c;
+                    if exact && sizes_w[c] <= BLOCK_ORDER_EXACT_MAX {
+                        let members: Vec<usize> = (0..m).filter(|&u| comp_w[u] == c).collect();
+                        let local = |u: usize| members.binary_search(&u).unwrap_or(0);
+                        let mut w = vec![vec![0u64; members.len()]; members.len()];
+                        for i in (0..written.len()).filter(|&i| inside(i)) {
+                            w[local(written[i].0)][local(written[i].1)] += weight(i) as u64;
+                        }
+                        least += least_turned(&w).0 as usize;
+                    } else {
+                        least += (0..written.len())
+                            .filter(|&i| inside(i) && (kept(i) != turned[arc_of(oriented[i])]))
+                            .map(weight)
+                            .sum::<usize>();
+                    }
+                }
+                if LANE_SHARE.1 * least > LANE_SHARE.0 * total {
+                    let (topo, out) = dag.get_or_insert_with(|| {
+                        let mut out: Vec<Vec<usize>> = vec![Vec::new(); n];
+                        let mut indeg = vec![0usize; n];
+                        for (k, l) in links[..drawn_links].iter().enumerate() {
+                            if l.weight == 0 {
+                                continue;
+                            }
+                            let (a, b) = if l.raw { (l.b, l.a) } else { (l.a, l.b) };
+                            out[a].push(k);
+                            indeg[b] += 1;
+                        }
+                        let mut topo: Vec<usize> = (0..n).filter(|&v| indeg[v] == 0).collect();
+                        let mut i = 0;
+                        while i < topo.len() {
+                            let u = topo[i];
+                            i += 1;
+                            for &k in &out[u] {
+                                let l = &links[k];
+                                let v = if l.raw { l.a } else { l.b };
+                                indeg[v] -= 1;
+                                if indeg[v] == 0 {
+                                    topo.push(v);
+                                }
+                            }
+                        }
+                        (topo, out)
+                    });
+                    // Does a path enter one child block twice through
+                    // drawn links of this level?
+                    let twice = units.iter().any(|&block| {
+                        if !matches!(block, LevelUnit::Block(_)) {
+                            return false;
+                        }
+                        let mut best = vec![0u8; n];
+                        for &u in topo.iter() {
+                            for &k in &out[u] {
+                                let l = &links[k];
+                                let v = if l.raw { l.a } else { l.b };
+                                let (lv, cu, cv) = tree.join(u, v);
+                                let enters = lv == li && cv == block && cu != cv;
+                                let reach = best[u] + u8::from(enters);
+                                if reach >= 2 {
+                                    return true;
+                                }
+                                best[v] = best[v].max(reach);
+                            }
+                        }
+                        false
+                    });
+                    if twice {
+                        let mut gone = vec![false; ns];
+                        for &u in &units {
+                            match u {
+                                LevelUnit::Node(v) => at_node[v] = usize::MAX,
+                                LevelUnit::Block(s) => {
+                                    at_sub[s] = usize::MAX;
+                                    gone[s] = true;
+                                }
+                            }
+                        }
+                        for p in paths.iter_mut() {
+                            p.retain(|&c| !gone[c]);
+                        }
+                        tree = Tree::new(&paths, ns);
+                        by_level = bucket(&tree);
+                        fired.push(lvl);
+                        continue;
+                    }
+                }
+            }
+
+            // Rows: a link not turned puts its target after its source.
+            let mut cons: Vec<(usize, usize)> = oriented
+                .iter()
+                .map(|&(x, y)| {
+                    if turned[arc_of((x, y))] {
+                        (y, x)
+                    } else {
+                        (x, y)
+                    }
+                })
+                .collect();
+            cons.sort_unstable();
+            cons.dedup();
+            turned.clear();
+            let unit_rows: Vec<usize> = units
+                .iter()
+                .map(|&u| match u {
+                    LevelUnit::Node(_) => 1,
+                    LevelUnit::Block(s) => rows[s],
+                })
+                .collect();
+            let mut start = level_rows(&unit_rows, &is_block, &mut cons);
+            // A lead card one row before its target inside its level.
+            for (i, &u) in units.iter().enumerate() {
+                let LevelUnit::Node(v) = u else { continue };
+                if !g.lead_nodes.contains(&v) || cons.iter().any(|&(_, j)| j == i) {
+                    continue;
+                }
+                let to = cons
+                    .iter()
+                    .filter(|&&(a, _)| a == i)
+                    .map(|&(_, j)| start[j])
+                    .min();
+                if let Some(to) = to.filter(|&t| t > start[i] + 1) {
+                    start[i] = to - 1;
+                }
+            }
+            for (i, &u) in units.iter().enumerate() {
+                match u {
+                    LevelUnit::Node(v) => {
+                        start_node[v] = start[i];
+                        at_node[v] = usize::MAX;
+                    }
+                    LevelUnit::Block(s) => {
+                        start_sub[s] = start[i];
+                        at_sub[s] = usize::MAX;
+                    }
+                }
+            }
+            if let Some(s) = lvl {
+                rows[s] = (0..m)
+                    .map(|i| start[i] + unit_rows[i])
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+            }
+            break;
+        }
+    }
+    let layer: Vec<usize> = (0..n)
+        .map(|v| start_node[v] + paths[v].iter().map(|&c| start_sub[c]).sum::<usize>())
+        .collect();
+    let flagged = (0..g.edges.len())
+        .map(|ei| blocks.flagged_edge(ei))
+        .collect();
+    (
+        layer,
+        BlockRanking {
+            flagged,
+            paths,
+            fired,
+        },
+    )
+}
+
+/// Which arcs of a level's unit graph run against the flow (block
+/// order, see [`block_rank`]): `arcs` are `((from, to), drawn weight)`
+/// between the units (`is_block` per unit, in declaration order),
+/// sorted. Two walks, the one turning less drawn weight taken (the walk
+/// from the sources on a tie); then, per strongly connected component
+/// solved exactly (`exact`, up to [`BLOCK_ORDER_EXACT_MAX`] units), its
+/// least-turning order instead where the walk turns more than
+/// `2 * M + 1` there. The arcs left are acyclic: a walk turns every arc
+/// into a unit on its path, an arc between two components lies on no
+/// cycle, and a component that takes its exact order is a line.
+///
+/// A plain node nothing links into starts neither walk. It sits on the
+/// first row wherever it is declared, so its place in the file must not
+/// order the blocks below it: with the walk started at the first such
+/// node, two actors declared the other way round stacked the public
+/// fixture's blocks the other way round (the shared services below the
+/// clusters they feed). The walk from the sources starts at what those
+/// nodes link to — the unit most of their drawn links enter first, then
+/// declaration order — and then at the blocks nothing links into; the
+/// declared walk leaves those nodes for last.
+fn block_order(is_block: &[bool], arcs: &[((usize, usize), usize)], exact: bool) -> Vec<bool> {
+    let m = is_block.len();
+    let mut out: Vec<Vec<(usize, usize)>> = vec![Vec::new(); m];
+    let mut indeg = vec![0usize; m];
+    for (id, &((x, y), _)) in arcs.iter().enumerate() {
+        out[x].push((y, id));
+        indeg[y] += 1;
+    }
+    let walk = |roots: &mut dyn Iterator<Item = usize>| -> Vec<bool> {
+        let mut state = vec![0u8; m]; // 0 unvisited, 1 on the path, 2 done
+        let mut turned = vec![false; arcs.len()];
+        for s in roots {
+            if state[s] != 0 {
+                continue;
+            }
+            state[s] = 1;
+            let mut stack: Vec<(usize, usize)> = vec![(s, 0)];
+            while let Some(&(u, ci)) = stack.last() {
+                let Some(&(v, id)) = out[u].get(ci) else {
+                    state[u] = 2;
+                    stack.pop();
+                    continue;
+                };
+                if let Some(top) = stack.last_mut() {
+                    top.1 += 1;
+                }
+                match state[v] {
+                    0 => {
+                        state[v] = 1;
+                        stack.push((v, 0));
+                    }
+                    1 => turned[id] = true,
+                    _ => {}
+                }
+            }
+        }
+        turned
+    };
+    let cost = |turned: &[bool]| -> usize {
+        arcs.iter()
+            .zip(turned)
+            .filter(|(_, &t)| t)
+            .map(|(a, _)| a.1)
+            .sum()
+    };
+    let loose = |u: usize| indeg[u] == 0 && !is_block[u];
+    // Per unit: the drawn links into it from loose nodes.
+    let mut fed = vec![0usize; m];
+    let mut entered = vec![false; m];
+    for u in (0..m).filter(|&u| loose(u)) {
+        for &(v, id) in &out[u] {
+            fed[v] += arcs[id].1;
+            entered[v] = true;
+        }
+    }
+    let mut entries: Vec<usize> = (0..m).filter(|&u| entered[u]).collect();
+    entries.sort_by_key(|&u| (std::cmp::Reverse(fed[u]), u));
+    let from_sources = walk(
+        &mut entries
+            .into_iter()
+            .chain((0..m).filter(|&u| indeg[u] == 0 && is_block[u]))
+            .chain(0..m),
+    );
+    let declared = walk(
+        &mut (0..m)
+            .filter(|&u| !loose(u))
+            .chain((0..m).filter(|&u| loose(u))),
+    );
+    let mut turned = if cost(&declared) < cost(&from_sources) {
+        declared
+    } else {
+        from_sources
+    };
+    if !exact || !turned.iter().any(|&t| t) {
+        return turned;
+    }
+    // The safety net, per strongly connected component.
+    let pairs: Vec<(usize, usize)> = arcs.iter().map(|a| a.0).collect();
+    let comp = components(m, &pairs);
+    let mut size = vec![0usize; m];
+    for &c in &comp {
+        size[c] += 1;
+    }
+    for c in (0..m).filter(|&c| (2..=BLOCK_ORDER_EXACT_MAX).contains(&size[c])) {
+        let members: Vec<usize> = (0..m).filter(|&u| comp[u] == c).collect();
+        let local = |u: usize| members.binary_search(&u).unwrap_or(0);
+        let inside: Vec<usize> = (0..arcs.len())
+            .filter(|&id| comp[arcs[id].0 .0] == c && comp[arcs[id].0 .1] == c)
+            .collect();
+        let walked: usize = inside
+            .iter()
+            .filter(|&&id| turned[id])
+            .map(|&id| arcs[id].1)
+            .sum();
+        if walked <= 1 {
+            continue; // never above 2 * M + 1
+        }
+        // Drawn weight first; among equals, fewer undrawn arcs turned.
+        let big = inside.len() as u64 + 1;
+        let mut w = vec![vec![0u64; members.len()]; members.len()];
+        for &id in &inside {
+            let ((x, y), drawn) = arcs[id];
+            w[local(x)][local(y)] += drawn as u64 * big + u64::from(drawn == 0);
+        }
+        let (least, pos) = least_turned(&w);
+        if walked as u64 > 2 * (least / big) + 1 {
+            for &id in &inside {
+                let (x, y) = arcs[id].0;
+                turned[id] = pos[local(x)] > pos[local(y)];
+            }
+        }
+    }
+    turned
+}
+
+/// The order of `w.len()` units (at most [`BLOCK_ORDER_EXACT_MAX`]) that
+/// turns the least weight, `w[i][j]` being the weight of the links
+/// `i -> j` (turned when `j` comes before `i`): that weight, and each
+/// unit's position. Among the best orders the lexicographically smallest
+/// sequence of unit indices. A programme over the subsets placed so far.
+fn least_turned(w: &[Vec<u64>]) -> (u64, Vec<usize>) {
+    let k = w.len();
+    debug_assert!(k <= BLOCK_ORDER_EXACT_MAX);
+    let full = (1usize << k) - 1;
+    // Placing `j` next turns every link into it from a unit not placed.
+    let step = |set: usize, j: usize| -> u64 {
+        (0..k)
+            .filter(|&i| i != j && set & (1 << i) == 0)
+            .map(|i| w[i][j])
+            .sum()
+    };
+    let mut best = vec![0u64; full + 1];
+    for set in (0..full).rev() {
+        best[set] = (0..k)
+            .filter(|&j| set & (1 << j) == 0)
+            .map(|j| step(set, j) + best[set | (1 << j)])
+            .min()
+            .unwrap_or(0);
+    }
+    let mut pos = vec![0usize; k];
+    let mut set = 0usize;
+    for place in 0..k {
+        let next = (0..k)
+            .filter(|&j| set & (1 << j) == 0)
+            .find(|&j| step(set, j) + best[set | (1 << j)] == best[set]);
+        let Some(j) = next else { break };
+        pos[j] = place;
+        set |= 1 << j;
+    }
+    (best[0], pos)
+}
+
+/// Strongly connected components of the graph of `m` vertices and
+/// `arcs`: each vertex's component, named by its smallest vertex.
+/// Kosaraju's two passes, without recursion.
+fn components(m: usize, arcs: &[(usize, usize)]) -> Vec<usize> {
+    let mut out: Vec<Vec<usize>> = vec![Vec::new(); m];
+    let mut into: Vec<Vec<usize>> = vec![Vec::new(); m];
+    for &(x, y) in arcs {
+        out[x].push(y);
+        into[y].push(x);
+    }
+    // Vertices by finishing time of a depth-first walk.
+    let mut seen = vec![false; m];
+    let mut finished: Vec<usize> = Vec::with_capacity(m);
+    for s in 0..m {
+        if seen[s] {
+            continue;
+        }
+        seen[s] = true;
+        let mut stack: Vec<(usize, usize)> = vec![(s, 0)];
+        while let Some(&(u, ci)) = stack.last() {
+            match out[u].get(ci) {
+                Some(&v) => {
+                    if let Some(top) = stack.last_mut() {
+                        top.1 += 1;
+                    }
+                    if !seen[v] {
+                        seen[v] = true;
+                        stack.push((v, 0));
+                    }
+                }
+                None => {
+                    finished.push(u);
+                    stack.pop();
+                }
+            }
+        }
+    }
+    let mut comp = vec![usize::MAX; m];
+    for &s in finished.iter().rev() {
+        if comp[s] != usize::MAX {
+            continue;
+        }
+        let mut members = vec![s];
+        comp[s] = s;
+        let mut i = 0;
+        while i < members.len() {
+            let u = members[i];
+            i += 1;
+            for &v in &into[u] {
+                if comp[v] == usize::MAX {
+                    comp[v] = s;
+                    members.push(v);
+                }
+            }
+        }
+        let name = members.iter().copied().min().unwrap_or(s);
+        for v in members {
+            comp[v] = name;
+        }
+    }
+    comp
+}
+
+/// Rows of one level (see [`block_rank`]): each unit's first row, by
+/// longest path over `cons` (`(i, j)`: unit `j` starts after unit `i`'s
+/// last row; `rows[i]` rows per unit), then two refinements repeated in
+/// this order until neither changes anything:
+///
+/// 1. *A source block sits next to what it feeds.* A block nothing
+///    constrains starts just above the first unit it constrains (the
+///    units it links to and the blocks rule 2 put after it) when that is
+///    later, and keeps that start as a floor. Plain source nodes stay on
+///    the first row.
+/// 2. *No interleaving.* While two blocks `A`, `B` overlap in rows
+///    without one holding the other (`start(A) < start(B) < end(A) <
+///    end(B)`), `B` starts after `A`: the pair with the earliest
+///    `start(A)`, then the earliest `start(B)`, then declaration order.
+///    The constraint points from the earlier start to the later, so it
+///    closes no cycle, and it is added to `cons`.
+///
+/// Rule 1 moves a block into its own slack only and rule 2 adds at most
+/// one constraint per pair of blocks, so the loop ends within (pairs of
+/// blocks + 2) passes.
+fn level_rows(rows: &[usize], is_block: &[bool], cons: &mut Vec<(usize, usize)>) -> Vec<usize> {
+    let m = rows.len();
+    let solve = |cons: &[(usize, usize)], floor: &[usize]| -> Vec<usize> {
+        let mut out: Vec<Vec<usize>> = vec![Vec::new(); m];
+        let mut indeg = vec![0usize; m];
+        for &(i, j) in cons {
+            out[i].push(j);
+            indeg[j] += 1;
+        }
+        let mut start = floor.to_vec();
+        let mut queue: VecDeque<usize> = (0..m).filter(|&u| indeg[u] == 0).collect();
+        let mut done = 0;
+        while let Some(u) = queue.pop_front() {
+            done += 1;
+            for &v in &out[u] {
+                start[v] = start[v].max(start[u] + rows[u]);
+                indeg[v] -= 1;
+                if indeg[v] == 0 {
+                    queue.push_back(v);
+                }
+            }
+        }
+        debug_assert_eq!(done, m, "the constraints of a level are acyclic");
+        start
+    };
+    let mut floor = vec![0usize; m];
+    let mut start = solve(cons, &floor);
+    let blocks: Vec<usize> = (0..m).filter(|&u| is_block[u]).collect();
+    let pairs = blocks.len() * blocks.len().saturating_sub(1) / 2;
+    for pass in 0.. {
+        debug_assert!(pass < pairs + 2, "the rows of a level settle");
+        if pass >= pairs + 2 {
+            break;
+        }
+        let mut changed = false;
+        for &s in &blocks {
+            if cons.iter().any(|&(_, j)| j == s) {
+                continue;
+            }
+            let near = cons
+                .iter()
+                .filter(|&&(i, _)| i == s)
+                .map(|&(_, j)| start[j])
+                .min();
+            if let Some(to) = near.and_then(|t| t.checked_sub(rows[s])) {
+                if to > start[s] {
+                    floor[s] = to;
+                    start = solve(cons, &floor);
+                    changed = true;
+                }
+            }
+        }
+        loop {
+            let end = |u: usize| start[u] + rows[u];
+            let pair = blocks
+                .iter()
+                .flat_map(|&a| blocks.iter().map(move |&b| (a, b)))
+                .filter(|&(a, b)| start[a] < start[b] && start[b] < end(a) && end(a) < end(b))
+                .min_by_key(|&(a, b)| (start[a], start[b], a, b));
+            let Some(pair) = pair else { break };
+            if cons.contains(&pair) {
+                break;
+            }
+            cons.push(pair);
+            start = solve(cons, &floor);
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    start
 }
 
 /// Seat every box fed from outside the boxes below its feeders (report
@@ -2801,8 +3705,80 @@ fn compact_layers(mut layer: Vec<usize>) -> Vec<usize> {
     layer
 }
 
+/// The fence a block layering puts round later layer moves
+/// ([`tighten_sources`], [`stagger_proposals`]): a node never leaves the
+/// rows of a block it is in, and no block's rows change.
+struct Fence<'a> {
+    /// Each node's chain of blocks ([`BlockRanking::paths`]).
+    paths: &'a [Vec<usize>],
+    /// Per block: its first and last layer.
+    span: Vec<(usize, usize)>,
+    /// Members per (block, layer).
+    count: BTreeMap<(usize, usize), usize>,
+}
+
+impl<'a> Fence<'a> {
+    fn new(blocks: &'a BlockRanking, layer: &[usize]) -> Fence<'a> {
+        let subs = blocks.paths.iter().flatten().max().map_or(0, |&c| c + 1);
+        let mut span = vec![(usize::MAX, 0usize); subs];
+        let mut count: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+        for (v, path) in blocks.paths.iter().enumerate() {
+            for &c in path {
+                span[c] = (span[c].0.min(layer[v]), span[c].1.max(layer[v]));
+                *count.entry((c, layer[v])).or_insert(0) += 1;
+            }
+        }
+        Fence {
+            paths: &blocks.paths,
+            span,
+            count,
+        }
+    }
+
+    /// Whether node `v` stays within the rows of every block round it
+    /// on layer `to`.
+    fn holds(&self, v: usize, to: usize) -> bool {
+        self.paths[v]
+            .iter()
+            .all(|&c| self.span[c].0 <= to && to <= self.span[c].1)
+    }
+
+    /// Whether node `v` may move from layer `from` to layer `to`: it
+    /// stays within its blocks' rows and leaves none of their rows
+    /// empty.
+    fn allows(&self, v: usize, from: usize, to: usize) -> bool {
+        self.holds(v, to)
+            && self.paths[v]
+                .iter()
+                .all(|&c| self.count.get(&(c, from)).copied().unwrap_or(0) > 1)
+    }
+
+    /// Record that node `v` moved from layer `from` to layer `to`.
+    fn moved(&mut self, v: usize, from: usize, to: usize) {
+        for &c in &self.paths[v] {
+            if let Some(k) = self.count.get_mut(&(c, from)) {
+                *k -= 1;
+            }
+            *self.count.entry((c, to)).or_insert(0) += 1;
+        }
+    }
+
+    /// Whether `layer` (each node's new layer) leaves every block the
+    /// rows it had.
+    fn unchanged(&self, layer: &[usize]) -> bool {
+        let mut span = vec![(usize::MAX, 0usize); self.span.len()];
+        for (v, path) in self.paths.iter().enumerate() {
+            for &c in path {
+                span[c] = (span[c].0.min(layer[v]), span[c].1.max(layer[v]));
+            }
+        }
+        span == self.span
+    }
+}
+
 /// Each movable source one layer above its nearest target, or `None`
-/// when no source moves.
+/// when no source moves. In block mode a source moves only within the
+/// rows of its blocks ([`Fence`]).
 fn tighten_sources(
     g: &Graph,
     groups: &[RankGroup],
@@ -2810,6 +3786,7 @@ fn tighten_sources(
     layer: &[usize],
 ) -> Option<Vec<usize>> {
     let nl = node_links(g, groups, rk, layer);
+    let mut fence = rk.blocks.as_ref().map(|b| Fence::new(b, layer));
     let mut out = layer.to_vec();
     let mut changed = false;
     for v in 0..layer.len() {
@@ -2822,6 +3799,12 @@ fn tighten_sources(
         };
         let to = (to - 1).min(nl.deepest[v]);
         if to > layer[v] {
+            if let Some(f) = fence.as_mut() {
+                if !f.allows(v, layer[v], to) {
+                    continue;
+                }
+                f.moved(v, layer[v], to);
+            }
             out[v] = to;
             changed = true;
         }
@@ -2915,16 +3898,25 @@ fn stagger_proposals(
             None => true,
         }
     };
+    // Block mode: a leaf steps only within the rows of its blocks. (The
+    // first of every bucket stays, so no row of a block empties.)
+    let fence = rk.blocks.as_ref().map(|b| Fence::new(b, layer));
+    let fenced = |v: usize, d: isize| match (&fence, layer[v].checked_add_signed(d)) {
+        (None, _) => true,
+        (Some(f), Some(to)) => f.holds(v, to),
+        // A fresh layer above the first: outside every block.
+        (Some(f), None) => f.paths[v].is_empty(),
+    };
     // Leaves: +1 = steps down (sink or edge-less), -1 = steps up.
     let leaves = every_second(&|v| {
         if nl.outs[v].is_empty() && layer[v] < nl.deepest[v] {
-            Some(1)
+            Some(1).filter(|&d| fenced(v, d))
         } else if nl.ins[v].is_empty()
             && !nl.outs[v].is_empty()
             && layer[v] as isize > nl.shallowest[v]
             && box_top(v)
         {
-            Some(-1)
+            Some(-1).filter(|&d| fenced(v, d))
         } else {
             None
         }
@@ -2961,8 +3953,11 @@ fn stagger_proposals(
         }
         let moved: Vec<usize> = (0..n).map(|v| layer[v] + usize::from(down[v])).collect();
         // A cycle breaker inside the moved set could now point the
-        // other way: skip rather than re-break cycles.
-        if !(0..n).any(|v| down[v] && nl.pinned[v]) {
+        // other way: skip rather than re-break cycles. In block mode the
+        // shift must leave every block its rows.
+        if !(0..n).any(|v| down[v] && nl.pinned[v])
+            && fence.as_ref().map_or(true, |f| f.unchanged(&moved))
+        {
             out.push(compact_layers(moved));
         }
     }
@@ -2984,11 +3979,19 @@ struct Placement {
     /// The depth the ribbon tests read (G12): the judged layer lines'
     /// (see `place`'s `layer_lines`).
     depth: f64,
+    /// A block layout's final order ([`OrderSeed`]).
+    order: Option<OrderSeed>,
+    /// A block layout's jog room per subgraph ([`title_jogs`]; empty
+    /// outside block layouts and in LR / RL).
+    title_jog: Vec<f64>,
 }
 
 /// Steps 3 to 5 for one layering: dummy chains, ordering and
 /// coordinates. `layer` holds one layer per real node and must keep
 /// every non-back ranking link pointing down by at least its weight.
+/// `seed`: the order a block layout's later placement starts from
+/// ([`BlockOrder::run`]).
+#[allow(clippy::too_many_arguments)] // internal: one bundle of layering state
 fn place(
     g: &Graph,
     sizes: &[(f64, f64)],
@@ -2997,6 +4000,7 @@ fn place(
     rk: &Ranking,
     layer: &[usize],
     opts: Opts,
+    seed: Option<&OrderSeed>,
 ) -> Placement {
     let n = g.nodes.len();
     let back = &rk.back;
@@ -3029,8 +4033,23 @@ fn place(
     // Adjacent pairs linked so far only by a 2-cycle's return edge,
     // which stands in for the first forward edge of the pair.
     let mut return_only: std::collections::HashSet<(usize, usize)> = Default::default();
+    // Block mode: a flagged stand-in is no link (no channel, no pull).
+    let flagged = |ei: usize| rk.blocks.as_ref().is_some_and(|b| b.flagged[ei]);
+    let block_paths = rk.blocks.as_ref().map(|b| b.paths.as_slice());
+    // A back-edge without a channel: every one before blocks; in a
+    // block layout only one between two plain nodes of a level
+    // ([`keeps_lane`]) and a note card's link — the others run up a
+    // channel of their own, in the model the ordering minimises.
+    let no_channel = |ei: usize| {
+        let e = &g.edges[ei];
+        let card = |v: usize| {
+            let node = &g.nodes[v];
+            crate::style::is_note_card(&node.id, node.shape, &node.style)
+        };
+        back[ei] && (keeps_lane(block_paths, e.from, e.to) || card(e.from) || card(e.to))
+    };
     for (ei, e) in g.edges.iter().enumerate() {
-        if e.from == e.to {
+        if e.from == e.to || flagged(ei) {
             continue; // self-loop — no layered path
         }
         // Order the endpoints by layer (lo below hi) to build the chain.
@@ -3071,7 +4090,7 @@ fn place(
         // the former must not inflate the canvas, and a back-edge routed
         // up the middle would cross every forward edge — it keeps the
         // sideways bow instead. Both still influence ordering directly.
-        if matches!(e.kind, EdgeKind::Invisible) || back[ei] {
+        if matches!(e.kind, EdgeKind::Invisible) || no_channel(ei) {
             succs[lo].push(hi);
             preds[hi].push(lo);
             continue;
@@ -3099,7 +4118,9 @@ fn place(
         // its chain: sizing that dummy makes it a real obstacle, so the
         // labels of converging edges spread apart instead of piling up
         // (dagre models edge labels as nodes for exactly this reason).
-        if let (Some(lbl), false) = (&e.label, chain.is_empty()) {
+        // (A block layout picks the dummy once the chain's subgraph
+        // paths are known, below.)
+        if let (Some(lbl), false, None) = (&e.label, chain.is_empty(), block_paths) {
             let mid = chain[chain.len() / 2];
             let lw = text_width(lbl) + LABEL_PAD_W;
             let lh = LINE_H * line_count(lbl) as f64 + 6.0;
@@ -3288,13 +4309,44 @@ fn place(
                 let l = alayer[d];
                 let kv = fit(&nc[e.to], l);
                 let ku = fit(&nc[e.from], l);
-                p[d] = if kv > 0 {
+                // A block layout: the deeper fit wins. Below the top
+                // level the shared ancestor makes the target's prefix
+                // fit on every layer, so a chain out of a nested block
+                // took the ancestor's path on the block's remaining
+                // layers, lay beside the block and crossed its side
+                // wall. (Both fits past the common prefix: a level the
+                // lane rule keeps side by side; the target's, as ever.)
+                p[d] = if block_paths.is_some() && ku > kv {
+                    nc[e.from][..ku].to_vec()
+                } else if kv > 0 {
                     nc[e.to][..kv].to_vec()
                 } else if ku > 0 {
                     nc[e.from][..ku].to_vec()
                 } else {
                     common_prefix(&nc[e.from], &nc[e.to])
                 };
+            }
+        }
+        // A block layout's label slot: the chain's middle dummy at the
+        // level of its ends' common ancestor, outside both end blocks
+        // ([`label_slot`]); sized, it is a real obstacle (see above).
+        if block_paths.is_some() {
+            for (ei, chain) in edge_chain.iter().enumerate() {
+                let e = &g.edges[ei];
+                let (Some(lbl), false) = (&e.label, chain.is_empty()) else {
+                    continue;
+                };
+                let paths: Vec<Vec<usize>> = chain.iter().map(|&d| p[d].clone()).collect();
+                let mid = chain[label_slot(&paths, &common_prefix(&nc[e.from], &nc[e.to]))];
+                let lw = text_width(lbl) + LABEL_PAD_W;
+                let lh = LINE_H * line_count(lbl) as f64 + 6.0;
+                if horizontal {
+                    absize[mid] = absize[mid].max(lh);
+                    alsize[mid] = alsize[mid].max(lw);
+                } else {
+                    absize[mid] = absize[mid].max(lw);
+                    alsize[mid] = alsize[mid].max(lh);
+                }
             }
         }
         for (d, side, path) in &border_meta {
@@ -3321,7 +4373,133 @@ fn place(
             pos[v] = i as f64;
         }
     }
-    if clustered {
+    // A block layout orders level first ([`BlockOrder`]).
+    let mut dummy_edge = vec![usize::MAX; na];
+    for (ei, chain) in edge_chain.iter().enumerate() {
+        for &d in chain {
+            dummy_edge[d] = ei;
+        }
+    }
+    let element = |v: usize| -> Option<(usize, usize)> {
+        if v < n {
+            Some((v, usize::MAX))
+        } else {
+            (dummy_edge[v] != usize::MAX).then(|| (dummy_edge[v], alayer[v]))
+        }
+    };
+    let mut block_order = match (block_paths, node_cluster) {
+        (Some(_), Some(nc)) => {
+            let ns = g.subgraphs.len();
+            let mut first = vec![usize::MAX; ns];
+            let mut path_of: Vec<Option<Vec<usize>>> = vec![None; ns];
+            for (v, path) in nc.iter().enumerate() {
+                for (i, &c) in path.iter().enumerate() {
+                    first[c] = first[c].min(v);
+                    if path_of[c].is_none() {
+                        path_of[c] = Some(path[..=i].to_vec());
+                    }
+                }
+            }
+            let mut canon = vec![(0usize, 0u8, 0usize, 0usize); na];
+            for (v, key) in canon.iter_mut().enumerate().take(n) {
+                *key = (v, 0, 0, 0);
+            }
+            let mut run = vec![usize::MAX; na];
+            let mut runs = 0;
+            for (ei, chain) in edge_chain.iter().enumerate() {
+                let e = &g.edges[ei];
+                let mut prev: Option<usize> = None;
+                for &d in chain {
+                    canon[d] = (e.from, 1, e.to, ei);
+                    match prev {
+                        Some(p) if apath[p] == apath[d] => run[d] = run[p],
+                        _ => {
+                            run[d] = runs;
+                            runs += 1;
+                        }
+                    }
+                    prev = Some(d);
+                }
+            }
+            for (d, side, path) in &border_meta {
+                let c = path.last().copied().unwrap_or(0);
+                canon[*d] = (first[c], 2, usize::from(*side), 0);
+            }
+            let mut levels: Vec<(Vec<usize>, usize, usize)> =
+                vec![(Vec::new(), 0, nlayers.saturating_sub(1))];
+            let mut subs: Vec<usize> = cluster_span.keys().copied().collect();
+            subs.sort_by_key(|&c| (path_of[c].as_ref().map_or(0, Vec::len), first[c]));
+            for c in subs {
+                if let (Some(path), Some(&(lo, hi))) = (path_of[c].clone(), cluster_span.get(&c)) {
+                    levels.push((path, lo, hi));
+                }
+            }
+            let mut bspan = vec![(0usize, 0usize); ns];
+            for (&c, &span) in &cluster_span {
+                bspan[c] = span;
+            }
+            let mut rspan = vec![(usize::MAX, 0usize); runs];
+            for (d, &r) in run.iter().enumerate() {
+                if r != usize::MAX {
+                    rspan[r] = (rspan[r].0.min(alayer[d]), rspan[r].1.max(alayer[d]));
+                }
+            }
+            let mut chains: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+            let mut chain_of = vec![usize::MAX; na];
+            for chain in &edge_chain {
+                let mut ds = chain.clone();
+                ds.sort_by_key(|&d| alayer[d]);
+                let (Some(&first), Some(&last)) = (ds.first(), ds.last()) else {
+                    continue;
+                };
+                let (Some(&top), Some(&bottom)) = (preds[first].first(), succs[last].first())
+                else {
+                    continue;
+                };
+                for &d in &ds {
+                    chain_of[d] = chains.len();
+                }
+                chains.push((top, bottom, ds));
+            }
+            Some(BlockOrder {
+                bspan,
+                rspan,
+                chains,
+                chain_of,
+                apath: &apath,
+                border: &border_side,
+                preds: &preds,
+                succs: &succs,
+                alayer: &alayer,
+                nlayers,
+                canon,
+                first,
+                run,
+                runs,
+                levels,
+                brank: vec![0.0; ns],
+                slot: vec![0.0; na],
+            })
+        }
+        _ => None,
+    };
+    if let Some(order) = block_order.as_mut() {
+        let links: usize = succs.iter().map(Vec::len).sum();
+        let starts = if opts.judge {
+            (BLOCK_ORDER_WORK / (na + links).max(1)).clamp(1, BLOCK_ORDER_STARTS)
+        } else {
+            1
+        };
+        // (The reports measure the crossings start by start.)
+        let starts = crate::levels::order_starts().unwrap_or(starts);
+        order.run(
+            starts,
+            seed.map(|s| (s, &element as ElementOf<'_>)),
+            &mut layers,
+            &mut pos,
+        );
+    }
+    if clustered && block_order.is_none() {
         let keys = cluster_keys(&layers, &apath, &border_side);
         for lv in layers.iter_mut() {
             enforce_contiguity(lv, &apath, &border_side, &mut pos, &keys);
@@ -3330,6 +4508,9 @@ fn place(
     let mut best_layers = layers.clone();
     let mut best_cross = count_crossings(&layers, &succs, &alayer, nlayers);
     for _ in 0..8 {
+        if block_order.is_some() {
+            break;
+        }
         for li in 1..nlayers {
             reorder(&mut layers[li], &preds, &mut pos);
         }
@@ -3388,15 +4569,20 @@ fn place(
             pos[v] = i as f64;
         }
     }
-    if clustered && !bar_cards(g).is_empty() {
+    if let (Some(order), false) = (block_order.as_ref(), bar_cards(g).is_empty()) {
+        for lv in layers.iter_mut() {
+            order.regroup(lv, &mut pos);
+        }
+    } else if clustered && !bar_cards(g).is_empty() {
         let keys = cluster_keys(&layers, &apath, &border_side);
         for lv in layers.iter_mut() {
             enforce_contiguity(lv, &apath, &border_side, &mut pos, &keys);
         }
     }
     // A subgraph [`centre_largest`] moves: its key changes, every layer
-    // regroups around it.
-    if let (true, Some((c, key))) = (clustered, opts.hint) {
+    // regroups around it. (Not in a block layout: the level orders
+    // placed its blocks.)
+    if let (true, Some((c, key)), true) = (clustered, opts.hint, block_order.is_none()) {
         let mut keys = cluster_keys(&layers, &apath, &border_side);
         keys.1.insert(c, key);
         for lv in layers.iter_mut() {
@@ -3439,54 +4625,64 @@ fn place(
     // vertical run and centres nodes over their aligned neighbours.
     // The far ends of a compact branch point's fan whose labels need
     // to sit side by side get the room (see `fan_label_room`).
-    let spaced = fan_label_room(g, back, &layers, &alayer, &absize, &alsize, n, horizontal);
-    // A self-looped node keeps its loop's reach (and NODE_SEP) from its
-    // high-side neighbour, where the scene draws the loop (report P0
-    // #13: a channel beside it ran through the loop's apex). A
-    // separation size counts on both sides; a node with no high-side
-    // neighbour needs none. The node's own half of the gap between
-    // neighbours (`pair_sep`: GAP_B / 2) already lies past its side, so
-    // only what the loop reaches beyond it widens the node (stress's
-    // `A ==> D` channel ran 54 px past the loop's apex, the canvas 72 px
-    // wider than it needed).
-    let loops = crate::scene::loop_reach(g);
-    let spaced = if loops.iter().any(|&r| r > 0.0) {
-        let mut sep = spaced.unwrap_or_else(|| absize.clone());
-        for lay in &layers {
-            for w in lay.windows(2) {
-                let v = w[0];
-                if v < n && loops[v] > 0.0 {
-                    let past = (loops[v] + NODE_SEP - GAP_B / 2.0).max(0.0);
-                    sep[v] = sep[v].max(absize[v] + 2.0 * past);
+    let chains_b = |bpos: &[f64]| -> (f64, f64) {
+        drawn_breadth(
+            g,
+            node_cluster,
+            &absize,
+            &alsize,
+            &alayer,
+            bpos,
+            &edge_chain,
+            block_paths,
+        )
+    };
+    // (A function of the layers: X2.5 below may move a run and place
+    // them again.)
+    let breadth = |layers: &[Vec<usize>], widen: &[(usize, f64)]| -> Vec<f64> {
+        let spaced = fan_label_room(g, back, layers, &alayer, &absize, &alsize, n, horizontal);
+        // A self-looped node keeps its loop's reach (and NODE_SEP) from its
+        // high-side neighbour, where the scene draws the loop (report P0
+        // #13: a channel beside it ran through the loop's apex). A
+        // separation size counts on both sides; a node with no high-side
+        // neighbour needs none. The node's own half of the gap between
+        // neighbours (`pair_sep`: GAP_B / 2) already lies past its side, so
+        // only what the loop reaches beyond it widens the node (stress's
+        // `A ==> D` channel ran 54 px past the loop's apex, the canvas 72 px
+        // wider than it needed).
+        let loops = crate::scene::loop_reach(g);
+        let spaced = if loops.iter().any(|&r| r > 0.0) {
+            let mut sep = spaced.unwrap_or_else(|| absize.clone());
+            for lay in layers {
+                for w in lay.windows(2) {
+                    let v = w[0];
+                    if v < n && loops[v] > 0.0 {
+                        let past = (loops[v] + NODE_SEP - GAP_B / 2.0).max(0.0);
+                        sep[v] = sep[v].max(absize[v] + 2.0 * past);
+                    }
                 }
             }
-        }
-        Some(sep)
-    } else {
-        spaced
-    };
-    let bsep: &[f64] = spaced.as_deref().unwrap_or(&absize);
-    let mut bpos = coordinates_bk(
-        n,
-        na,
-        nlayers,
-        &layers,
-        preds_c,
-        succs_c,
-        &alayer,
-        bsep,
-        if clustered { Some(&apath) } else { None },
-        if clustered { Some(&border_side) } else { None },
-        if clustered && horizontal {
-            Some(header.as_slice())
+            Some(sep)
         } else {
-            None
-        },
-    );
-    if opts.compact {
-        compact_breadth(
+            spaced
+        };
+        // (X2.2 for a run past a title chip: the room it keeps from the
+        // unit before it.)
+        let spaced = if widen.is_empty() {
+            spaced
+        } else {
+            let mut sep = spaced.unwrap_or_else(|| absize.clone());
+            for &(v, w) in widen {
+                sep[v] += w;
+            }
+            Some(sep)
+        };
+        let bsep: &[f64] = spaced.as_deref().unwrap_or(&absize);
+        let mut bpos = coordinates_bk(
             n,
-            &layers,
+            na,
+            nlayers,
+            layers,
             preds_c,
             succs_c,
             &alayer,
@@ -3498,72 +4694,172 @@ fn place(
             } else {
                 None
             },
-            &mut bpos,
         );
-    }
-    // ... then slides inside its layer's free room towards the breadth
-    // centre of everything drawn (D4); the order stays, so no crossing
-    // appears.
-    let chains_b = |bpos: &[f64]| -> (f64, f64) {
-        drawn_breadth(
-            g,
-            node_cluster,
-            &absize,
-            &alsize,
-            &alayer,
-            bpos,
-            &edge_chain,
-        )
-    };
-    // A node already on a straight run with a neighbour stays: sliding it
-    // would kink that edge into an S (G8).
-    let aligned = |v: usize, bpos: &[f64]| {
-        preds[v]
-            .iter()
-            .chain(&succs[v])
-            .any(|&u| (bpos[u] - bpos[v]).abs() < ALIGN_EPS)
-    };
-    if let Some(v) = big.filter(|&v| !aligned(v, &bpos)) {
-        let ext = chains_b(&bpos);
-        let lay = &layers[alayer[v]];
-        let s = lay.iter().position(|&w| w == v).unwrap_or(0);
-        let ap = if clustered {
-            Some(apath.as_slice())
-        } else {
-            None
+        if opts.compact {
+            compact_breadth(
+                n,
+                layers,
+                preds_c,
+                succs_c,
+                &alayer,
+                bsep,
+                if clustered { Some(&apath) } else { None },
+                if clustered { Some(&border_side) } else { None },
+                if clustered && horizontal {
+                    Some(header.as_slice())
+                } else {
+                    None
+                },
+                &mut bpos,
+            );
+        }
+        // ... then slides inside its layer's free room towards the breadth
+        // centre of everything drawn (D4); the order stays, so no crossing
+        // appears.
+        // A node already on a straight run with a neighbour stays: sliding it
+        // would kink that edge into an S (G8).
+        let aligned = |v: usize, bpos: &[f64]| {
+            preds[v]
+                .iter()
+                .chain(&succs[v])
+                .any(|&u| (bpos[u] - bpos[v]).abs() < ALIGN_EPS)
         };
-        let bs = if clustered {
-            Some(border_side.as_slice())
-        } else {
-            None
-        };
-        let hb = if clustered && horizontal {
-            Some(header.as_slice())
-        } else {
-            None
-        };
-        let half = absize[v] / 2.0;
-        let lo = match s.checked_sub(1).map(|i| lay[i]) {
-            Some(l) => bpos[l] + pair_sep(l, v, n, bsep, ap, bs, hb),
-            None => ext.0 + half,
-        };
-        let hi = match lay.get(s + 1) {
-            Some(&r) => bpos[r] - pair_sep(v, r, n, bsep, ap, bs, hb),
-            None => ext.1 - half,
-        };
-        // Only as far as needed: into the middle CENTRE_SLIDE_BAND of
-        // the breadth, so its edges keep their angles where they can.
-        let (mid, band) = (
-            (ext.0 + ext.1) / 2.0,
-            (ext.1 - ext.0) / 2.0 * CENTRE_SLIDE_BAND,
-        );
-        if lo <= hi {
-            let to = bpos[v].max(mid - band).min(mid + band).max(lo).min(hi);
-            if (to - bpos[v]).abs() >= CENTRE_SLIDE_MIN_MOVE {
-                bpos[v] = to;
+        if let Some(v) = big.filter(|&v| !aligned(v, &bpos)) {
+            let ext = chains_b(&bpos);
+            let lay = &layers[alayer[v]];
+            let s = lay.iter().position(|&w| w == v).unwrap_or(0);
+            let ap = if clustered {
+                Some(apath.as_slice())
+            } else {
+                None
+            };
+            let bs = if clustered {
+                Some(border_side.as_slice())
+            } else {
+                None
+            };
+            let hb = if clustered && horizontal {
+                Some(header.as_slice())
+            } else {
+                None
+            };
+            let half = absize[v] / 2.0;
+            let lo = match s.checked_sub(1).map(|i| lay[i]) {
+                Some(l) => bpos[l] + pair_sep(l, v, n, bsep, ap, bs, hb),
+                None => ext.0 + half,
+            };
+            let hi = match lay.get(s + 1) {
+                Some(&r) => bpos[r] - pair_sep(v, r, n, bsep, ap, bs, hb),
+                None => ext.1 - half,
+            };
+            // Only as far as needed: into the middle CENTRE_SLIDE_BAND of
+            // the breadth, so its edges keep their angles where they can.
+            let (mid, band) = (
+                (ext.0 + ext.1) / 2.0,
+                (ext.1 - ext.0) / 2.0 * CENTRE_SLIDE_BAND,
+            );
+            if lo <= hi {
+                let to = bpos[v].max(mid - band).min(mid + band).max(lo).min(hi);
+                if (to - bpos[v]).abs() >= CENTRE_SLIDE_MIN_MOVE {
+                    bpos[v] = to;
+                }
             }
         }
+        bpos
+    };
+    let mut bpos = breadth(&layers, &[]);
+    let mut seed_layers: Option<Vec<Vec<usize>>> = None;
+    // X2.5 (B12, block layouts in TD / BT): a run to a member behind a
+    // block's title row whose column lies under the block's title chip
+    // crosses the title side there, and the router takes it round the
+    // chip through a lateral wall. Its channel moves past the chip in
+    // the order ([`BlockOrder::clear_titles`]), and the breadths are
+    // placed again.
+    if let (Some(order), Some(nc), false) = (block_order.as_ref(), node_cluster, horizontal) {
+        let under = runs_under_titles(
+            g,
+            &TitleRows {
+                nc,
+                apath: &apath,
+                alayer: &alayer,
+                absize: &absize,
+                bpos: &bpos,
+                border: &border_side,
+                preds: &preds,
+                succs: &succs,
+                cluster_span: &cluster_span,
+                n,
+            },
+        );
+        let before = layers.clone();
+        if !under.is_empty() && order.clear_titles(&under, &bpos, &absize, &mut layers, &mut pos) {
+            bpos = breadth(&layers, &[]);
+            // (The later placements of the layout call start from the
+            // order as the level orders left it: each moves its own runs.)
+            seed_layers = Some(before);
+        }
+        let widen = title_room(
+            g,
+            &TitleRows {
+                nc,
+                apath: &apath,
+                alayer: &alayer,
+                absize: &absize,
+                bpos: &bpos,
+                border: &border_side,
+                preds: &preds,
+                succs: &succs,
+                cluster_span: &cluster_span,
+                n,
+            },
+            &layers,
+        );
+        if !widen.is_empty() {
+            bpos = breadth(&layers, &widen);
+        }
     }
+
+    // A block layout's jog room (B12 F2): what each frame grows on its
+    // title side, reserved here on its title row's slot and reach, and
+    // added to the frame by the scene ([`title_jogs`]).
+    let title_jog: Vec<f64> = match (block_paths, node_cluster) {
+        (Some(_), Some(nc)) if !horizontal => {
+            let jog = title_jogs(
+                g,
+                &TitleRows {
+                    nc,
+                    apath: &apath,
+                    alayer: &alayer,
+                    absize: &absize,
+                    bpos: &bpos,
+                    border: &border_side,
+                    preds: &preds,
+                    succs: &succs,
+                    cluster_span: &cluster_span,
+                    n,
+                },
+            );
+            let bt = matches!(g.direction, Direction::BT);
+            for v in 0..n {
+                for &c in &nc[v] {
+                    let Some(&(lo, hi)) = cluster_span.get(&c) else {
+                        continue;
+                    };
+                    if jog[c] > 0.0 && alayer[v] == if bt { hi } else { lo } {
+                        if bt {
+                            lextra[v].1 += jog[c];
+                            reach[v].1 += jog[c];
+                        } else {
+                            lextra[v].0 += jog[c];
+                            reach[v].0 += jog[c];
+                        }
+                    }
+                }
+            }
+            jog
+        }
+        _ => Vec::new(),
+    };
 
     // Layer positions (l axis): each layer is as tall as its tallest
     // REAL node (dummies contribute zero layer-size).
@@ -3969,12 +5265,34 @@ fn place(
         let mut need = vec![0.0f64; nlayers];
         if g.edge_paint_width.is_none() && g.drawn_edge_count() <= crate::router::ROUTE_MAX_EDGES {
             let mut spans: Vec<Vec<(f64, f64)>> = vec![Vec::new(); nlayers];
+            // A block's members across the flow: the stretch of its frame
+            // side a pin may stand on (see below).
+            let mut member_ext: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
+            let mut pin_at = |c: usize, b: f64| -> f64 {
+                let (lo, hi) = *member_ext.entry(c).or_insert_with(|| {
+                    (0..n).filter(|&v| apath[v].contains(&c)).fold(
+                        (f64::INFINITY, f64::NEG_INFINITY),
+                        |(lo, hi), v| {
+                            (
+                                lo.min(bpos[v] - absize[v] / 2.0),
+                                hi.max(bpos[v] + absize[v] / 2.0),
+                            )
+                        },
+                    )
+                });
+                if lo <= hi {
+                    b.max(lo).min(hi)
+                } else {
+                    b
+                }
+            };
             for (ei, e) in g.edges.iter().enumerate() {
                 if e.from == e.to || matches!(e.kind, EdgeKind::Invisible) {
                     continue;
                 }
                 let chain = &edge_chain[ei];
-                let path: Vec<usize> = if alayer[e.from] <= alayer[e.to] {
+                let up = alayer[e.from] > alayer[e.to];
+                let path: Vec<usize> = if !up {
                     std::iter::once(e.from)
                         .chain(chain.iter().copied())
                         .chain(std::iter::once(e.to))
@@ -3985,27 +5303,90 @@ fn place(
                         .chain(std::iter::once(e.from))
                         .collect()
                 };
+                // In a block layout an edge to or from a whole block is cut
+                // back to that block's frame (`Graph::frame_cut`), and its
+                // end there is a pin on the frame side it crosses, never
+                // past the block's members (`scene::cut_to_frames`). A
+                // channel that runs beside a broader block next door lies
+                // past them, so the edge steps across between its pin and
+                // its channel in the gap at that border: a step the chain
+                // does not show (inside the block it runs on under its
+                // channel, undrawn). It takes a track of that gap like any
+                // other. Without one, two stacked blocks stood a frame gap
+                // apart with the steps of the lower block's two turned
+                // edges between them, and both were drawn inside the upper
+                // block's border (blocks/turned-blocks: `Shipping` under
+                // `Work area`, a block that holds neither end of them).
+                // Per end of the path: the cut block's layers and the gap
+                // (its lower layer) the pin's step lies in.
+                let cut_gap: [Option<(usize, usize)>; 2] = if block_paths.is_some() {
+                    let cut = g.frame_cut.get(ei).copied().unwrap_or([None, None]);
+                    let (first, last) = if up {
+                        (cut[1], cut[0])
+                    } else {
+                        (cut[0], cut[1])
+                    };
+                    [
+                        first.and_then(|c| cluster_span.get(&c).map(|s| (c, s.1 + 1))),
+                        last.and_then(|c| cluster_span.get(&c).map(|s| (c, s.0))),
+                    ]
+                } else {
+                    [None, None]
+                };
                 for w in path.windows(2) {
                     let (a, b) = (w[0], w[1]);
-                    if alayer[b] != alayer[a] + 1 || (bpos[a] - bpos[b]).abs() <= 1.0 {
+                    if alayer[b] != alayer[a] + 1 {
                         continue;
                     }
-                    spans[alayer[b]].push((bpos[a].min(bpos[b]), bpos[a].max(bpos[b])));
+                    // (The pair across a cut block's border: its step runs
+                    // from the pin, not from the undrawn run inside.)
+                    let (pa, pb) = match cut_gap {
+                        [Some((c, gap)), _] if gap == alayer[b] => (pin_at(c, bpos[b]), bpos[b]),
+                        [_, Some((c, gap))] if gap == alayer[b] => (bpos[a], pin_at(c, bpos[a])),
+                        _ => (bpos[a], bpos[b]),
+                    };
+                    if (pa - pb).abs() <= 1.0 {
+                        continue;
+                    }
+                    spans[alayer[b]].push((pa, pb));
                 }
             }
             for (li, sp) in spans.iter_mut().enumerate() {
-                // The most spans over one point: the tracks the gap needs.
-                let mut ev: Vec<(f64, i32)> = Vec::with_capacity(2 * sp.len());
-                for &(a, b) in sp.iter() {
-                    ev.push((a, 1));
-                    ev.push((b, -1));
+                // The tracks the gap needs. Outside a block layout: the
+                // most spans over one point.
+                let mut most = 0usize;
+                if block_paths.is_none() {
+                    let mut ev: Vec<(f64, i32)> = Vec::with_capacity(2 * sp.len());
+                    for &(a, b) in sp.iter() {
+                        ev.push((a.min(b), 1));
+                        ev.push((a.max(b), -1));
+                    }
+                    ev.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+                    let mut cur = 0i32;
+                    for (_, d) in ev {
+                        cur += d;
+                        most = most.max(cur.max(0) as usize);
+                    }
+                } else {
+                    // A block layout's gap (B12 G2): its largest channel as
+                    // the ortho stage packs it (`ortho::channel_sizes`),
+                    // one track per step. The steps of a channel nest,
+                    // every one on its own track, also where two of them
+                    // never meet over one point: a hub's fan stepping down
+                    // a staircase into the gap under its block is a chain
+                    // of steps each overlapping the next, and its order
+                    // asks one track a step. Counted by the most over one
+                    // point, dense-td's fan of nine steps under its
+                    // second band was given room for seven; its two
+                    // outermost steps shared a track 4 px apart, the
+                    // router rerouted one of them, and the fan crossed
+                    // itself sixteen times.
+                    most = crate::ortho::channel_sizes(sp)
+                        .into_iter()
+                        .max()
+                        .unwrap_or(0);
                 }
-                ev.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
-                let (mut cur, mut most) = (0i32, 0i32);
-                for (_, d) in ev {
-                    cur += d;
-                    most = most.max(cur);
-                }
+                let most = most as i32;
                 if most >= 1 {
                     need[li] = crate::ortho::ROW_CLEAR
                         + crate::ortho::HEAD_LEG
@@ -4132,6 +5513,22 @@ fn place(
             if !judged && li > 0 && track_need[li] > 0.0 {
                 let prev = lcoord[li - 1] + prev_after;
                 cursor = cursor.max(prev + track_need[li]);
+                // A block layout's tracks lie between the frames: where
+                // a frame closes on the layer before or opens on this
+                // one, the steps across the gap run between the two
+                // borders, and the room is measured from frame to frame
+                // (pads and title strips included, as `reach_of` reads
+                // them). Measured from row to row, as above, the nested
+                // frames of two bands took the room themselves: the
+                // fifteen steps between dense-td's second and third
+                // band shared 30 px, ran on top of each other and
+                // crossed twice a pair (94 crossings after the ortho
+                // stage; 36 with the room).
+                if block_paths.is_some() {
+                    let at =
+                        lcoord[li - 1] + reach_of(li - 1, 1) + track_need[li] + reach_of(li, 0);
+                    cursor = cursor.max(at - before);
+                }
             }
             prev_after = after;
             lcoord[li] = cursor + before;
@@ -4219,6 +5616,14 @@ fn place(
                 .collect()
         })
         .collect();
+    let order: Option<OrderSeed> = block_paths.map(|_| {
+        seed_layers
+            .as_ref()
+            .unwrap_or(&layers)
+            .iter()
+            .map(|lv| lv.iter().filter_map(|&v| element(v)).collect())
+            .collect()
+    });
 
     Placement {
         lo: LayoutResult {
@@ -4233,7 +5638,262 @@ fn place(
         ckeys,
         ext,
         depth,
+        order,
+        title_jog,
     }
+}
+
+/// A block's title chip as a block layout's placement sees it (TD /
+/// BT; [`title_chip`]).
+struct TitleChip {
+    /// The block's title row: its first layer (TD), its last (BT).
+    row: usize,
+    /// The block's depth: the length of its members' subgraph path up to
+    /// and including it.
+    depth: usize,
+    /// The chip's breadth interval, widened by
+    /// [`crate::ortho::CHIP_CLEAR`].
+    lo: f64,
+    hi: f64,
+}
+
+/// Block `c`'s title chip ([`TitleChip`]): it spans the frame's left
+/// inset and the title's width (the frame's left: its members' boxes,
+/// and the channel points inside it, as the scene wraps them). None for
+/// a block without a title or without members.
+fn title_chip(g: &Graph, t: &TitleRows, c: usize) -> Option<TitleChip> {
+    use crate::clearance::{CHIP_INSET_X, CHIP_PAD_W};
+    let title = &g.subgraphs[c].title;
+    if title.trim().is_empty() {
+        return None;
+    }
+    let &(lo, hi) = t.cluster_span.get(&c)?;
+    let row = if matches!(g.direction, Direction::BT) {
+        hi
+    } else {
+        lo
+    };
+    let mut left = f64::INFINITY;
+    for v in 0..t.n {
+        if t.nc[v].contains(&c) {
+            left = left.min(t.bpos[v] - t.absize[v] / 2.0 - FRAME_PAD);
+        }
+    }
+    for d in t.n..t.bpos.len() {
+        if t.border[d] == 0 && t.apath[d].contains(&c) {
+            left = left.min(t.bpos[d] - crate::scene::LANE_PAD);
+        }
+    }
+    if !left.is_finite() {
+        return None;
+    }
+    let depth = t.apath.iter().enumerate().find_map(|(v, p)| {
+        (v < t.n && t.nc[v].contains(&c)).then(|| p.iter().position(|&x| x == c).map(|i| i + 1))
+    })??;
+    Some(TitleChip {
+        row,
+        depth,
+        lo: left + CHIP_INSET_X - crate::ortho::CHIP_CLEAR,
+        hi: left
+            + CHIP_INSET_X
+            + text_width(title) * TITLE_SCALE
+            + CHIP_PAD_W
+            + crate::ortho::CHIP_CLEAR,
+    })
+}
+
+/// A block layout's channel points that stand under a title chip (TD /
+/// BT, B12 X2.5): per block, each dummy of the block's own level on its
+/// title row whose column lies in the chip's interval — a run to a
+/// member behind the title row, which crosses the title side under the
+/// chip. With the right end of the chip's interval.
+fn runs_under_titles(g: &Graph, t: &TitleRows) -> Vec<(usize, f64)> {
+    let mut out = Vec::new();
+    for &c in t.cluster_span.keys() {
+        let Some(chip) = title_chip(g, t, c) else {
+            continue;
+        };
+        for d in t.n..t.bpos.len() {
+            if t.alayer[d] == chip.row
+                && t.border[d] == 0
+                && t.apath[d].len() == chip.depth
+                && t.apath[d].last() == Some(&c)
+                && t.bpos[d] > chip.lo
+                && t.bpos[d] < chip.hi
+            {
+                out.push((d, chip.hi));
+            }
+        }
+    }
+    out
+}
+
+/// The most a run's column moves for the room past a title chip
+/// ([`title_room`]): two node gaps. A run that a long chip would push
+/// further keeps its column (X2.2's frame breadth for a chip wider than
+/// its block is not built): pushed past the chip of a long title over a
+/// narrow block, a turned edge's run widened the drawing of one local
+/// acceptance input by 13 %, past the 10 % its permutations may differ.
+const TITLE_ROOM_MAX: f64 = 2.0 * GAP_B;
+
+/// X2.2 for the runs of a block layout that cross a title side past the
+/// chip (TD / BT): such a run's column keeps clear of the chip and of the
+/// columns the block's displaced entries take past it
+/// ([`crate::ortho`]'s title sides: the first a corner's rounding past
+/// the chip's clearance, the next a track apart), so the entries jog in
+/// to their ports without crossing it. Per run on a title row short of
+/// that column, with a unit of its block before it there: the breadth
+/// its element widens by so that its least distance from that unit
+/// reaches the column. (blocks/nested-chain: past `Inner target`'s chip
+/// `a -> c2` ran down 1 px clear of it, and `b2 -> c`, displaced, took
+/// the column past the run and crossed it twice.)
+fn title_room(g: &Graph, t: &TitleRows, layers: &[Vec<usize>]) -> Vec<(usize, f64)> {
+    let counts = title_counts(g, t);
+    let mut out = Vec::new();
+    for &c in t.cluster_span.keys() {
+        let Some(chip) = title_chip(g, t, c) else {
+            continue;
+        };
+        let k = counts[c].0;
+        let need = if k == 0 {
+            chip.hi
+        } else {
+            chip.hi + crate::router::CORNER_R + k as f64 * crate::ortho::TRACK_PITCH
+        };
+        let lv = &layers[chip.row];
+        for (i, &d) in lv.iter().enumerate() {
+            if d < t.n
+                || t.border[d] != 0
+                || t.apath[d].len() != chip.depth
+                || t.apath[d].last() != Some(&c)
+                || t.bpos[d] <= chip.lo
+                || t.bpos[d] >= need
+            {
+                continue;
+            }
+            let Some(&u) = i.checked_sub(1).map(|j| &lv[j]) else {
+                continue;
+            };
+            let inside = if u < t.n {
+                t.nc[u].contains(&c)
+            } else {
+                t.border[u] == 0 && t.apath[u].contains(&c)
+            };
+            if !inside {
+                continue;
+            }
+            let least = pair_sep(u, d, t.n, t.absize, Some(t.apath), Some(t.border), None);
+            let short = need - t.bpos[u] - least;
+            if short > 0.0 && short <= TITLE_ROOM_MAX {
+                out.push((d, 2.0 * short));
+            }
+        }
+    }
+    out
+}
+
+/// What [`title_jogs`] reads of a placement.
+struct TitleRows<'a> {
+    nc: &'a [Vec<usize>],
+    apath: &'a [Vec<usize>],
+    alayer: &'a [usize],
+    absize: &'a [f64],
+    bpos: &'a [f64],
+    border: &'a [u8],
+    preds: &'a [Vec<usize>],
+    succs: &'a [Vec<usize>],
+    cluster_span: &'a std::collections::BTreeMap<usize, (usize, usize)>,
+    n: usize,
+}
+
+/// A block layout's jog room per subgraph (B12 F2, TD / BT): the room
+/// its frame grows on its title side, between the title strip and the
+/// title row, where the edges that cross that side under the title
+/// chip jog clear of it ([`crate::ortho`]'s displaced crossings).
+///
+/// Its chip spans the frame's left inset and the title's width (the
+/// frame's left: its members' boxes, and the channel points inside it,
+/// as the scene wraps them), widened by [`crate::ortho::CHIP_CLEAR`].
+/// A member of the title row takes the entries that cross the title
+/// side into it (in TD the links from the layer before, from outside
+/// the block; in BT from the layer after) on the free stretch of its
+/// side beside the chip, as many as [`crate::ports::PORT_SPACING`]
+/// holds there (`cap`); the rest are displaced. So is each run of the
+/// block's own on its title row whose column lies under the chip (to a
+/// member behind the title row: it crosses the title side at its column
+/// past the chip and jogs over to its run). With `k` displaced, the
+/// frame grows by [`crate::ortho::ROW_CLEAR`] and a
+/// [`crate::ortho::TRACK_PITCH`] for each one past the first: the
+/// strip leaves 19 px between the chip and the row, and a displaced
+/// entry takes the chip's clearance, its track and a head's straight
+/// run into its port. Without displaced crossings a frame keeps its
+/// height.
+fn title_jogs(g: &Graph, t: &TitleRows) -> Vec<f64> {
+    title_counts(g, t)
+        .into_iter()
+        .map(|(entries, runs)| match entries + runs {
+            0 => 0.0,
+            k => crate::ortho::ROW_CLEAR + (k - 1) as f64 * crate::ortho::TRACK_PITCH,
+        })
+        .collect()
+}
+
+/// Per block (TD / BT): the entries its title row takes that the free
+/// stretch beside the title chip cannot hold — displaced, each crosses
+/// the title side at a column of its own past the chip — and its runs
+/// under the chip ([`title_jogs`]).
+fn title_counts(g: &Graph, t: &TitleRows) -> Vec<(usize, usize)> {
+    let ns = g.subgraphs.len();
+    let mut counts = vec![(0usize, 0usize); ns];
+    let bt = matches!(g.direction, Direction::BT);
+    for &c in t.cluster_span.keys() {
+        let Some(TitleChip {
+            row,
+            depth,
+            lo: chip_lo,
+            hi: chip_hi,
+        }) = title_chip(g, t, c)
+        else {
+            continue;
+        };
+        let (mut k, mut runs) = (0usize, 0usize);
+        for v in 0..t.bpos.len() {
+            if t.alayer[v] != row || t.border[v] != 0 || t.apath[v].len() != depth {
+                continue;
+            }
+            if t.apath[v].last() != Some(&c) {
+                continue;
+            }
+            let (m0, m1) = (t.bpos[v] - t.absize[v] / 2.0, t.bpos[v] + t.absize[v] / 2.0);
+            if v >= t.n {
+                // A run of the block's own under the chip.
+                runs += usize::from(t.bpos[v] > chip_lo && t.bpos[v] < chip_hi);
+                continue;
+            }
+            let from = if bt { &t.succs[v] } else { &t.preds[v] };
+            let border = from
+                .iter()
+                .filter(|&&u| {
+                    t.border[u] == 0
+                        && t.alayer[u] != row
+                        && !t.apath[u].contains(&c)
+                        && !(u < t.n && t.nc[u].contains(&c))
+                })
+                .count();
+            if border == 0 || m1 <= chip_lo || m0 >= chip_hi {
+                continue;
+            }
+            let free = (m1 - chip_hi).max(chip_lo - m0);
+            let cap = if free < 0.0 {
+                0
+            } else {
+                (free / crate::ports::PORT_SPACING).floor() as usize + 1
+            };
+            k += border.saturating_sub(cap);
+        }
+        counts[c] = (k, runs);
+    }
+    counts
 }
 
 /// The largest node outside every subgraph, when there clearly is one:
@@ -4338,6 +5998,7 @@ fn drawn_breadth(
     alayer: &[usize],
     bpos: &[f64],
     edge_chain: &[Vec<usize>],
+    blocks: Option<&[Vec<usize>]>,
 ) -> (f64, f64) {
     let n = g.nodes.len();
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -4360,7 +6021,7 @@ fn drawn_breadth(
         })
         .collect();
     let horizontal = matches!(g.direction, Direction::LR | Direction::RL);
-    for (ei, lane) in back_lanes(g, &at, node_cluster, edge_chain, |d| {
+    for (ei, lane) in back_lanes(g, &at, node_cluster, blocks, edge_chain, |d| {
         (bpos[d], alayer[d] as f64)
     }) {
         let half = crate::lanes::label_breadth(g.edges[ei].label.as_deref(), horizontal) / 2.0;
@@ -4372,6 +6033,49 @@ fn drawn_breadth(
     } else {
         (lo, hi)
     }
+}
+
+/// The breadth bounds of a lane beside the members of block `box_of` (a
+/// subgraph path) in a block layout, for a lane `label_half` broad: past
+/// the nearest node outside the block on any layer of the block, on each
+/// side of the block's members, by the room the frame takes round the
+/// lane (the scene's lane pad) and the gap between frames. Open
+/// on a side with nothing there.
+fn lane_corridor(
+    at: &[Placed],
+    nc: &[Vec<usize>],
+    box_of: &[usize],
+    label_half: f64,
+) -> (f64, f64) {
+    let member = |v: usize| nc[v].starts_with(box_of);
+    let (mut l0, mut l1) = (usize::MAX, 0usize);
+    let (mut m0, mut m1) = (f64::INFINITY, f64::NEG_INFINITY);
+    for (_, p) in at.iter().enumerate().filter(|&(v, _)| member(v)) {
+        l0 = l0.min(p.layer);
+        l1 = l1.max(p.layer);
+        m0 = m0.min(p.b - p.bsize / 2.0);
+        m1 = m1.max(p.b + p.bsize / 2.0);
+    }
+    let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
+    if m0 > m1 {
+        return (lo, hi);
+    }
+    let room = FRAME_GAP + crate::scene::LANE_PAD + label_half;
+    for (v, p) in at.iter().enumerate() {
+        if member(v) || p.layer < l0 || p.layer > l1 {
+            continue;
+        }
+        // A node in a block of its own beside this one: that frame too.
+        let shared = nc[v].iter().zip(box_of).take_while(|(a, b)| a == b).count();
+        let pad = (nc[v].len() - shared) as f64 * FRAME_PAD;
+        let (s0, s1) = (p.b - p.bsize / 2.0 - pad, p.b + p.bsize / 2.0 + pad);
+        if s1 <= m0 {
+            lo = lo.max(s1 + room);
+        } else if s0 >= m1 {
+            hi = hi.min(s0 - room);
+        }
+    }
+    (lo, hi)
 }
 
 /// The lane of every back-edge that gets one (`(edge, lane)`; a state
@@ -4390,10 +6094,17 @@ fn drawn_breadth(
 /// The lane is judged for crossings against the skeletons of the other
 /// edges (end centres and channel points, `dummy(d)` = a dummy's
 /// (breadth, layer) — `edge_chain` lists each edge's), on the layers.
+///
+/// In a block layout (`blocks`, its [`BlockPaths`]) only an upstream
+/// edge between two plain nodes of one level is a lane
+/// ([`keeps_lane`]); every other upstream edge is drawn through its
+/// channel, or as a step across the gap, and counts among the
+/// skeletons.
 pub(crate) fn back_lanes(
     g: &Graph,
     at: &[Placed],
     node_cluster: Option<&[Vec<usize>]>,
+    blocks: Option<&[Vec<usize>]>,
     edge_chain: &[Vec<usize>],
     dummy: impl Fn(usize) -> (f64, f64),
 ) -> Vec<(usize, crate::lanes::Lane)> {
@@ -4411,7 +6122,11 @@ pub(crate) fn back_lanes(
     let backs: Vec<usize> = (0..g.edges.len())
         .filter(|&ei| {
             let e = &g.edges[ei];
-            drawn(e) && at[e.to].layer < at[e.from].layer && !card(e.from) && !card(e.to)
+            drawn(e)
+                && at[e.to].layer < at[e.from].layer
+                && !card(e.from)
+                && !card(e.to)
+                && keeps_lane(blocks, e.from, e.to)
         })
         .collect();
     if backs.is_empty() {
@@ -4422,7 +6137,11 @@ pub(crate) fn back_lanes(
         .edges
         .iter()
         .enumerate()
-        .filter(|(_, e)| drawn(e) && at[e.to].layer >= at[e.from].layer)
+        .filter(|(_, e)| {
+            drawn(e)
+                && (at[e.to].layer >= at[e.from].layer
+                    || !(keeps_lane(blocks, e.from, e.to) || card(e.from) || card(e.to)))
+        })
         .map(|(ei, e)| {
             let mut pts = vec![(at[e.from].b, at[e.from].l)];
             pts.extend(edge_chain.get(ei).into_iter().flatten().map(|&d| dummy(d)));
@@ -4473,6 +6192,20 @@ pub(crate) fn back_lanes(
             let label = label_breadth(e.label.as_deref(), horizontal);
             let (sa, sb) = (g.nodes[e.from].shape, g.nodes[e.to].shape);
             let ports = (direct_port(sa, a, b.b), direct_port(sb, b, a.b));
+            // In a block layout the frame of the lane's block grows over
+            // the lane on every row of the block, not only on the rows
+            // of its band (`scene_clustered`): what stands beside the
+            // block on any of its rows bounds the lane, so the frame never
+            // grows over a node it does not hold. (A state's lanes inside
+            // a nested composite took the side where a state of the
+            // composite round it stood beside the composite's first row,
+            // and the composite's frame was drawn round that state.)
+            let corridor = match (blocks, node_cluster) {
+                (Some(_), Some(nc)) if !box_of.is_empty() => {
+                    lane_corridor(at, nc, &box_of, label / 2.0)
+                }
+                _ => (f64::NEG_INFINITY, f64::INFINITY),
+            };
             Want {
                 key: (a.layer - b.layer) as f64,
                 band: (b.layer as f64, a.layer as f64),
@@ -4483,6 +6216,7 @@ pub(crate) fn back_lanes(
                 label_half: label / 2.0,
                 spans: [port_span(sa, a), port_span(sb, b)],
                 ends: (e.from, e.to),
+                corridor,
             }
         })
         .collect();
@@ -4562,7 +6296,7 @@ fn node_hits(
 
 /// Does segment `p`-`q` pass through the open box `(x0, y0, x1, y1)`?
 /// (Liang-Barsky clipping.)
-fn seg_hits_box(p: (f64, f64), q: (f64, f64), r: (f64, f64, f64, f64)) -> bool {
+pub(crate) fn seg_hits_box(p: (f64, f64), q: (f64, f64), r: (f64, f64, f64, f64)) -> bool {
     let (dx, dy) = (q.0 - p.0, q.1 - p.1);
     let (mut t0, mut t1) = (0.0f64, 1.0f64);
     for (den, num) in [
@@ -4652,6 +6386,1659 @@ fn drawn_crossings(
     }
     total
 }
+
+/// The constants the generated sweep pins: the largest component
+/// ordered exactly, the lane rule's share, the most starts.
+#[cfg(test)]
+pub(crate) const BLOCK_ORDER_PINS: (usize, (usize, usize), usize) =
+    (BLOCK_ORDER_EXACT_MAX, LANE_SHARE, BLOCK_ORDER_STARTS);
+
+/// The most starts the ordering of a block layout takes ([`BlockOrder`]):
+/// the canonical order and eight shuffles of it. A shuffled start finds
+/// orders no sweep reaches from the canonical one, and which start does
+/// is the draw's: over the block fixtures the least crossings are
+/// reached by the seventh start at the latest (a hub and five blocks),
+/// over the larger drawings the package was judged on by the ninth; a
+/// layered layout elsewhere spends seven by default (ELK's
+/// thoroughness).
+const BLOCK_ORDER_STARTS: usize = 9;
+
+/// The work the starts of one ordering may cost, in elements (dummies
+/// and walls included) plus links, summed over the starts: a drawing of
+/// `e` elements takes `BLOCK_ORDER_WORK / e` starts, at least one and at
+/// most [`BLOCK_ORDER_STARTS`], so the static scene of a large diagram
+/// stays inside its time budget (twice the scene before blocks):
+/// about 150 elements and links take all nine, the public fixture's 234
+/// five, dense-td's 371 three.
+const BLOCK_ORDER_WORK: usize = 1_400;
+
+/// The final order of a block layout's placement, by element: per
+/// layer, each real node `(node, usize::MAX)` and each channel dummy
+/// `(edge, layer)`. The later placements of one layout call start from
+/// the first one's ([`BlockOrder::warm`]).
+pub(crate) type OrderSeed = Vec<Vec<(usize, usize)>>;
+
+/// An augmented node's element of an [`OrderSeed`], if it has one (a
+/// wall has none).
+type ElementOf<'a> = &'a dyn Fn(usize) -> Option<(usize, usize)>;
+
+/// Two neighbouring units of a level on one layer, each as the
+/// `(start, len)` range of its members in the layer.
+type UnitPair = ((usize, usize), (usize, usize));
+
+/// A unit of a level on one layer, as the level's ordering sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OrderUnit {
+    /// A direct node of the level (a real node; by augmented index).
+    Node(usize),
+    /// A child block: its members on the layer, kept together.
+    Block(usize),
+    /// A dummy of a run: the dummies of one channel that lie in the
+    /// level itself on consecutive layers.
+    Run(usize),
+}
+
+/// The ordering of a block layout (level first; see [`BlockOrder::run`]).
+struct BlockOrder<'a> {
+    apath: &'a [Vec<usize>],
+    border: &'a [u8],
+    preds: &'a [Vec<usize>],
+    succs: &'a [Vec<usize>],
+    alayer: &'a [usize],
+    nlayers: usize,
+    /// Per augmented node: its canonical key as a unit of its own level
+    /// — a real node by its index (first mention), a channel dummy by
+    /// its edge's source node, then (after a node of that key) by the
+    /// target node and the edge. Nothing here reads the order of the
+    /// edge statements, two parallel edges of one node pair excepted.
+    canon: Vec<(usize, u8, usize, usize)>,
+    /// Per subgraph: its least node index, a block's canonical key.
+    first: Vec<usize>,
+    /// Per augmented node: its run, or `usize::MAX`.
+    run: Vec<usize>,
+    runs: usize,
+    /// The levels, top-down: (subgraph path, first layer, last layer).
+    levels: Vec<(Vec<usize>, usize, usize)>,
+    /// Per subgraph: its place among its sibling blocks (the level
+    /// order's result), one for every layer they share.
+    brank: Vec<f64>,
+    /// Per augmented node: its slot in its own level on its layer —
+    /// just before the block of that rank.
+    slot: Vec<f64>,
+    /// Per subgraph: the layers it spans.
+    bspan: Vec<(usize, usize)>,
+    /// Per run: the layers its dummies stand on.
+    rspan: Vec<(usize, usize)>,
+    /// Every channel: its node on the layer before its first dummy, its
+    /// node on the layer after its last, and its dummies by layer
+    /// ([`BlockOrder::untangle_fans`]).
+    chains: Vec<(usize, usize, Vec<usize>)>,
+    /// Per augmented node: its channel (index into `chains`), or
+    /// `usize::MAX`.
+    chain_of: Vec<usize>,
+}
+
+impl BlockOrder<'_> {
+    /// One layer's members regrouped: at every level the blocks in
+    /// their order, the level's nodes and runs in their slots between
+    /// them by `key` (their sweep positions, or nothing: the canonical
+    /// order decides), every block's members together.
+    fn arrange(&self, items: &[usize], depth: usize, key: &dyn Fn(usize) -> f64) -> Vec<usize> {
+        if items.len() <= 1 {
+            return items.to_vec();
+        }
+        let mut groups: Vec<(Option<usize>, Vec<usize>)> = Vec::new();
+        let mut index: BTreeMap<usize, usize> = BTreeMap::new();
+        for &v in items {
+            match self.apath[v].get(depth) {
+                Some(&c) => match index.get(&c) {
+                    Some(&gi) => groups[gi].1.push(v),
+                    None => {
+                        index.insert(c, groups.len());
+                        groups.push((Some(c), vec![v]));
+                    }
+                },
+                None => groups.push((None, vec![v])),
+            }
+        }
+        type Key = (f64, f64, (usize, u8, usize, usize));
+        let mut keyed: Vec<(Key, Option<usize>, Vec<usize>)> = groups
+            .into_iter()
+            .map(|(c, members)| {
+                let v = members[0];
+                let k = match (members.len(), self.border[v], c) {
+                    // A bare wall anchors to its block's edge.
+                    (1, 1, _) => (f64::NEG_INFINITY, 0.0, self.canon[v]),
+                    (1, 2, _) => (f64::INFINITY, 0.0, self.canon[v]),
+                    (_, _, Some(c)) => (self.brank[c], 0.0, (self.first[c], 0, 0, 0)),
+                    _ => (self.slot[v], key(v), self.canon[v]),
+                };
+                (k, c, members)
+            })
+            .collect();
+        keyed.sort_by(|a, b| {
+            a.0 .0
+                .total_cmp(&b.0 .0)
+                .then(a.0 .1.total_cmp(&b.0 .1))
+                .then(a.0 .2.cmp(&b.0 .2))
+        });
+        let mut out = Vec::with_capacity(items.len());
+        for (_, c, members) in keyed {
+            if c.is_some() && members.len() > 1 {
+                out.extend(self.arrange(&members, depth + 1, key));
+            } else {
+                out.extend(members);
+            }
+        }
+        out
+    }
+
+    /// [`reorder`] with its ties broken by the canonical order (a
+    /// dummy's index follows the order of the edge statements).
+    fn reorder(&self, layer: &mut Vec<usize>, nbrs: &[Vec<usize>], pos: &mut [f64]) {
+        let mut keyed: Vec<(f64, usize)> = layer
+            .iter()
+            .map(|&v| {
+                let key = if nbrs[v].is_empty() {
+                    pos[v]
+                } else {
+                    wmedian(nbrs[v].iter().map(|&u| pos[u]))
+                };
+                (key, v)
+            })
+            .collect();
+        keyed.sort_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then_with(|| self.canon[a.1].cmp(&self.canon[b.1]))
+                .then(a.1.cmp(&b.1))
+        });
+        layer.clear();
+        for (i, (_, v)) in keyed.into_iter().enumerate() {
+            layer.push(v);
+            pos[v] = i as f64;
+        }
+    }
+
+    fn regroup(&self, layer: &mut Vec<usize>, pos: &mut [f64]) {
+        if layer.len() > 1 {
+            let arranged = self.arrange(layer, 0, &|v| pos[v]);
+            *layer = arranged;
+        }
+        for (i, &v) in layer.iter().enumerate() {
+            pos[v] = i as f64;
+        }
+    }
+
+    /// The units of the level `path` on `layer`, in its order, with
+    /// where each starts in the layer and how many members it has. They
+    /// are contiguous: the level's own walls stand at their two ends.
+    fn units(&self, layer: &[usize], path: &[usize]) -> Vec<(OrderUnit, usize, usize)> {
+        let k = path.len();
+        let mut out: Vec<(OrderUnit, usize, usize)> = Vec::with_capacity(layer.len());
+        // (A subgraph has one path: its id at depth `k - 1` is the level.)
+        let level = path.last();
+        for (i, &v) in layer.iter().enumerate() {
+            let p = &self.apath[v];
+            if k > 0 && p.get(k - 1) != level {
+                continue;
+            }
+            match p.get(k) {
+                Some(&c) => match out.last_mut() {
+                    Some((OrderUnit::Block(b), _, len)) if *b == c => *len += 1,
+                    _ => out.push((OrderUnit::Block(c), i, 1)),
+                },
+                None if self.border[v] != 0 => {}
+                None if self.run[v] != usize::MAX => out.push((OrderUnit::Run(self.run[v]), i, 1)),
+                None => out.push((OrderUnit::Node(v), i, 1)),
+            }
+        }
+        out
+    }
+
+    /// Write the level's units back to their layer in the order `order`
+    /// (indices into `units`), each block's members as they stand.
+    fn place_units(
+        layer: &mut [usize],
+        pos: &mut [f64],
+        units: &[(OrderUnit, usize, usize)],
+        order: &[usize],
+    ) {
+        let Some(&(_, start, _)) = units.first() else {
+            return;
+        };
+        let members: Vec<usize> = order
+            .iter()
+            .flat_map(|&i| layer[units[i].1..units[i].1 + units[i].2].iter().copied())
+            .collect();
+        for (i, v) in members.into_iter().enumerate() {
+            layer[start + i] = v;
+            pos[v] = (start + i) as f64;
+        }
+    }
+
+    /// Layered crossings in the gaps from layer `from` to layer `to`:
+    /// per gap, the upper layer's links in its order, each counted
+    /// against the links before it that end further on (a binary
+    /// indexed tree over the lower layer's places; the links of one
+    /// node never count against each other).
+    fn crossings(&self, layers: &[Vec<usize>], pos: &[f64], from: usize, to: usize) -> usize {
+        let mut total = 0;
+        let mut tree: Vec<u32> = Vec::new();
+        for li in from..to.min(self.nlayers.saturating_sub(1)) {
+            let n = layers[li + 1].len();
+            tree.clear();
+            tree.resize(n + 1, 0);
+            let mut seen = 0usize;
+            for &u in &layers[li] {
+                let links = self.succs[u].iter().filter(|&&v| self.alayer[v] == li + 1);
+                for &v in links.clone() {
+                    // Links seen so far that end at or before `v`.
+                    let (mut i, mut upto) = (pos[v] as usize + 1, 0usize);
+                    while i > 0 {
+                        upto += tree[i] as usize;
+                        i &= i - 1;
+                    }
+                    total += seen - upto;
+                }
+                for &v in links {
+                    let mut i = pos[v] as usize + 1;
+                    while i <= n {
+                        tree[i] += 1;
+                        i += i & i.wrapping_neg();
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        total
+    }
+
+    /// One half sweep of a level's order (down: every layer by the
+    /// layer above it; up: by the layer below). Each unit's barycentre
+    /// is the mean place of its links' other ends in that layer, links
+    /// inside one child block left out; a long unit (a block, a run)
+    /// takes ONE key for all its layers, the mean of its barycentres,
+    /// so two blocks keep one order on every layer they share and a run
+    /// stays on one side of a block. Each layer is then the long units
+    /// in that order with the level's nodes merged in by their own
+    /// barycentres; ties fall back to the canonical order.
+    fn half_sweep(
+        &self,
+        path: &[usize],
+        (lo, hi): (usize, usize),
+        down: bool,
+        layers: &mut [Vec<usize>],
+        pos: &mut [f64],
+    ) {
+        let k = path.len();
+        let ns = self.first.len();
+        let mut block = vec![(0.0f64, 0.0f64); ns];
+        let mut runs = vec![(0.0f64, 0.0f64); self.runs];
+        let mut own = vec![0.0f64; self.alayer.len()];
+        let order: Vec<usize> = if down {
+            (lo..=hi).collect()
+        } else {
+            (lo..=hi).rev().collect()
+        };
+        let canon = |u: OrderUnit, at: usize, layer: &[usize]| match u {
+            OrderUnit::Block(c) => (self.first[c], 0, 0, 0),
+            _ => self.canon[layer[at]],
+        };
+        for &l in &order {
+            let units = self.units(&layers[l], path);
+            if units.is_empty() {
+                continue;
+            }
+            let beside = if down {
+                l.checked_sub(1)
+            } else {
+                (l + 1 < self.nlayers).then_some(l + 1)
+            };
+            let len = layers[l].len() as f64;
+            let mut keys: Vec<f64> = Vec::with_capacity(units.len());
+            for &(u, at, n) in &units {
+                // Whole numbers, so the order the links are listed in
+                // (the order of the edge statements) cannot move a key.
+                let (mut sum, mut links) = (0usize, 0usize);
+                let mut blen = 1.0;
+                if let Some(b) = beside {
+                    blen = layers[b].len().max(1) as f64;
+                    for &w in &layers[l][at..at + n] {
+                        let nbrs = if down { &self.preds[w] } else { &self.succs[w] };
+                        for &x in nbrs {
+                            // (Inside the same child block: its id at
+                            // this depth says so.)
+                            let inside = matches!(u, OrderUnit::Block(c)
+                                if self.apath[x].get(k) == Some(&c));
+                            if self.alayer[x] == b && !inside {
+                                sum += pos[x] as usize;
+                                links += 1;
+                            }
+                        }
+                    }
+                }
+                let key = if links > 0 {
+                    (sum as f64 / links as f64 + 0.5) / blen
+                } else {
+                    (at as f64 + n as f64 / 2.0) / len
+                };
+                // Running mean for a long unit, so the sweep carries on
+                // from where its earlier layers put it.
+                let key = match u {
+                    OrderUnit::Block(c) => {
+                        block[c] = (block[c].0 + key, block[c].1 + 1.0);
+                        block[c].0 / block[c].1
+                    }
+                    OrderUnit::Run(r) => {
+                        runs[r] = (runs[r].0 + key, runs[r].1 + 1.0);
+                        runs[r].0 / runs[r].1
+                    }
+                    OrderUnit::Node(v) => {
+                        own[v] = key;
+                        key
+                    }
+                };
+                keys.push(key);
+            }
+            let mut by: Vec<usize> = (0..units.len()).collect();
+            by.sort_by(|&a, &b| keys[a].total_cmp(&keys[b]).then(a.cmp(&b)));
+            Self::place_units(&mut layers[l], pos, &units, &by);
+        }
+        // Every layer by the final keys.
+        for l in lo..=hi {
+            let units = self.units(&layers[l], path);
+            let key = |u: OrderUnit| match u {
+                OrderUnit::Block(c) => block[c].0 / block[c].1.max(1.0),
+                OrderUnit::Run(r) => runs[r].0 / runs[r].1.max(1.0),
+                OrderUnit::Node(v) => own[v],
+            };
+            let mut by: Vec<usize> = (0..units.len()).collect();
+            by.sort_by(|&a, &b| {
+                key(units[a].0).total_cmp(&key(units[b].0)).then_with(|| {
+                    canon(units[a].0, units[a].1, &layers[l])
+                        .cmp(&canon(units[b].0, units[b].1, &layers[l]))
+                })
+            });
+            Self::place_units(&mut layers[l], pos, &units, &by);
+        }
+    }
+
+    /// The layers a long unit of a level stands on.
+    fn long_span(&self, u: OrderUnit) -> Option<(usize, usize)> {
+        match u {
+            OrderUnit::Block(c) => Some(self.bspan[c]),
+            OrderUnit::Run(r) => Some(self.rspan[r]),
+            OrderUnit::Node(_) => None,
+        }
+    }
+
+    /// What exchanging two neighbours of one layer does to the layered
+    /// crossings: `a` (the left one) and `b`, as `(start, len)` ranges
+    /// of `layer`. `beside` holds, for the layer before and the layer
+    /// after, the two units' ranges there when they change places on it
+    /// in the same exchange: a pair of links that flips at both ends
+    /// keeps its state. `scratch` is two buffers, kept between calls.
+    fn exchange_delta(
+        &self,
+        layer: &[usize],
+        (a, b): UnitPair,
+        pos: &[f64],
+        beside: [Option<UnitPair>; 2],
+        scratch: &mut (Vec<usize>, Vec<usize>),
+    ) -> isize {
+        let mut delta = 0isize;
+        let l = self.alayer[layer[a.0]];
+        let (xs, ys) = scratch;
+        for (nbrs, other, both) in [
+            (self.preds, l.wrapping_sub(1), beside[0]),
+            (self.succs, l + 1, beside[1]),
+        ] {
+            let ends = |range: (usize, usize), out: &mut Vec<usize>| {
+                out.clear();
+                for &v in &layer[range.0..range.0 + range.1] {
+                    out.extend(
+                        nbrs[v]
+                            .iter()
+                            .filter(|&&x| self.alayer[x] == other)
+                            .map(|&x| pos[x] as usize),
+                    );
+                }
+                out.sort_unstable();
+            };
+            ends(a, xs);
+            if xs.is_empty() {
+                continue;
+            }
+            ends(b, ys);
+            if ys.is_empty() {
+                continue;
+            }
+            // The left unit is left now: a pair of links crosses while
+            // the left one's far end is the further on.
+            let (mut below, mut upto) = (0usize, 0usize);
+            for &x in xs.iter() {
+                while below < ys.len() && ys[below] < x {
+                    below += 1;
+                }
+                while upto < ys.len() && ys[upto] <= x {
+                    upto += 1;
+                }
+                delta += (ys.len() - upto) as isize - below as isize;
+            }
+            if let Some((ra, rb)) = both {
+                let within = |r: (usize, usize), v: &[usize]| {
+                    v.iter().filter(|&&p| p >= r.0 && p < r.0 + r.1).count() as isize
+                };
+                delta -= within(ra, xs) * within(rb, ys);
+                delta += within(rb, xs) * within(ra, ys);
+            }
+        }
+        delta
+    }
+
+    /// The weighted adjacent exchange of a level's order, after each
+    /// half sweep: two units that stand next to each other on every
+    /// layer they share change places — on all of those layers at once,
+    /// so two blocks keep one order and a run one side of a block —
+    /// when that lowers the layered crossings, every link of theirs
+    /// counted (a bundle weighs its multiplicity). A barycentre gives a
+    /// long unit ONE key for all its layers, the mean of what each
+    /// layer asks for; the exchange is what then tries the neighbour
+    /// that mean passed over (the public fixture's crossings fall from
+    /// 9 to 6 with it, dense-td's layered ones by a quarter). With
+    /// `tidy`, the level's nodes and runs are what is exchanged, a pair
+    /// whose left one is later in the canonical order, also when the
+    /// crossings only stay ([`BlockOrder::tidy`]). Each exchange lowers
+    /// the crossings or the inversions against the canonical order, so
+    /// it ends. Returns whether anything moved.
+    fn exchange(
+        &self,
+        path: &[usize],
+        (lo, hi): (usize, usize),
+        tidy: bool,
+        layers: &mut [Vec<usize>],
+        pos: &mut [f64],
+    ) -> bool {
+        type Range = (usize, usize);
+        let mut units: Vec<Vec<(OrderUnit, usize, usize)>> =
+            (lo..=hi).map(|l| self.units(&layers[l], path)).collect();
+        let canon = |u: OrderUnit, at: usize, layer: &[usize]| match u {
+            OrderUnit::Block(c) => (self.first[c], 0, 0, 0),
+            _ => self.canon[layer[at]],
+        };
+        let mut shared: Vec<(usize, usize, Range, Range)> = Vec::new();
+        let mut scratch: (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+        let mut moved = false;
+        let mut again = true;
+        let mut passes = 0;
+        while again && passes < EXCHANGE_PASSES {
+            again = false;
+            passes += 1;
+            for l in lo..=hi {
+                let mut i = 0;
+                while i + 1 < units[l - lo].len() {
+                    let (a, b) = (units[l - lo][i], units[l - lo][i + 1]);
+                    i += 1;
+                    // The layers the two share, with their places there.
+                    shared.clear();
+                    match (self.long_span(a.0), self.long_span(b.0)) {
+                        (Some(sa), Some(sb)) => {
+                            let (from, to) = (sa.0.max(sb.0), sa.1.min(sb.1));
+                            // Judged once, from the first layer they share.
+                            if from != l {
+                                continue;
+                            }
+                            let mut apart = false;
+                            for m in from..=to {
+                                let us = &units[m - lo];
+                                match us.iter().position(|u| u.0 == a.0) {
+                                    Some(ia) if us.get(ia + 1).is_some_and(|u| u.0 == b.0) => {
+                                        let (ua, ub) = (us[ia], us[ia + 1]);
+                                        shared.push((m, ia, (ua.1, ua.2), (ub.1, ub.2)));
+                                    }
+                                    _ => {
+                                        apart = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if apart {
+                                continue;
+                            }
+                        }
+                        _ => shared.push((l, i - 1, (a.1, a.2), (b.1, b.2))),
+                    }
+                    if tidy {
+                        let later = canon(a.0, a.1, &layers[l]) > canon(b.0, b.1, &layers[l]);
+                        let block = |u: OrderUnit| matches!(u, OrderUnit::Block(_));
+                        if !later || block(a.0) || block(b.0) {
+                            continue;
+                        }
+                    }
+                    // A pair of links that flips at one end only is met
+                    // from that end; one that flips at both (the two
+                    // units change places on the layer beside this one
+                    // too), never.
+                    let mut delta = 0isize;
+                    for (si, &(m, _, ra, rb)) in shared.iter().enumerate() {
+                        let on = |k: Option<usize>, layer: usize| {
+                            k.and_then(|k| shared.get(k))
+                                .filter(|s| s.0 == layer)
+                                .map(|s| (s.2, s.3))
+                        };
+                        let beside = [
+                            on(si.checked_sub(1), m.wrapping_sub(1)),
+                            on(Some(si + 1), m + 1),
+                        ];
+                        delta +=
+                            self.exchange_delta(&layers[m], (ra, rb), pos, beside, &mut scratch);
+                    }
+                    if delta > 0 || (delta == 0 && !tidy) {
+                        continue;
+                    }
+                    for &(m, ia, ra, rb) in &shared {
+                        layers[m][ra.0..rb.0 + rb.1].rotate_left(ra.1);
+                        for at in ra.0..rb.0 + rb.1 {
+                            pos[layers[m][at]] = at as f64;
+                        }
+                        let us = &mut units[m - lo];
+                        us.swap(ia, ia + 1);
+                        us[ia].1 = ra.0;
+                        us[ia + 1].1 = ra.0 + rb.1;
+                    }
+                    moved = true;
+                    again = true;
+                }
+            }
+        }
+        moved
+    }
+
+    /// The order of one level's units (the level `li` of `levels`):
+    /// from the order they stand in and from its reverse, half sweeps
+    /// down and up with an adjacent exchange after each half
+    /// ([`BlockOrder::exchange`]), judged after each half by the layered
+    /// crossings of the layers the level spans (and the gaps just
+    /// outside it, whose far layers stay as the levels above left
+    /// them); the least wins, the earlier on a tie. The result is each
+    /// child block's rank and each node's and run dummy's slot between
+    /// the blocks, which the sweeps over the whole graph then keep.
+    fn order_level(&mut self, li: usize, layers: &mut [Vec<usize>], pos: &mut [f64]) {
+        let (path, lo, hi) = self.levels[li].clone();
+        let span = (lo, hi);
+        let judge = |me: &Self, layers: &[Vec<usize>], pos: &[f64]| {
+            me.crossings(layers, pos, lo.saturating_sub(1), hi + 1)
+        };
+        let restore = |layers: &mut [Vec<usize>], pos: &mut [f64], from: &[Vec<usize>]| {
+            layers[lo..=hi].clone_from_slice(from);
+            for lv in &layers[lo..=hi] {
+                for (i, &v) in lv.iter().enumerate() {
+                    pos[v] = i as f64;
+                }
+            }
+        };
+        let long = (lo..=hi).any(|l| {
+            self.units(&layers[l], &path)
+                .iter()
+                .any(|u| !matches!(u.0, OrderUnit::Node(_)))
+        });
+        if long {
+            let base: Vec<Vec<usize>> = layers[lo..=hi].to_vec();
+            let mut best = (judge(self, layers, pos), base.clone());
+            for start in 0..2 {
+                if best.0 == 0 {
+                    break;
+                }
+                restore(layers, pos, &base);
+                // This start's own least: its rounds go on while they
+                // lower it, whatever the other start reached.
+                let mut least = best.0;
+                if start == 1 {
+                    for l in lo..=hi {
+                        let units = self.units(&layers[l], &path);
+                        let by: Vec<usize> = (0..units.len()).rev().collect();
+                        Self::place_units(&mut layers[l], pos, &units, &by);
+                    }
+                    least = judge(self, layers, pos);
+                    if least < best.0 {
+                        best = (least, layers[lo..=hi].to_vec());
+                    }
+                }
+                for _ in 0..LEVEL_ROUNDS {
+                    let before = least;
+                    for down in [true, false] {
+                        self.half_sweep(&path, span, down, layers, pos);
+                        self.exchange(&path, span, false, layers, pos);
+                        let c = judge(self, layers, pos);
+                        least = least.min(c);
+                        if c < best.0 {
+                            best = (c, layers[lo..=hi].to_vec());
+                        }
+                    }
+                    if least == 0 || least >= before {
+                        break;
+                    }
+                }
+            }
+            restore(layers, pos, &best.1);
+            // A link between two rows keeps to one side of every block
+            // that spans both ([`BlockOrder::link_sides`]).
+            self.link_sides(&path, span, layers, pos);
+        }
+        self.rank_level(&path, span, layers);
+    }
+
+    /// The ranks of a level's child blocks — one sequence that every
+    /// layer's order is a part of — and the slot of each of its nodes
+    /// and channel points between them, read off the order its layers
+    /// stand in.
+    fn rank_level(&mut self, path: &[usize], (lo, hi): (usize, usize), layers: &[Vec<usize>]) {
+        let k = path.len();
+        let mut blocks: Vec<usize> = Vec::new();
+        let mut after: Vec<(usize, usize)> = Vec::new();
+        for lv in &layers[lo..=hi] {
+            let mut prev: Option<usize> = None;
+            for (u, _, _) in self.units(lv, path) {
+                if let OrderUnit::Block(c) = u {
+                    if !blocks.contains(&c) {
+                        blocks.push(c);
+                    }
+                    if let Some(p) = prev {
+                        after.push((p, c));
+                    }
+                    prev = Some(c);
+                }
+            }
+        }
+        blocks.sort_by_key(|&c| self.first[c]);
+        let mut rank = 0.0;
+        let mut left: Vec<usize> = blocks.clone();
+        while !left.is_empty() {
+            // The first block (canonically) no other waits before.
+            let at = left
+                .iter()
+                .position(|&c| !after.iter().any(|&(p, q)| q == c && left.contains(&p)))
+                .unwrap_or(0);
+            let c = left.remove(at);
+            self.brank[c] = rank;
+            rank += 1.0;
+        }
+        for lv in &layers[lo..=hi] {
+            let units = self.units(lv, path);
+            let mut next = rank;
+            for &(u, at, _) in units.iter().rev() {
+                match u {
+                    OrderUnit::Block(c) => next = self.brank[c],
+                    _ => self.slot[lv[at]] = next - 0.5,
+                }
+            }
+            // The level's own walls keep to its ends.
+            for &v in lv {
+                if self.border[v] != 0 && self.apath[v].len() == k && self.apath[v] == path {
+                    self.slot[v] = 0.0;
+                }
+            }
+        }
+    }
+
+    /// One side per (link, block). A channel keeps one side of a child
+    /// block on every layer the two share, because it is one unit of
+    /// the level's order; a link between two rows is no unit, and its
+    /// two ends are placed each by its own barycentre — one before a
+    /// block that spans both rows, the other after it, and the link is
+    /// drawn straight through that block (dense-td as blocks: `n41 ->
+    /// n42`, 217 px through the nested block between them). So, per
+    /// child block that spans more than one layer: the level's units on
+    /// its layers that such links join (a node, a channel as a whole, a
+    /// sibling block) stand together on one side of it — the side of a
+    /// sibling block among them, whose place the level order has fixed
+    /// (none is moved when two of them stand on either side: that link
+    /// has no way round); else the side most of them stand on, the
+    /// first of them in the canonical order deciding a tie. The others
+    /// step across the block, next to it, each on its own layers:
+    /// across this block alone, so every other block keeps them where
+    /// they were. Returns whether anything moved.
+    fn link_sides(
+        &self,
+        path: &[usize],
+        (lo, hi): (usize, usize),
+        layers: &mut [Vec<usize>],
+        pos: &mut [f64],
+    ) -> bool {
+        let k = path.len();
+        let level = path.last();
+        // The level's unit an augmented node belongs to, if any.
+        let unit = |v: usize| -> Option<OrderUnit> {
+            let p = &self.apath[v];
+            if k > 0 && p.get(k - 1) != level {
+                return None;
+            }
+            match p.get(k) {
+                Some(&c) => Some(OrderUnit::Block(c)),
+                None if self.border[v] != 0 => None,
+                None if self.run[v] != usize::MAX => Some(OrderUnit::Run(self.run[v])),
+                None => Some(OrderUnit::Node(v)),
+            }
+        };
+        let mut blocks: Vec<usize> = Vec::new();
+        for lv in &layers[lo..=hi] {
+            for &v in lv {
+                if let Some(OrderUnit::Block(c)) = unit(v) {
+                    if self.bspan[c].1 > self.bspan[c].0 && !blocks.contains(&c) {
+                        blocks.push(c);
+                    }
+                }
+            }
+        }
+        blocks.sort_by_key(|&c| self.first[c]);
+        let mut any = false;
+        for b in blocks {
+            let (b0, b1) = self.bspan[b];
+            let here = OrderUnit::Block(b);
+            // The block's members on a layer, as a range of its places.
+            let range = |lv: &[usize]| -> Option<(usize, usize)> {
+                let at = lv.iter().position(|&v| unit(v) == Some(here))?;
+                let end = lv.iter().rposition(|&v| unit(v) == Some(here))?;
+                Some((at, end))
+            };
+            // The level's other units on the block's layers, each with
+            // the side it stands on (`true`: before the block) and its
+            // first member met (for the canonical order).
+            let mut ents: Vec<(OrderUnit, bool, usize)> = Vec::new();
+            for lv in &layers[b0..=b1] {
+                let Some((at, _)) = range(lv) else { continue };
+                for (i, &v) in lv.iter().enumerate() {
+                    match unit(v) {
+                        Some(u) if u != here && ents.iter().all(|e| e.0 != u) => {
+                            ents.push((u, i < at, v));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Joined by a link between two of the block's layers.
+            let mut group: Vec<usize> = (0..ents.len()).collect();
+            let find = |group: &[usize], mut i: usize| {
+                while group[i] != i {
+                    i = group[i];
+                }
+                i
+            };
+            for l in b0..b1 {
+                for &x in &layers[l] {
+                    let Some(ex) = unit(x).filter(|&u| u != here) else {
+                        continue;
+                    };
+                    for &y in self.succs[x].iter().filter(|&&y| self.alayer[y] == l + 1) {
+                        let Some(ey) = unit(y).filter(|&u| u != here && u != ex) else {
+                            continue;
+                        };
+                        let (Some(i), Some(j)) = (
+                            ents.iter().position(|e| e.0 == ex),
+                            ents.iter().position(|e| e.0 == ey),
+                        ) else {
+                            continue;
+                        };
+                        let (ri, rj) = (find(&group, i), find(&group, j));
+                        if ri != rj {
+                            group[ri.max(rj)] = ri.min(rj);
+                        }
+                    }
+                }
+            }
+            for root in 0..ents.len() {
+                if find(&group, root) != root {
+                    continue;
+                }
+                let members: Vec<usize> = (0..ents.len())
+                    .filter(|&i| find(&group, i) == root)
+                    .collect();
+                let fixed = |i: usize| matches!(ents[i].0, OrderUnit::Block(_));
+                let on = |before: bool| members.iter().filter(|&&i| ents[i].1 == before).count();
+                if members.len() < 2 || on(true) == 0 || on(false) == 0 {
+                    continue;
+                }
+                let held: Vec<bool> = members
+                    .iter()
+                    .filter(|&&i| fixed(i))
+                    .map(|&i| ents[i].1)
+                    .collect();
+                let before = match (held.contains(&true), held.contains(&false)) {
+                    (true, true) => continue,
+                    (true, false) => true,
+                    (false, true) => false,
+                    (false, false) if on(true) != on(false) => on(true) > on(false),
+                    (false, false) => members
+                        .iter()
+                        .min_by_key(|&&i| self.canon[ents[i].2])
+                        .map_or(true, |&i| ents[i].1),
+                };
+                for &i in members.iter().filter(|&&i| ents[i].1 != before) {
+                    let u = ents[i].0;
+                    for lv in layers[b0..=b1].iter_mut() {
+                        let Some(from) = lv.iter().position(|&v| unit(v) == Some(u)) else {
+                            continue;
+                        };
+                        let v = lv.remove(from);
+                        match range(lv) {
+                            Some((at, _)) if before => lv.insert(at, v),
+                            Some((_, end)) => lv.insert(end + 1, v),
+                            None => lv.insert(from, v),
+                        }
+                    }
+                    any = true;
+                }
+            }
+        }
+        if any {
+            for lv in &layers[lo..=hi] {
+                for (i, &v) in lv.iter().enumerate() {
+                    pos[v] = i as f64;
+                }
+            }
+        }
+        any
+    }
+
+    /// The sweeps over the whole graph inside the slots the level
+    /// orders left: weighted-median reorders and adjacent swaps as
+    /// before blocks, every layer regrouped as soon as it is reordered,
+    /// judged after the downward half and after the upward half (judged
+    /// after the upward half only, every chain parks where its target
+    /// is). Returns the crossings of the order kept.
+    fn sweep(&self, layers: &mut Vec<Vec<usize>>, pos: &mut [f64]) -> usize {
+        let n = self.nlayers;
+        for lv in layers.iter_mut() {
+            self.regroup(lv, pos);
+        }
+        let mut best = (self.crossings(layers, pos, 0, n), layers.clone());
+        for _ in 0..SLOT_ROUNDS {
+            if best.0 == 0 {
+                break;
+            }
+            let before = best.0;
+            for li in 1..n {
+                self.reorder(&mut layers[li], self.preds, pos);
+                self.regroup(&mut layers[li], pos);
+            }
+            let c = self.crossings(layers, pos, 0, n);
+            if c < best.0 {
+                best = (c, layers.clone());
+            }
+            for li in (0..n.saturating_sub(1)).rev() {
+                self.reorder(&mut layers[li], self.succs, pos);
+                self.regroup(&mut layers[li], pos);
+            }
+            transpose(
+                layers,
+                self.preds,
+                self.succs,
+                pos,
+                n,
+                Some(self.apath),
+                Some(self.border),
+            );
+            for lv in layers.iter_mut() {
+                self.regroup(lv, pos);
+            }
+            let c = self.crossings(layers, pos, 0, n);
+            if c < best.0 {
+                best = (c, layers.clone());
+            }
+            if best.0 >= before {
+                break;
+            }
+        }
+        *layers = best.1;
+        for lv in layers.iter() {
+            for (i, &v) in lv.iter().enumerate() {
+                pos[v] = i as f64;
+            }
+        }
+        best.0
+    }
+
+    /// The canonical order: on every layer the units of each level form
+    /// one sequence by key, a block's members together inside it.
+    fn canonical(&mut self, layers: &mut [Vec<usize>], pos: &mut [f64]) {
+        self.brank.iter_mut().for_each(|r| *r = 0.0);
+        self.slot.iter_mut().for_each(|s| *s = 0.0);
+        for lv in layers.iter_mut() {
+            if lv.len() > 1 {
+                let arranged = self.arrange(lv, 0, &|_| 0.0);
+                *lv = arranged;
+            }
+            for (i, &v) in lv.iter().enumerate() {
+                pos[v] = i as f64;
+            }
+        }
+    }
+
+    /// Start `k > 0`, for the level `li`: the canonical order shuffled —
+    /// one permutation of the level's long units, and per layer one of
+    /// its own nodes; never a layer as a whole, so two blocks start in
+    /// one order on every layer and a run on one side of a block. One
+    /// generator stream per (start, level) — a level's draw then depends
+    /// on its own units alone, not on how many the levels before it
+    /// drew — the long units first, then the layers in ascending order;
+    /// integer arithmetic only.
+    fn shuffle(&self, li: usize, k: usize, layers: &mut [Vec<usize>], pos: &mut [f64]) {
+        const MUL: u64 = 6_364_136_223_846_793_005;
+        const INC: u64 = 1_442_695_040_888_963_407;
+        let stream = k + SHUFFLE_STREAMS * li;
+        let mut x = (stream as u64).wrapping_mul(MUL).wrapping_add(INC);
+        let mut draw = |below: usize| -> usize {
+            x = x.wrapping_mul(MUL).wrapping_add(INC);
+            ((x >> 33) % below as u64) as usize
+        };
+        let mut fisher_yates = |n: usize| -> Vec<usize> {
+            let mut p: Vec<usize> = (0..n).collect();
+            for i in (1..n).rev() {
+                p.swap(i, draw(i + 1));
+            }
+            p
+        };
+        let (path, lo, hi) = &self.levels[li];
+        // The level's long units, in the order they are first met.
+        let mut long: Vec<OrderUnit> = Vec::new();
+        for lv in &layers[*lo..=*hi] {
+            for (u, _, _) in self.units(lv, path) {
+                if !matches!(u, OrderUnit::Node(_)) && !long.contains(&u) {
+                    long.push(u);
+                }
+            }
+        }
+        let perm = fisher_yates(long.len());
+        let place = |u: OrderUnit| long.iter().position(|&x| x == u).map_or(0, |i| perm[i]);
+        for l in *lo..=*hi {
+            let units = self.units(&layers[l], path);
+            let (mut longs, mut shorts): (Vec<usize>, Vec<usize>) =
+                (0..units.len()).partition(|&i| !matches!(units[i].0, OrderUnit::Node(_)));
+            longs.sort_by_key(|&i| place(units[i].0));
+            let p = fisher_yates(shorts.len());
+            shorts = p.iter().map(|&i| shorts[i]).collect();
+            // The layer's pattern of long and short places stays.
+            let (mut li, mut si) = (0, 0);
+            let by: Vec<usize> = units
+                .iter()
+                .map(|u| {
+                    if matches!(u.0, OrderUnit::Node(_)) {
+                        si += 1;
+                        shorts[si - 1]
+                    } else {
+                        li += 1;
+                        longs[li - 1]
+                    }
+                })
+                .collect();
+            Self::place_units(&mut layers[l], pos, &units, &by);
+        }
+    }
+
+    /// The order a later placement of one layout call starts from: on
+    /// each layer the elements `seed` (the first placement's final
+    /// order) has there stay in that order, and a node or dummy new to
+    /// the layer goes before the first kept element that follows it in
+    /// the canonical order (at the end without one), inside its block.
+    /// Returns whether any element is new.
+    fn warm(
+        &mut self,
+        seed: &OrderSeed,
+        element: ElementOf<'_>,
+        layers: &mut [Vec<usize>],
+        pos: &mut [f64],
+    ) -> bool {
+        self.canonical(layers, pos);
+        let mut fresh = false;
+        let mut key = vec![0.0f64; self.alayer.len()];
+        for (l, lv) in layers.iter().enumerate() {
+            let kept: BTreeMap<(usize, usize), usize> = seed
+                .get(l)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(i, &e)| (e, i))
+                .collect();
+            // Canonical order of the layer, back to front: each new
+            // element takes the key just before the kept one after it.
+            let mut next = kept.len() as f64;
+            for &v in lv.iter().rev() {
+                match element(v).and_then(|e| kept.get(&e)) {
+                    Some(&i) => {
+                        next = i as f64;
+                        key[v] = next;
+                    }
+                    None => {
+                        fresh |= self.border[v] == 0;
+                        key[v] = next - 0.5;
+                    }
+                }
+            }
+        }
+        // A block's place: the mean of its members' keys over all its
+        // layers (one for every layer, as the level orders keep it).
+        let ns = self.first.len();
+        let mut acc = vec![(0.0f64, 0.0f64); ns];
+        for (v, path) in self.apath.iter().enumerate() {
+            if self.border[v] != 0 {
+                continue;
+            }
+            let share = key[v] / layers[self.alayer[v]].len().max(1) as f64;
+            for &c in path {
+                acc[c] = (acc[c].0 + share, acc[c].1 + 1.0);
+            }
+        }
+        for c in 0..ns {
+            self.brank[c] = acc[c].0 / acc[c].1.max(1.0);
+        }
+        for lv in layers.iter_mut() {
+            let len = lv.len().max(1) as f64;
+            for &v in lv.iter() {
+                self.slot[v] = key[v] / len;
+            }
+            if lv.len() > 1 {
+                let arranged = self.arrange(lv, 0, &|_| 0.0);
+                *lv = arranged;
+            }
+            for (i, &v) in lv.iter().enumerate() {
+                pos[v] = i as f64;
+            }
+        }
+        fresh
+    }
+
+    /// How many pairs of a level's own nodes stand against the
+    /// canonical (source) order on a layer they share.
+    fn node_inversions(
+        &self,
+        path: &[usize],
+        (lo, hi): (usize, usize),
+        layers: &[Vec<usize>],
+    ) -> usize {
+        let mut total = 0;
+        for lv in &layers[lo..=hi] {
+            let nodes: Vec<usize> = self
+                .units(lv, path)
+                .iter()
+                .filter_map(|&(u, at, _)| matches!(u, OrderUnit::Node(_)).then_some(lv[at]))
+                .collect();
+            for (i, &v) in nodes.iter().enumerate() {
+                total += nodes[i + 1..]
+                    .iter()
+                    .filter(|&&w| self.canon[v] > self.canon[w])
+                    .count();
+            }
+        }
+        total
+    }
+
+    /// Source order among equals, for the members a channel holds out
+    /// of place. A channel that ends on a member of its own level (an
+    /// edge out of a block's last row, up past the rows before it)
+    /// passes those rows on one side, and the sweeps settle for the
+    /// member on that side of its row whatever the source says: taking
+    /// the member back alone would cross the channel over its row
+    /// mates' links, and moving the channel alone crosses it too. So
+    /// the two are tried together: a channel that ends on a node out of
+    /// source order goes, with that node, to the end the node belongs
+    /// on — every run of it to that end of its own level, on every
+    /// layer it has — the levels it passes are tidied again, and the
+    /// change is kept when the layered crossings do not rise and the
+    /// nodes are nearer their source order. At most [`FLIP_TRIES`]
+    /// channels are tried, so a dense drawing, where a member out of
+    /// source order is where its links want it, pays a bounded price.
+    fn flip_chains(&self, layers: &mut [Vec<usize>], pos: &mut [f64]) {
+        let judge = |me: &Self, layers: &[Vec<usize>], pos: &[f64]| {
+            let inversions: usize = me
+                .levels
+                .iter()
+                .map(|(path, lo, hi)| me.node_inversions(path, (*lo, *hi), layers))
+                .sum();
+            (me.crossings(layers, pos, 0, me.nlayers), inversions)
+        };
+        let span_of = |path: &[usize]| match path.last() {
+            Some(&c) => self.bspan[c],
+            None => (0, self.nlayers.saturating_sub(1)),
+        };
+        let mut now = judge(self, layers, pos);
+        let mut tries = 0;
+        // Each kept change lowers (crossings, inversions): it ends.
+        while now.1 > 0 && tries < FLIP_TRIES {
+            // The channels that end on a node standing out of source
+            // order in its level: (edge, node, the end the node belongs
+            // on — `true`: the low one).
+            let mut cands: Vec<(usize, usize, bool)> = Vec::new();
+            for (path, lo, hi) in &self.levels {
+                for lv in &layers[*lo..=*hi] {
+                    let nodes: Vec<usize> = self
+                        .units(lv, path)
+                        .iter()
+                        .filter_map(|&(u, at, _)| matches!(u, OrderUnit::Node(_)).then_some(lv[at]))
+                        .collect();
+                    for (i, &v) in nodes.iter().enumerate() {
+                        for &w in &nodes[i + 1..] {
+                            if self.canon[v] <= self.canon[w] {
+                                continue;
+                            }
+                            for (node, low) in [(w, true), (v, false)] {
+                                for &x in self.preds[node].iter().chain(&self.succs[node]) {
+                                    let edge = self.canon[x].3;
+                                    if self.run[x] != usize::MAX
+                                        && self.apath[x] == *path
+                                        && !cands.contains(&(edge, node, low))
+                                    {
+                                        cands.push((edge, node, low));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut kept = false;
+            for (edge, node, low) in cands {
+                if tries == FLIP_TRIES {
+                    break;
+                }
+                tries += 1;
+                let before: Vec<Vec<usize>> = layers.to_vec();
+                // The channel's dummies and the node, each to the end of
+                // its own level on its layer.
+                let mut paths: Vec<&[usize]> = Vec::new();
+                for v in 0..self.alayer.len() {
+                    let dummy = self.run[v] != usize::MAX && self.canon[v].3 == edge;
+                    if !dummy && v != node {
+                        continue;
+                    }
+                    let (l, path) = (self.alayer[v], self.apath[v].as_slice());
+                    if !paths.contains(&path) {
+                        paths.push(path);
+                    }
+                    let units = self.units(&layers[l], path);
+                    let (Some(first), Some(last)) = (units.first(), units.last()) else {
+                        continue;
+                    };
+                    let Some(at) = layers[l].iter().position(|&x| x == v) else {
+                        continue;
+                    };
+                    let end = if low { first.1 } else { last.1 + last.2 - 1 };
+                    let d = layers[l].remove(at);
+                    layers[l].insert(end, d);
+                    for (i, &x) in layers[l].iter().enumerate() {
+                        pos[x] = i as f64;
+                    }
+                }
+                for path in paths {
+                    self.exchange(path, span_of(path), true, layers, pos);
+                }
+                let then = judge(self, layers, pos);
+                if then.0 <= now.0 && then < now {
+                    now = then;
+                    kept = true;
+                    break;
+                }
+                layers.clone_from_slice(&before);
+                for lv in layers.iter() {
+                    for (i, &v) in lv.iter().enumerate() {
+                        pos[v] = i as f64;
+                    }
+                }
+            }
+            if !kept {
+                break;
+            }
+        }
+    }
+
+    /// Source order among equals: after the winning start, two units of
+    /// one level that stand next to each other (two members of a block,
+    /// two nodes or runs between the same blocks) change places when
+    /// the left one is later in the canonical order and the layered
+    /// crossings do not rise ([`BlockOrder::exchange`]); each exchange
+    /// removes one inversion against the canonical order, so it ends.
+    /// (A shuffled start leaves the members that change no crossing
+    /// wherever the shuffle put them.)
+    fn tidy(&self, layers: &mut [Vec<usize>], pos: &mut [f64]) {
+        for (path, lo, hi) in &self.levels {
+            self.exchange(path, (*lo, *hi), true, layers, pos);
+        }
+    }
+
+    /// One start's orders, from the order the layers stand in: the level
+    /// orders top-down (each level's blocks and runs first, then inside
+    /// each block), then the sweeps inside their slots; again while a
+    /// pass lowers the layered crossings, at most [`LEVEL_PASSES`]
+    /// times. Returns the layered crossings.
+    fn settle(&mut self, layers: &mut Vec<Vec<usize>>, pos: &mut [f64]) -> usize {
+        let mut best: Option<(usize, Vec<Vec<usize>>)> = None;
+        for _ in 0..LEVEL_PASSES {
+            for li in 0..self.levels.len() {
+                self.order_level(li, layers, pos);
+            }
+            let c = self.sweep(layers, pos);
+            if best.as_ref().map_or(true, |b| c < b.0) {
+                best = Some((c, layers.clone()));
+            } else {
+                break;
+            }
+            if c == 0 {
+                break;
+            }
+        }
+        let (c, order) = best.unwrap_or((0, layers.clone()));
+        *layers = order;
+        for lv in layers.iter() {
+            for (i, &v) in lv.iter().enumerate() {
+                pos[v] = i as f64;
+            }
+        }
+        c
+    }
+
+    /// The ordering of a block layout, level first.
+    ///
+    /// Every level's units are ordered before the members inside them:
+    /// its child blocks and the channels passing it as whole units
+    /// ([`BlockOrder::order_level`]), the root first, then each block's
+    /// inside with everything outside it fixed. Flat sweeps then order
+    /// the nodes and channel dummies inside the slots that leaves
+    /// ([`BlockOrder::sweep`]). Flat sweeps alone cannot move a block
+    /// past its sibling, and a block-swap judged by crossings changes
+    /// nothing useful.
+    ///
+    /// This runs from `starts` starts — the canonical order, then
+    /// shuffles of it ([`BlockOrder::shuffle`]) — and the start with the
+    /// fewest layered crossings wins, the lowest on a tie; then the
+    /// crossing-neutral neighbours go back to source order
+    /// ([`BlockOrder::tidy`], [`BlockOrder::flip_chains`]). With `seed`
+    /// (a later placement of the same layout call) there is one run,
+    /// from the first placement's final order ([`BlockOrder::warm`]):
+    /// its layers differ from the winner's, and from a start of its own
+    /// it would lose to the multi-start best by construction.
+    fn run(
+        &mut self,
+        starts: usize,
+        seed: Option<(&OrderSeed, ElementOf<'_>)>,
+        layers: &mut Vec<Vec<usize>>,
+        pos: &mut [f64],
+    ) {
+        if let Some((seed, element)) = seed {
+            if self.warm(seed, element, layers, pos) {
+                self.settle(layers, pos);
+            }
+            self.tidy(layers, pos);
+            self.untangle_fans(layers, pos);
+            return;
+        }
+        self.canonical(layers, pos);
+        let base = layers.clone();
+        let mut best: Option<(usize, Vec<Vec<usize>>)> = None;
+        for k in 0..starts.max(1) {
+            *layers = base.clone();
+            for lv in layers.iter() {
+                for (i, &v) in lv.iter().enumerate() {
+                    pos[v] = i as f64;
+                }
+            }
+            if k > 0 {
+                for li in 0..self.levels.len() {
+                    self.shuffle(li, k, layers, pos);
+                }
+            }
+            let c = self.settle(layers, pos);
+            if best.as_ref().map_or(true, |b| c < b.0) {
+                best = Some((c, layers.clone()));
+            }
+            if c == 0 {
+                break;
+            }
+        }
+        if let Some((_, order)) = best {
+            *layers = order;
+        }
+        for lv in layers.iter() {
+            for (i, &v) in lv.iter().enumerate() {
+                pos[v] = i as f64;
+            }
+        }
+        self.tidy(layers, pos);
+        // (Once a layout call: a later placement starts from this order.)
+        self.flip_chains(layers, pos);
+        // The last exchanges place a unit by crossings alone: a link
+        // they left on either side of a block steps back to one.
+        for li in 0..self.levels.len() {
+            let (path, lo, hi) = self.levels[li].clone();
+            if self.link_sides(&path, (lo, hi), layers, pos) {
+                self.rank_level(&path, (lo, hi), layers);
+            }
+        }
+        self.untangle_fans(layers, pos);
+    }
+
+    /// The two ends of the link from `u` to `v` (on the next layer) as
+    /// fans read them: its channel's two nodes, or `u` and `v`.
+    fn link_ends(&self, u: usize, v: usize) -> (usize, usize) {
+        let c = if self.chain_of[u] != usize::MAX {
+            self.chain_of[u]
+        } else {
+            self.chain_of[v]
+        };
+        match self.chains.get(c) {
+            Some(&(top, bottom, _)) => (top, bottom),
+            None => (u, v),
+        }
+    }
+
+    /// Layered crossings between two links of one fan: two links whose
+    /// edges leave one node on the same side or reach one on the same
+    /// side (the same upper or the same lower node; parallel edges
+    /// aside), per gap.
+    fn fan_crossings(&self, layers: &[Vec<usize>], pos: &[f64]) -> usize {
+        let mut total = 0;
+        let mut links: Vec<(f64, f64, (usize, usize))> = Vec::new();
+        for li in 0..self.nlayers.saturating_sub(1) {
+            links.clear();
+            for &u in &layers[li] {
+                for &v in &self.succs[u] {
+                    if self.alayer[v] == li + 1 {
+                        links.push((pos[u], pos[v], self.link_ends(u, v)));
+                    }
+                }
+            }
+            for (i, a) in links.iter().enumerate() {
+                for b in &links[i + 1..] {
+                    let fan = (a.2 .0 == b.2 .0) != (a.2 .1 == b.2 .1);
+                    if fan && (a.0 - b.0) * (a.1 - b.1) < 0.0 {
+                        total += 1;
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// O6 across levels: two channels of one fan (the same upper or the
+    /// same lower node) that cross in the layered order change places
+    /// on the layers between their crossing and the node they share,
+    /// where they stand next to each other on every one of those layers
+    /// inside the same level, when that lowers the fans' crossings and
+    /// not the drawing's. The level orders and the sweeps judge every
+    /// crossing alike, and an exchange of two neighbours moves a channel
+    /// on one level only, so a crossing two channels of a fan make at
+    /// one level stays wherever the channel pair spans several (dense-td:
+    /// `n20 -> n37` and `n16 -> n37` cross under their block and run
+    /// side by side through three levels into `n37`, the hub `n16`'s
+    /// edge to `n37` and its turned edge from `n36` cross over `n36`).
+    /// Drawn, such a crossing is one in a fan, which no later stage
+    /// takes out. Each change kept lowers the fans' crossings, so it
+    /// ends.
+    fn untangle_fans(&self, layers: &mut [Vec<usize>], pos: &mut [f64]) {
+        let n = self.chains.len();
+        if n < 2 {
+            return;
+        }
+        let mut fans = self.fan_crossings(layers, pos);
+        if fans == 0 {
+            return;
+        }
+        let mut cross = self.crossings(layers, pos, 0, self.nlayers);
+        let mut tries = 0;
+        let mut kept = true;
+        while kept && fans > 0 && tries < FAN_TRIES {
+            kept = false;
+            for a in 0..n {
+                for b in a + 1..n {
+                    let (ta, ba, da) = &self.chains[a];
+                    let (tb, bb, db) = &self.chains[b];
+                    let (up, down) = (ta == tb, ba == bb);
+                    if up == down {
+                        continue;
+                    }
+                    let la: Vec<usize> = da.iter().map(|&d| self.alayer[d]).collect();
+                    let lb: Vec<usize> = db.iter().map(|&d| self.alayer[d]).collect();
+                    let (lo, hi) = (la[0].max(lb[0]), la[la.len() - 1].min(lb[lb.len() - 1]));
+                    if lo > hi {
+                        continue;
+                    }
+                    let at = |ds: &[usize], ls: &[usize], l: usize| ds[l - ls[0]];
+                    // Their order on each layer both stand on, from the
+                    // shared node's side: where it first flips is the
+                    // crossing, and the layers before it change places.
+                    let range: Vec<usize> = if down {
+                        (lo..=hi).rev().collect()
+                    } else {
+                        (lo..=hi).collect()
+                    };
+                    let left = |l: usize| pos[at(da, &la, l)] < pos[at(db, &lb, l)];
+                    let first = left(range[0]);
+                    let flip = range.iter().position(|&l| left(l) != first);
+                    // Past the last layer both stand on: the far ends.
+                    let far_flip = || {
+                        let l = if down { lo } else { hi };
+                        let (fa, fb) = if down {
+                            (
+                                if la[0] == l { *ta } else { at(da, &la, l - 1) },
+                                if lb[0] == l { *tb } else { at(db, &lb, l - 1) },
+                            )
+                        } else {
+                            (
+                                if la[la.len() - 1] == l {
+                                    *ba
+                                } else {
+                                    at(da, &la, l + 1)
+                                },
+                                if lb[lb.len() - 1] == l {
+                                    *bb
+                                } else {
+                                    at(db, &lb, l + 1)
+                                },
+                            )
+                        };
+                        fa != fb && (pos[fa] < pos[fb]) != first
+                    };
+                    let upto = match flip {
+                        Some(k) => k,
+                        None if far_flip() => range.len(),
+                        None => continue,
+                    };
+                    let swap: Vec<usize> = range[..upto].to_vec();
+                    let movable = swap.iter().all(|&l| {
+                        let (x, y) = (at(da, &la, l), at(db, &lb, l));
+                        (pos[x] - pos[y]).abs() == 1.0 && self.apath[x] == self.apath[y]
+                    });
+                    if !movable {
+                        continue;
+                    }
+                    tries += 1;
+                    let exchange = |layers: &mut [Vec<usize>], pos: &mut [f64]| {
+                        for &l in &swap {
+                            let (x, y) = (at(da, &la, l), at(db, &lb, l));
+                            let (px, py) = (pos[x] as usize, pos[y] as usize);
+                            layers[l].swap(px, py);
+                            pos[x] = py as f64;
+                            pos[y] = px as f64;
+                        }
+                    };
+                    exchange(layers, pos);
+                    let (f, c) = (
+                        self.fan_crossings(layers, pos),
+                        self.crossings(layers, pos, 0, self.nlayers),
+                    );
+                    if f < fans && c <= cross {
+                        (fans, cross) = (f, c);
+                        kept = true;
+                    } else {
+                        exchange(layers, pos);
+                    }
+                    if tries >= FAN_TRIES {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dummy `d` moved, on its layer and inside its own level, to the
+    /// first place whose units all stand left of column `x` by their
+    /// middles in `bpos` (each unit as its members stand: a block stays
+    /// whole).
+    fn move_to_column(
+        &self,
+        d: usize,
+        x: f64,
+        bpos: &[f64],
+        layers: &mut [Vec<usize>],
+        pos: &mut [f64],
+    ) {
+        let l = self.alayer[d];
+        let Some(at) = layers[l].iter().position(|&v| v == d) else {
+            return;
+        };
+        layers[l].remove(at);
+        let units = self.units(&layers[l], &self.apath[d]);
+        let mut to = units.first().map_or(at, |u| u.1);
+        for &(_, start, len) in &units {
+            let mid = layers[l][start..start + len]
+                .iter()
+                .map(|&v| bpos[v])
+                .sum::<f64>()
+                / len as f64;
+            if mid < x {
+                to = start + len;
+            }
+        }
+        layers[l].insert(to.min(layers[l].len()), d);
+        for (i, &v) in layers[l].iter().enumerate() {
+            pos[v] = i as f64;
+        }
+    }
+
+    /// X2.5 in the order (B12, block layouts in TD / BT). A channel whose
+    /// run stands under a block's title chip (`under`: a dummy of the run
+    /// on the block's title row and the right end of the chip's interval,
+    /// as the breadths `bpos` placed them; `size` the elements' breadths)
+    /// would cross the title side there, and the router takes it round
+    /// the chip through a lateral wall. It moves past the chip: to the
+    /// column right of the nearest unit of its title row that reaches
+    /// past the chip's end, else right of the row's last unit — first its
+    /// run in the block alone, then every dummy of the channel, each to
+    /// the place on its layer in its own level that column gives
+    /// ([`BlockOrder::move_to_column`]). A move is kept when neither the
+    /// layered crossings nor the fans' crossings rise, the nearest column
+    /// first. (blocks/nested-chain: `a -> c2` ran down beside `c` under
+    /// `Inner target`'s chip, and out of and into the two inner blocks
+    /// through their left walls; mermaid runs it down their right side.)
+    /// Returns whether the order changed.
+    fn clear_titles(
+        &self,
+        under: &[(usize, f64)],
+        bpos: &[f64],
+        size: &[f64],
+        layers: &mut [Vec<usize>],
+        pos: &mut [f64],
+    ) -> bool {
+        let mut cross = self.crossings(layers, pos, 0, self.nlayers);
+        let mut fans = self.fan_crossings(layers, pos);
+        let mut done: Vec<usize> = Vec::new();
+        let mut changed = false;
+        for &(d, chip_hi) in under {
+            let ch = self.chain_of[d];
+            if ch == usize::MAX || done.contains(&ch) {
+                continue;
+            }
+            done.push(ch);
+            let l = self.alayer[d];
+            // The columns past the chip, nearest first.
+            let units = self.units(&layers[l], &self.apath[d]);
+            let mut cols: Vec<f64> = Vec::new();
+            for (k, &(_, start, len)) in units.iter().enumerate() {
+                let members = &layers[l][start..start + len];
+                if members.contains(&d) {
+                    continue;
+                }
+                let right = members
+                    .iter()
+                    .map(|&v| bpos[v] + size[v] / 2.0)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                if right + GAP_B / 2.0 >= chip_hi || k + 1 == units.len() {
+                    cols.push(right + GAP_B / 4.0);
+                }
+            }
+            let run: Vec<usize> = (0..self.alayer.len())
+                .filter(|&v| self.run[v] != usize::MAX && self.run[v] == self.run[d])
+                .collect();
+            // The whole channel only when both its ends lie in the level
+            // that holds the block: then the levels it passes are the
+            // block's siblings. A channel from further out runs through
+            // levels a hub's fan shares, and moved to their far side it
+            // left the order the fan's comb was laid out in (dense-td:
+            // `n16 -> n35` past `n16 -> n32`, and the turned `n36 -> n16`
+            // was rerouted across the fan).
+            let parent = &self.apath[d][..self.apath[d].len().saturating_sub(1)];
+            let (top, bottom, _) = &self.chains[ch];
+            let local =
+                self.apath[*top].starts_with(parent) && self.apath[*bottom].starts_with(parent);
+            let chain = if local {
+                self.chains[ch].2.clone()
+            } else {
+                run.clone()
+            };
+            'cols: for x in cols {
+                for moved in [&run, &chain] {
+                    let before: Vec<Vec<usize>> = moved
+                        .iter()
+                        .map(|&v| layers[self.alayer[v]].clone())
+                        .collect();
+                    for &v in moved.iter() {
+                        self.move_to_column(v, x, bpos, layers, pos);
+                    }
+                    let (c, f) = (
+                        self.crossings(layers, pos, 0, self.nlayers),
+                        self.fan_crossings(layers, pos),
+                    );
+                    if c <= cross && f <= fans {
+                        (cross, fans, changed) = (c, f, true);
+                        break 'cols;
+                    }
+                    for (&v, lv) in moved.iter().zip(before).rev() {
+                        let l = self.alayer[v];
+                        layers[l] = lv;
+                        for (i, &w) in layers[l].iter().enumerate() {
+                            pos[w] = i as f64;
+                        }
+                    }
+                }
+            }
+        }
+        changed
+    }
+}
+
+/// Most passes of level orders and sweeps from one start: the first
+/// orders each level's blocks while their insides still stand as the
+/// start left them, the later ones with the insides ordered (the least
+/// layered crossings of dense-td's starts fall from 57 to 38 with the
+/// third); a pass that lowers nothing is the last.
+const LEVEL_PASSES: usize = 3;
+/// The generator streams a level has for its shuffles
+/// ([`BlockOrder::shuffle`]): one per start, with room past
+/// [`BLOCK_ORDER_STARTS`] for a count forced by a report. Pinned with
+/// the starts (the crossings by start of the block fixtures): a level's
+/// stream is `start + SHUFFLE_STREAMS * level`.
+const SHUFFLE_STREAMS: usize = 21;
+/// Most rounds (a half sweep down, one up) of a level's order.
+const LEVEL_ROUNDS: usize = 12;
+/// Most passes of one adjacent exchange over a level's layers.
+const EXCHANGE_PASSES: usize = 8;
+/// Most channels [`BlockOrder::flip_chains`] tries to move to the other
+/// side of their levels in one ordering.
+const FLIP_TRIES: usize = 12;
+/// Most rounds of the sweeps inside the slots.
+const SLOT_ROUNDS: usize = 16;
+/// Most exchanges [`BlockOrder::untangle_fans`] tries in one ordering:
+/// each costs a count of the layered crossings, so a drawing with many
+/// fans pays a bounded price (dense-td tries 6).
+const FAN_TRIES: usize = 64;
 
 /// Reorder one layer by the weighted median of each node's neighbour
 /// positions (dagre's heuristic — more robust to outliers than the
@@ -5623,6 +9010,20 @@ mod tests {
         let y = |id: &str| sc.nodes.iter().find(|n| n.id == id).unwrap().y;
         let row = y("linked");
         assert!(y("hub") < row - 30.0, "the hub above its target");
+        if crate::levels::blocks_on() {
+            // Laid out as blocks, every box the hub feeds lies wholly
+            // below the hub — also the pinned one, whose source no
+            // longer stays level with the hub — and the box nothing
+            // feeds starts on the first row.
+            for id in [
+                "loose1", "loose2", "c1", "i1", "src2", "x2", "y2", "src3", "fed3",
+            ] {
+                assert!(y(id) > y("hub") + 30.0, "{id} not below the hub");
+            }
+            assert!(y("c2") > y("c1") + 30.0, "the chain keeps its own step");
+            assert!((y("x1") - y("hub")).abs() < 1.0);
+            return;
+        }
         for id in ["loose1", "loose2", "c1", "i1"] {
             assert!(
                 (y(id) - row).abs() < 1.0,
@@ -5887,7 +9288,7 @@ mod tests {
             "flowchart TB\nn0\nn1\nn2\nn3\nn1-->n2\nn0-->n3\nn0-->n1\nn1-->n3\nn2-->n1\nn3-->n2\n";
         let g = crate::parser::parse(core).unwrap();
         let back = |w: Walk| -> Vec<usize> {
-            let rk = rank(&g, &[], 0, None, w);
+            let rk = rank(&g, &[], 0, None, w, None);
             (0..g.edges.len()).filter(|&e| rk.back[e]).collect()
         };
         assert_eq!(back(Walk::Source), vec![0, 3]);
@@ -5895,18 +9296,21 @@ mod tests {
         let layers = |src: &str| -> Vec<usize> {
             let g = crate::parser::parse(src).unwrap();
             let sizes = vec![(60.0, 40.0); g.nodes.len()];
-            let (lo, _) = layout_core(&g, &sizes, None, &[]);
+            let (lo, ..) = layout_core(&g, &sizes, None, &[], None);
             lo.nodes[..4].iter().map(|p| p.layer).collect()
         };
         let small = layers(core);
-        assert_eq!(small, rank(&g, &[], 0, None, Walk::Fewest).layer);
+        assert_eq!(small, rank(&g, &[], 0, None, Walk::Fewest, None).layer);
         let mut big = core.to_string();
         let pairs = WALK_MAX_ELEMENTS / 3 + 1;
         for i in 0..pairs {
             big += &format!("p{i} --> q{i}\n");
         }
         assert!(4 + 6 + 3 * pairs > WALK_MAX_ELEMENTS);
-        assert_eq!(layers(&big), rank(&g, &[], 0, None, Walk::Source).layer);
+        assert_eq!(
+            layers(&big),
+            rank(&g, &[], 0, None, Walk::Source, None).layer
+        );
         assert_ne!(small, layers(&big), "the walks lay the cycle out alike");
     }
 
@@ -5927,8 +9331,8 @@ mod tests {
             })
             .collect();
         let sizes: Vec<(f64, f64)> = vec![(60.0, 40.0); g.nodes.len()];
-        let rk = rank(&g, &[], 0, None, Walk::Fewest);
-        let (lo, _) = layout_core(&g, &sizes, Some(&nc), &[]);
+        let rk = rank(&g, &[], 0, None, Walk::Fewest, None);
+        let (lo, ..) = layout_core(&g, &sizes, Some(&nc), &[], None);
         let wraps = wrap_candidates(&g, &nc, &[], &rk, &rk.layer, &lo);
         assert_eq!(wraps.len(), 1, "{wraps:?}");
         let (first, then) = &wraps[0];
@@ -5944,7 +9348,7 @@ mod tests {
         let (x, y) = (&g.nodes[then[0]].id, &g.nodes[first[0]].id);
         back += &format!("{x} --> {y}\n");
         let g2 = crate::parser::parse(&back).unwrap();
-        let rk2 = rank(&g2, &[], 0, None, Walk::Fewest);
+        let rk2 = rank(&g2, &[], 0, None, Walk::Fewest, None);
         let wraps2 = wrap_candidates(&g2, &nc, &[], &rk2, &rk2.layer, &lo);
         assert!(
             wraps2
@@ -6830,5 +10234,169 @@ mod tests {
         assert!(text_width("⛔ ✅ ✕") >= 3.0 * 14.0);
         // Plain Latin text keeps its old estimate.
         assert_eq!(text_width("Wazuh 4.14"), line_width("Wazuh 4.14"));
+    }
+
+    /// Strongly connected components are named by their smallest
+    /// vertex, whatever the order of the arcs.
+    #[test]
+    fn components_name_each_cycle_by_its_first_vertex() {
+        let arcs = [(0, 1), (1, 2), (2, 1), (2, 3), (4, 3), (3, 4), (5, 5)];
+        assert_eq!(components(6, &arcs), [0, 1, 1, 3, 3, 5]);
+        let mut back: Vec<(usize, usize)> = arcs.to_vec();
+        back.reverse();
+        assert_eq!(components(6, &back), [0, 1, 1, 3, 3, 5]);
+        assert_eq!(components(3, &[]), [0, 1, 2]);
+    }
+
+    /// The exact order turns the least weight, and among equals is the
+    /// earliest sequence of units.
+    #[test]
+    fn the_least_turning_order_prefers_declaration_order_among_equals() {
+        // A triangle 0 -> 1 -> 2 -> 0: any order turns one link; the
+        // declared one turns `2 -> 0`.
+        let mut w = vec![vec![0u64; 3]; 3];
+        w[0][1] = 1;
+        w[1][2] = 1;
+        w[2][0] = 1;
+        assert_eq!(least_turned(&w), (1, vec![0, 1, 2]));
+        // One link down, four back up: the other unit first.
+        let mut w = vec![vec![0u64; 2]; 2];
+        w[0][1] = 1;
+        w[1][0] = 4;
+        assert_eq!(least_turned(&w), (1, vec![1, 0]));
+        // No link at all: declaration order, nothing turned.
+        assert_eq!(least_turned(&vec![vec![0u64; 3]; 3]), (0, vec![0, 1, 2]));
+    }
+
+    /// The walk's order of a level stands until it turns more than
+    /// `2 * M + 1` drawn links of a component.
+    #[test]
+    fn a_block_order_keeps_the_walk_within_twice_the_minimum() {
+        let blocks = [true, true];
+        // 0 -> 1 once, 1 -> 0 three times: the walk turns 3, the
+        // minimum is 1, and 3 <= 2 * 1 + 1.
+        let arcs = [((0, 1), 1), ((1, 0), 3)];
+        assert_eq!(block_order(&blocks, &arcs, true), [false, true]);
+        // Four times: 4 > 3, the component takes its exact order.
+        let arcs = [((0, 1), 1), ((1, 0), 4)];
+        assert_eq!(block_order(&blocks, &arcs, true), [true, false]);
+        // Without the exact net (a drawing past the walk budget) the
+        // walk stands.
+        assert_eq!(block_order(&blocks, &arcs, false), [false, true]);
+        // An undrawn link (weight 0) is turned for free and never makes
+        // a drawn one turn.
+        let arcs = [((0, 1), 0), ((1, 0), 1)];
+        assert_eq!(block_order(&blocks, &arcs, true), [false, true]);
+    }
+
+    /// A plain node nothing links into does not start the walk: where
+    /// its links enter does. Units: 0 and 1 loose nodes, 2 and 3 blocks
+    /// in a cycle; node 0 feeds block 3 once, node 1 feeds block 2
+    /// twice. The walk starts at block 2 (most entry links), whichever
+    /// node is declared first.
+    #[test]
+    fn a_block_order_starts_where_the_loose_sources_enter() {
+        let blocks = [false, false, true, true];
+        let arcs = [((0, 3), 1), ((1, 2), 2), ((2, 3), 1), ((3, 2), 1)];
+        // 3 -> 2 is turned: block 2 comes first.
+        assert_eq!(
+            block_order(&blocks, &arcs, true),
+            [false, false, false, true]
+        );
+    }
+
+    /// A level's rows: longest path, a source block beside what it
+    /// feeds, and no two blocks interleaved.
+    #[test]
+    fn level_rows_seat_source_blocks_and_never_interleave() {
+        // Units: 0 a node, 1 a block of three rows, 2 a block of two
+        // rows, 3..=7 a chain of nodes, 8 a sink. 0 -> 1, 0 -> 3 -> .. ->
+        // 7 -> 8, 2 -> 8.
+        let rows = [1, 3, 2, 1, 1, 1, 1, 1, 1];
+        let is_block = [false, true, true, false, false, false, false, false, false];
+        let mut cons = vec![
+            (0, 1),
+            (0, 3),
+            (3, 4),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 8),
+            (2, 8),
+        ];
+        let start = level_rows(&rows, &is_block, &mut cons);
+        // The source block would start at 6 - 2 = 4, interleaving with
+        // nothing: block 1 holds rows 1-3, block 2 rows 4-5.
+        assert_eq!(start[1], 1);
+        assert_eq!(start[2], 4);
+        assert_eq!(start[8], 6);
+        // Two blocks that overlap without one holding the other: the
+        // later one starts after the earlier.
+        let rows = [3, 4, 2, 1, 1];
+        let is_block = [true, true, true, false, false];
+        let mut cons = vec![(3, 1), (4, 0), (2, 1)];
+        let start = level_rows(&rows, &is_block, &mut cons);
+        let end = |u: usize| start[u] + rows[u];
+        for a in 0..3 {
+            for b in 0..3 {
+                assert!(
+                    !(start[a] < start[b] && start[b] < end(a) && end(a) < end(b)),
+                    "{start:?}"
+                );
+            }
+        }
+        assert_eq!((0..5).map(end).max(), Some(6));
+    }
+
+    /// The fence of a block layering: a node stays within the rows of
+    /// its blocks and leaves none of them empty.
+    #[test]
+    fn a_fence_keeps_a_node_in_its_blocks_rows() {
+        let blocks = BlockRanking {
+            flagged: Vec::new(),
+            // Nodes 0 and 1 in block 0, node 2 in block 1 inside block
+            // 0, node 3 outside.
+            paths: vec![vec![0], vec![0], vec![0, 1], vec![]],
+            fired: Vec::new(),
+        };
+        let layer = [0, 2, 1, 0];
+        let mut fence = Fence::new(&blocks, &layer);
+        assert!(fence.holds(0, 2) && !fence.holds(0, 3));
+        // Node 0 is alone on its block's first row: it may not leave it.
+        assert!(!fence.allows(0, 0, 1));
+        // Node 2 is all of block 1: it has nowhere to go.
+        assert!(!fence.allows(2, 1, 2));
+        // A node outside every block is free.
+        assert!(fence.allows(3, 0, 5));
+        fence.moved(3, 0, 5);
+        assert!(fence.unchanged(&[0, 2, 1, 5]));
+        assert!(!fence.unchanged(&[1, 2, 1, 0]));
+    }
+
+    /// A block layout's label slot is the middle of the chain's run at
+    /// its ends' common level; without one, the middle of the chain.
+    #[test]
+    fn a_label_slot_is_the_middle_of_the_run_between_the_end_blocks() {
+        // Two points inside the source block (subgraph 1), three
+        // between the blocks, one inside the target block (2).
+        let paths = vec![vec![1], vec![1], vec![], vec![], vec![], vec![2]];
+        assert_eq!(label_slot(&paths, &[]), 3);
+        // Both blocks inside subgraph 0: the run at that level.
+        let nested = vec![vec![0, 1], vec![0], vec![0, 2]];
+        assert_eq!(label_slot(&nested, &[0]), 1);
+        // The chain never leaves the end blocks: its middle point.
+        let inside = vec![vec![1], vec![1], vec![2], vec![2]];
+        assert_eq!(label_slot(&inside, &[]), 2);
+    }
+
+    /// Only an upstream edge between two plain nodes of one level keeps
+    /// its lane in a block layout; before blocks every back-edge does.
+    #[test]
+    fn a_lane_is_kept_between_two_plain_nodes_of_one_level() {
+        let paths = vec![vec![0], vec![0], vec![0, 1], vec![]];
+        assert!(keeps_lane(None, 0, 2));
+        assert!(keeps_lane(Some(&paths), 0, 1));
+        assert!(!keeps_lane(Some(&paths), 0, 2));
+        assert!(!keeps_lane(Some(&paths), 3, 1));
     }
 }

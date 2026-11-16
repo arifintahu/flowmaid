@@ -35,6 +35,8 @@
 
 pub mod advance;
 pub mod architecture;
+#[cfg(test)]
+mod blockcheck;
 mod casing;
 pub mod class;
 pub(crate) mod clearance;
@@ -46,11 +48,14 @@ pub mod er;
 pub mod fold;
 pub mod gitgraph;
 mod hops;
+#[cfg(test)]
+mod identity;
 pub mod journey;
 pub(crate) mod json;
 mod labels;
 mod lanes;
 pub mod layout;
+mod levels;
 mod markdown;
 pub mod mindmap;
 pub mod model;

@@ -7,7 +7,7 @@ Where flowmaid is going and how far it has come. Two things are tracked, in two 
 
 The bar for drawing quality: the same source should look as good as it does in mermaid 12.2.0, or better and tidier. flowmaid keeps what mermaid does not offer: zero dependencies, an interactive scene API (drag, re-route, picking), and speed (most hand-written diagrams render in under a millisecond).
 
-Last updated for 0.40.0 (2026-11-11).
+Last updated 2026-11-16 (latest release: 0.40.0).
 
 ## Done
 
@@ -38,12 +38,12 @@ It is built in four steps. Each is merged behind an internal switch that is off,
 
 | step | what | state |
 |---|---|---|
-| 1 | Structure: the tree of blocks, layering, ordering | a first version is on a work branch; its review did not pass (see the open question below), so it is not merged or released |
+| 1 | Structure: the tree of blocks, layering, ordering | merged behind the switch, which is off: no drawing changes |
 | 2 | Geometry: frames, coordinates, room for gaps and labels | not started |
 | 3 | Routing under a drag: `route()`, `route_sized()` and `route_partial()` in block mode | not started |
 | 4 | Comparison sweep against mermaid and against the previous release, then on by default | not started |
 
-**Open question.** One dense test diagram draws with more than twice as many crossings in block mode as it has today. Either the design is extended to cover it, or a diagram that the block layout would draw worse keeps the current layout.
+**The dense test diagram.** It used to draw more than twice as many crossings in block mode as it has today. After step 1 it draws fewer: 49 crossings against 66 in today's layout (`tests/fixtures/quality/dense-td.mmd`, the static drawing). Redrawn by `route()`, which a drag uses, it still has more, 113 against 76, until step 3.
 
 ## After that
 
