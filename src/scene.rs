@@ -229,7 +229,7 @@ pub struct Scene {
     /// grows that way instead and `origin` goes negative on that axis, to
     /// the margin before the drawing. Like `width` and `height` it only
     /// grows: a [`route_partial`] keeps its base's canvas. An overflow
-    /// under the 0.1 px the SVG is written to is none.
+    /// that rounds to 0 at the 0.1 px the SVG is written to is none.
     ///
     /// A class or ER SVG is drawn on this canvas (its `viewBox`), a
     /// routed scene at its coordinates (a laid-out one that reaches into
@@ -7420,7 +7420,8 @@ fn view_shift(routed: bool, fit: (f64, f64)) -> ((f64, f64), (f64, f64)) {
 /// on an axis that does not overflow, possibly after zero. So a dragged
 /// node stays where the host put it, nothing else moves, and a host maps
 /// pointer coordinates through the `viewBox` into scene coordinates for
-/// picking. An overflow under the 0.1 px the SVG is written to is none.
+/// picking. An overflow that rounds to 0 at the 0.1 px the SVG is written
+/// to is none.
 /// The accessible name is `"Flowchart diagram"`; use [`to_svg_titled`]
 /// for another diagram class (e.g. state machines).
 pub fn to_svg(sc: &Scene) -> String {

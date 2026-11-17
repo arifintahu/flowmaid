@@ -21,7 +21,8 @@ changed.
   does not match the diagram, or a coordinate that is not finite or lies
   more than a million px from zero), so a host whose position list is out
   of date for a moment needs no counting rule of its own.
-- **A drag past the top-left keeps every position.** A routed drawing that
+- **A drag past the top-left keeps every position** (flowchart, state,
+  class and ER). A routed drawing that
   reaches past the top-left margin is no longer moved onto a `0 0` canvas:
   its `viewBox` starts before zero on the axis that overflows instead, so a
   dragged node stays under the pointer. The new `Scene::origin` is the
