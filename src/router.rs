@@ -4967,7 +4967,7 @@ fn info_of(g: &Graph, w: &World, cx: &Ctx, i: usize) -> Option<Info> {
         ends: (a, b),
         allowed,
         blocked_frames,
-        back: cx.back.get(i).copied().unwrap_or(false),
+        back: cx.lane.get(i).copied().unwrap_or(false),
         sideways: a1.min(b1) > a0.max(b0),
         home,
     })
@@ -5219,7 +5219,16 @@ pub(crate) fn repair(g: &Graph, sc: &mut Scene, cx: &Ctx, mode: Mode, moved: &mu
         if simple_all.is_empty() || lane(i) {
             return false;
         }
-        let many = mode == Mode::Static && sc.edges[i].label.is_none();
+        // (Not in a block layout: there every edge runs where the block
+        // ordering put it, down its dummy chain or as a Z across the
+        // gap between its two rows, and that ordering counted its
+        // crossings; a way round the crowd found edge by edge took no
+        // account of the fan it belongs to. dense-td's turned edge
+        // `n36 -> n16`, searched for its crossings, came back square
+        // across all five siblings of its fan, twice each; bench-75's
+        // fans out of its stacked members, searched one by one, crossed
+        // 27 times where the ortho stage drew them crossing once.)
+        let many = mode == Mode::Static && sc.edges[i].label.is_none() && !cx.blocks;
         let a = &simple_all[i];
         let ends = |k: usize| cx.ends.get(k).copied().flatten();
         let shares = |j: usize| match (ends(i), ends(j)) {
@@ -5420,6 +5429,21 @@ pub(crate) fn repair(g: &Graph, sc: &mut Scene, cx: &Ctx, mode: Mode, moved: &mu
         };
         // Its smoothed curve still touches something: a wider clearance.
         let wider = Try { lat: 1, ..first };
+        // In a block layout's static scene ([`Ctx::blocks`]), after the
+        // priced search below found only a way through a foreign frame:
+        // still clear of every band and foreign frame, over the whole
+        // drawing. A run through a block that holds neither end is what
+        // the block layout exists to avoid (spec 4.3 f), and the way
+        // round a block lies past the block's far side, beyond the
+        // window round the ends (bench-75's `gw -> logs`, spilled to the
+        // bottom sides of both ends: the window found no way into `logs`
+        // from below but through `metrics`, and the priced search then
+        // ran it straight through `app` and `data`).
+        let round = Try {
+            reach: work.walls_reach,
+            ..first
+        };
+        let round_on = cx.blocks && mode == Mode::Static;
         // No such path: over a wider window (the whole drawing when
         // static), bands and frames priced.
         let walls = Try {
@@ -5434,7 +5458,26 @@ pub(crate) fn repair(g: &Graph, sc: &mut Scene, cx: &Ctx, mode: Mode, moved: &mu
         };
         let mut n_found = 0;
         let mut built: Built = Vec::new();
-        for t in [first, wider, walls, back] {
+        // (Each try with whether it is `round`.)
+        let mut tries = vec![(first, false), (wider, false), (walls, false)];
+        if round_on {
+            tries.push((round, true));
+        }
+        tries.push((back, false));
+        for (t, is_round) in tries {
+            // (The whole-drawing strict try only where the priced search
+            // found a way through a foreign frame that would replace the
+            // original, one through a node: an original that only touches
+            // a title chip keeps its course, as before, rather than take
+            // a long way round across a dozen lines.)
+            if is_round
+                && !best.as_ref().is_some_and(|b| {
+                    b.0.frame > 0
+                        && (b.0.node, b.0.frame, b.0.chip) < (base0.node, base0.frame, base0.chip)
+                })
+            {
+                continue;
+            }
             // (A frame the path still enters is no matter of clearance: in
             // `route()` a wider lattice is not tried for it.)
             if t.lat == 1
@@ -6157,6 +6200,11 @@ mod tests {
             "parallel-labelled" => (0..25).fold("flowchart TD\n".to_string(), |s, i| {
                 s + &format!("A -->|lbl {i}| B\n")
             }),
+            // A fixture of another directory, named with it.
+            _ if name.contains('/') => {
+                let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+                std::fs::read_to_string(format!("{dir}/{name}.mmd")).unwrap()
+            }
             _ => {
                 let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/quality");
                 std::fs::read_to_string(format!("{dir}/{name}.mmd")).unwrap()
@@ -6248,6 +6296,8 @@ mod tests {
             ("dense-lr", true),
             ("dense-td", true),
             ("bench-75", true),
+            // A diagram of linked subgraphs (the block layout's fixture).
+            ("blocks/blocks-overview", true),
             ("fan-40-labelled", false),
             ("parallel-labelled", false),
         ] {
@@ -6776,8 +6826,45 @@ mod tests {
     /// synthetic stand-in, generic ids): the static scene keeps them off
     /// the gap between the frames, never riding a border or cramped
     /// beside each other there (G4 over G6, the narrow-channel rule).
+    ///
+    /// The layout before blocks: as blocks the two frames are stacked
+    /// along the flow and no wedge is left to test, so the body runs
+    /// with the block layout switched off. Where a block layout does
+    /// leave two linked frames side by side — a level the lane rule
+    /// keeps as lanes — the rule is tested by
+    /// `edges_between_two_lanes_keep_off_their_gap_as_blocks`.
     #[test]
     fn edges_into_a_wedged_frame_keep_out_of_the_gap() {
+        crate::levels::with_blocks(false, wedged_frame);
+    }
+
+    /// The narrow-channel rule in a block layout: the lane rule leaves
+    /// the two blocks of a ping-pong side by side, 20 px apart, and
+    /// every edge between them crosses that gap — none rides a frame's
+    /// border there or runs cramped beside another.
+    #[test]
+    fn edges_between_two_lanes_keep_off_their_gap_as_blocks() {
+        for name in ["blocks/swimlane", "blocks/swim-cycle"] {
+            let g = crate::blockcheck::fixture(name);
+            let sc = crate::levels::with_blocks(true, || scene(&g));
+            let frame = |id: &str| sc.clusters.iter().find(|c| c.id == id).expect("frame");
+            let (a, b) = (frame("A"), frame("B"));
+            let gap = b.x - (a.x + a.w);
+            assert!(
+                gap > 0.0 && gap < 2.0 * FRAME_SEP,
+                "{name}: frames {gap:.1} px apart"
+            );
+            let m = crate::quality::measure(&g, &sc);
+            for d in &m.details {
+                assert!(
+                    !(d.contains(" border ") || d.contains(" tight ")),
+                    "{name}: {d}"
+                );
+            }
+        }
+    }
+
+    fn wedged_frame() {
         let src = "flowchart TB
   subgraph g0[Lorem]
     subgraph g1[Ipsum]

@@ -69,8 +69,21 @@ const BARE_LEG: f64 = crate::router::CORNER_R / 2.0;
 /// Room (px) a jog keeps from a frame's border it passes along: the
 /// router's frame ring.
 const BORDER_CLEAR: f64 = crate::clearance::FRAME_SEP / 2.0 + SEP_AIR;
-/// Room (px) a jog keeps from a frame's title chip.
-const CHIP_CLEAR: f64 = crate::clearance::CHIP_SEP + SEP_AIR;
+/// [`BORDER_CLEAR`] in a block layout (B12 G2): a frame's whole
+/// clearance and air, past the router's frame band
+/// ([`crate::clearance::CLEAR_GAP`]) even where the router judges the
+/// path simplified (a rounded corner cut short tilts the run beside it
+/// a px or two towards the border), so a track the layout made room
+/// for is not a border ride the repair then reroutes. At
+/// [`BORDER_CLEAR`] the first track of a fan stepping under a block ran
+/// 7.5 px under its border for 570 px, and the repair took it off,
+/// across the rest of the fan (dense-td).
+const BLOCK_BORDER_CLEAR: f64 = crate::clearance::FRAME_SEP + SEP_AIR;
+/// Room (px) a jog keeps from a frame's title chip — and, in a block
+/// layout, a port from a chip's shadow ([`crate::ports`]): the room the
+/// router asks for and a little air, so a stroke placed by it does not
+/// sit exactly on the router's limit.
+pub(crate) const CHIP_CLEAR: f64 = crate::clearance::CHIP_SEP + SEP_AIR;
 /// Room (px) a step across keeps from the label of its own edge riding
 /// the run below it (the label stage's own gap).
 const LABEL_SEP: f64 = crate::labels::LABEL_GAP;
@@ -524,11 +537,16 @@ fn ortho_pass(g: &Graph, sc: &mut Scene, cx: &mut Ctx, mode: Mode) {
     // their title chips (breadth span, flow span).
     let mut walls: Vec<Wall> = Vec::new();
     if !sc.clusters.is_empty() {
-        let right = sc.width;
+        let right = sc.origin.0 + sc.width;
+        let clear = if cx.blocks {
+            BLOCK_BORDER_CLEAR
+        } else {
+            BORDER_CLEAR
+        };
         for (ci, c) in sc.clusters.iter().enumerate() {
             let r = flow_rect(dir, (c.x, c.y, c.x + c.w, c.y + c.h));
             for l in [r.2, r.3] {
-                walls.push(((r.0, r.1), (l - BORDER_CLEAR, l + BORDER_CLEAR)));
+                walls.push(((r.0, r.1), (l - clear, l + clear)));
             }
             let h = flow_rect(dir, crate::scene::title_head(&sc.clusters, ci, right));
             walls.push(((h.0, h.1), (h.2 - CHIP_CLEAR, h.3 + CHIP_CLEAR)));
@@ -565,6 +583,8 @@ fn ortho_pass(g: &Graph, sc: &mut Scene, cx: &mut Ctx, mode: Mode) {
         Vec::new()
     };
     let stubs = breadth_stubs(sc, cx, dir, &boxes);
+    let end_stubs = breadth_ends(sc, cx, dir, &boxes);
+    let titles = TitleSides::of(sc, cx, dir, &frames);
     let mut jogs: Vec<Jog> = Vec::new();
     let mut plans: Vec<(usize, Vec<Corner>)> = Vec::new();
     // The edges between one pair of ends, either way round (twins): a
@@ -798,11 +818,29 @@ fn ortho_pass(g: &Graph, sc: &mut Scene, cx: &mut Ctx, mode: Mode) {
                     own: [ends_of(from), ends_of(to)],
                     edge: i,
                 };
-                straighten(&room, f0.0, &cols, f3.0)
+                // A column whose run crosses a block's title side keeps
+                // the place the layout gave it past the chip and the
+                // columns of the block's displaced entries (X2.2, X2.5).
+                // Straightened towards its neighbours it moved back into
+                // that room (blocks/nested-chain: `a -> c2` 1 px past the
+                // chip, `b2 -> c` displaced past it and across it).
+                let pts: Vec<Pt> = std::iter::once(f0)
+                    .chain(cols.iter().copied())
+                    .chain(std::iter::once(f3))
+                    .collect();
+                let pinned: Vec<bool> = (1..pts.len() - 1)
+                    .map(|k| {
+                        !titles.all_crossings(&pts[k - 1..=k]).is_empty()
+                            || !titles.all_crossings(&pts[k..=k + 1]).is_empty()
+                    })
+                    .collect();
+                straighten(&room, f0.0, &cols, f3.0, &pinned)
             }
         } else {
             Vec::new()
         };
+        // Clear of the title chips whose sides it crosses (B12 2.8).
+        let cols = titles.clear(i, f0, cols, f3);
         let mut home: Vec<usize> = Vec::new();
         for end in [from, to] {
             let fr = match end {
@@ -818,10 +856,12 @@ fn ortho_pass(g: &Graph, sc: &mut Scene, cx: &mut Ctx, mode: Mode) {
             walls: &walls,
             frames: &frames,
             home: &home,
+            blocks: cx.blocks,
             load: &load,
             own,
             head_leg,
             lines: &lines,
+            titles: &titles,
         };
         // The label's spot along the flow and its half extent there.
         let label = e.label.as_ref().map(|(_, c, w)| {
@@ -924,7 +964,10 @@ fn ortho_pass(g: &Graph, sc: &mut Scene, cx: &mut Ctx, mode: Mode) {
             &cols,
             (f3, n3, glyph.1),
             label,
-            stubs.get(i).copied().flatten(),
+            (
+                stubs.get(i).copied().flatten(),
+                end_stubs.get(i).copied().flatten(),
+            ),
             &mut jogs,
         );
         let Some(plan) = plan else { continue };
@@ -946,7 +989,7 @@ fn ortho_pass(g: &Graph, sc: &mut Scene, cx: &mut Ctx, mode: Mode) {
         }
         plans.push((i, plan));
     }
-    place_tracks(&mut jogs, &kept);
+    place_tracks(&mut jogs, &kept, cx.blocks);
     uncross(&mut jogs, &kept_lines);
 
     for (i, plan) in plans {
@@ -989,6 +1032,16 @@ fn ortho_pass(g: &Graph, sc: &mut Scene, cx: &mut Ctx, mode: Mode) {
             if let Some((_, at, _)) = e.label.as_mut() {
                 let (a, b) = (screen[2], screen[3]);
                 *at = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+            }
+        } else if cx.blocks && chain[i] {
+            // A block layout's long edge: its label keeps the slot the
+            // layout reserved on the run between its two end blocks
+            // ([`crate::layout::label_slot`]), on the new path. Moved
+            // with the path's middle, the label of a chain whose
+            // columns lined up into one run and a last step went onto
+            // that step, inside the block the edge ends in.
+            if let Some((_, at, _)) = e.label.as_mut() {
+                *at = nearest_on(&screen, *at);
             }
         } else {
             relabel(e, &screen, rides.then_some(dir));
@@ -1129,6 +1182,9 @@ struct Along<'a> {
     /// edge (never in its way).
     frames: &'a [(f64, f64, f64, f64)],
     home: &'a [usize],
+    /// A block layout ([`Ctx::blocks`]): a step keeps out of the frames
+    /// that hold neither of its ends ([`plan_jog`]).
+    blocks: bool,
     /// The spans of the jogs each gap holds so far.
     load: &'a std::cell::RefCell<Vec<Vec<(f64, f64)>>>,
     /// The edge's own end nodes (never in its way).
@@ -1139,6 +1195,8 @@ struct Along<'a> {
     /// Every edge's line as the stage found it (flow coordinates; empty
     /// where none is judged), for the gap a long run steps across in.
     lines: &'a [Vec<Pt>],
+    /// The frames' title sides (a block layout's; [`TitleSides`]).
+    titles: &'a TitleSides,
 }
 
 impl Along<'_> {
@@ -1271,6 +1329,326 @@ fn breadth_stubs(sc: &Scene, cx: &Ctx, dir: Direction, boxes: &[Rect]) -> Vec<Op
     out
 }
 
+/// A frame's title side as [`TitleSides`] reads it (flow coordinates):
+/// the frame's breadth span, the flow coordinate of its title side,
+/// which way along the flow the frame lies from it, and the chip's
+/// breadth span widened by [`CHIP_CLEAR`].
+type TitleSide = (f64, f64, f64, f64, (f64, f64));
+
+/// The title sides of a block layout's frames (TD / BT; B12 2.8,
+/// "Title-clear entries", rule 2 in its smallest form): an edge end on a
+/// side of a member of the frame's title row that lies wholly under the
+/// frame's title chip widened by [`CHIP_CLEAR`] — an entry into such a
+/// member, or an exit out of it going back up — is *displaced*: the edge
+/// crosses the title side at a column past the chip's end, the columns
+/// of one side [`TRACK_PITCH`] apart in the order of the breadths they
+/// replace, and steps over to its port inside the frame, in the jog room
+/// between the title strip and the title row that the layout reserves
+/// for them (`layout::title_jogs`). Through the chip, the router took
+/// such an edge round it and in through the frame's lateral wall. Only
+/// edge ends are displaced: a run of the frame's own under the chip is
+/// the layout's to move past it (X2.5, `layout::BlockOrder`'s
+/// `clear_titles`), and a channel column that crosses a title side keeps
+/// the column the layout gave it ([`straighten`]'s pins). A column that
+/// would leave the frame is not taken: the edge is drawn as before.
+struct TitleSides {
+    /// Per frame: its breadth span, the flow coordinate of its title
+    /// side, which way along the flow the frame lies from it, and the
+    /// chip's breadth span widened by [`CHIP_CLEAR`] (flow coordinates),
+    /// when it has a title on a flow side.
+    sides: Vec<Option<TitleSide>>,
+    /// The displaced crossings: (edge, frame) -> the column it takes.
+    cols: std::collections::BTreeMap<(usize, usize), f64>,
+}
+
+impl TitleSides {
+    fn of(sc: &Scene, cx: &Ctx, dir: Direction, frames: &[Rect]) -> TitleSides {
+        let mut out = TitleSides {
+            sides: Vec::new(),
+            cols: std::collections::BTreeMap::new(),
+        };
+        if !cx.blocks || !matches!(dir, Direction::TD | Direction::BT) || sc.clusters.is_empty() {
+            return out;
+        }
+        let right = sc.origin.0 + sc.width;
+        out.sides = (0..sc.clusters.len())
+            .map(|ci| {
+                if sc.clusters[ci].title.trim().is_empty() {
+                    return None;
+                }
+                let r = frames[ci];
+                let h = flow_rect(dir, crate::scene::title_head(&sc.clusters, ci, right));
+                // The side the chip sits on, and which way along the flow
+                // the frame lies from it.
+                let (t, inward) = if (h.2 - r.2).abs() <= (r.3 - h.3).abs() {
+                    (r.2, 1.0)
+                } else {
+                    (r.3, -1.0)
+                };
+                Some((r.0, r.1, t, inward, (h.0 - CHIP_CLEAR, h.1 + CHIP_CLEAR)))
+            })
+            .collect();
+        // Every displaced crossing, by frame: (breadth it replaces, edge);
+        // and the breadths the side's other crossings take past the chip.
+        let mut by: std::collections::BTreeMap<usize, Vec<(f64, usize)>> =
+            std::collections::BTreeMap::new();
+        let mut taken: std::collections::BTreeMap<usize, Vec<f64>> =
+            std::collections::BTreeMap::new();
+        for (i, e) in sc.edges.iter().enumerate() {
+            if !cx.drawn.get(i).copied().unwrap_or(false)
+                || e.waypoints.len() < 2 && e.bezier[0] == e.bezier[3]
+            {
+                continue;
+            }
+            let pts: Vec<Pt> = if e.waypoints.len() >= 2 {
+                e.waypoints.iter().map(|&p| to_flow(dir, p)).collect()
+            } else {
+                vec![to_flow(dir, e.bezier[0]), to_flow(dir, e.bezier[3])]
+            };
+            // Only an end on a side that lies wholly under the chip: the
+            // ports stage keeps the others' ends on the free stretch
+            // beside it (rule 1), and drawn displaced as well, the
+            // entries of a fan into a narrow block's partly shaded
+            // member crossed each other above it (dense-td's `n43`).
+            let shaded = |end: Option<EndRef>, k: usize| {
+                let (Some(EndRef::Node(v)), Some((_, _, _, _, (c0, c1)))) = (end, out.sides[k])
+                else {
+                    return false;
+                };
+                let r = flow_rect(dir, end_rect(sc, EndRef::Node(v)));
+                r.0 >= c0 && r.1 <= c1
+            };
+            let ends = cx.ends.get(i).copied().flatten();
+            for (k, b, displaced) in out.all_crossings(&pts) {
+                let end = ends.map(|(f, t)| {
+                    let t_flow = flow_rect(dir, end_rect(sc, t));
+                    if b >= t_flow.0 && b <= t_flow.1 {
+                        t
+                    } else {
+                        f
+                    }
+                });
+                if displaced && shaded(end, k) {
+                    by.entry(k).or_default().push((b, i));
+                } else {
+                    taken.entry(k).or_default().push(b);
+                }
+            }
+        }
+        for (k, mut v) in by {
+            let Some((_, f1, _, _, (_, c1))) = out.sides[k] else {
+                continue;
+            };
+            let taken = taken.remove(&k).unwrap_or_default();
+            v.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            // The nearest free columns past the chip, in the order of
+            // the breadths they replace, a track apart and a track off
+            // the side's other crossings; the first a corner's rounding
+            // past the chip's clearance, so the turn onto the track under
+            // the chip stays out of the chip's ring.
+            let mut next = c1 + crate::router::CORNER_R;
+            for &(_, i) in &v {
+                let mut col = next;
+                while let Some(&o) = taken.iter().find(|&&o| (o - col).abs() < TRACK_PITCH) {
+                    col = o + TRACK_PITCH;
+                }
+                if col > f1 - crate::scene::LANE_PAD {
+                    break;
+                }
+                out.cols.entry((i, k)).or_insert(col);
+                next = col + TRACK_PITCH;
+            }
+        }
+        out
+    }
+
+    /// The displaced crossings of a path through `pts` (flow
+    /// coordinates): (frame, breadth it would cross the title side at).
+    fn crossings(&self, pts: &[Pt]) -> Vec<(usize, f64)> {
+        self.all_crossings(pts)
+            .into_iter()
+            .filter(|c| c.2)
+            .map(|c| (c.0, c.1))
+            .collect()
+    }
+
+    /// Every crossing of a title side by a path through `pts` (flow
+    /// coordinates) inside the frame's breadth: (frame, breadth, whether
+    /// it is displaced: under the chip).
+    fn all_crossings(&self, pts: &[Pt]) -> Vec<(usize, f64, bool)> {
+        let mut out = Vec::new();
+        for (k, side) in self.sides.iter().enumerate() {
+            let Some((f0, f1, t, inward, (c0, c1))) = *side else {
+                continue;
+            };
+            let last = pts.len().saturating_sub(1);
+            for (j, w) in pts.windows(2).enumerate() {
+                let (a, b) = (w[0], w[1]);
+                if (a.1 - t) * (b.1 - t) >= 0.0 {
+                    continue;
+                }
+                // The end inside the frame sets the breadth it crosses at.
+                let (p, at) = if (b.1 - t) * inward > 0.0 {
+                    (b, j + 1)
+                } else {
+                    (a, j)
+                };
+                // Displaced only where that end is the edge's own, a port
+                // of the title row's (an entry, or an exit going back up):
+                // a run's column under the chip is the coordinates' to
+                // move (X2.5), and jogged clear of it here, the runs of a
+                // fan into a block crossed each other above it (dense-td).
+                let port = at == 0 || at == last;
+                if p.0 > f0 && p.0 < f1 {
+                    out.push((k, p.0, port && p.0 > c0 && p.0 < c1));
+                }
+            }
+        }
+        out
+    }
+
+    /// The columns of edge `i`'s path from `f0` through `cols` to `f3`
+    /// (flow coordinates), with a column past the chip of each title
+    /// side it crosses displaced.
+    fn clear(&self, i: usize, f0: Pt, cols: Vec<Pt>, f3: Pt) -> Vec<Pt> {
+        if self.cols.is_empty() {
+            return cols;
+        }
+        let pts: Vec<Pt> = std::iter::once(f0)
+            .chain(cols.iter().copied())
+            .chain(std::iter::once(f3))
+            .collect();
+        let mut out: Vec<Pt> = Vec::with_capacity(cols.len() + 2);
+        for (j, w) in pts.windows(2).enumerate() {
+            if j > 0 {
+                out.push(w[0]);
+            }
+            let (a, b) = (w[0], w[1]);
+            for (k, side) in self.sides.iter().enumerate() {
+                let (Some((_, _, t, _, _)), Some(&col)) = (side, self.cols.get(&(i, k))) else {
+                    continue;
+                };
+                if (a.1 - t) * (b.1 - t) < 0.0 && self.crossings(&[a, b]).iter().any(|c| c.0 == k) {
+                    out.push((col, *t));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Per edge, in a block layout ([`Ctx::blocks`]): the breadth (flow
+/// coordinates) of the run its end takes into a breadth side, where the
+/// straight leg off its run onto that side would pass through another
+/// box (B12 2.8, an over-full side's corner legs). A block whose members
+/// stand side by side across the flow (a `direction` block, stacked in
+/// the other direction) spills the ends of its members' over-full flow
+/// sides round their corners, and the leg from the run into a spilled
+/// end then crossed the members stacked beside it (bench-75: the edges
+/// into `db` and `cache` dropped through `queue` and `db`, 11 boxes hit,
+/// which the router rerouted one by one, out of their fans' order).
+/// The end takes its last run in the gap beside its side instead, just
+/// outside it, a track further out for every end of that side reached
+/// before it along the flow, so the runs nest round each other's turns,
+/// and the step to it is taken in the gap before the end's row. As for
+/// starts ([`breadth_stubs`]), once one end of a side would pass through
+/// a box, every end into that side takes its run so. Outside a block
+/// layout every end keeps its turn (`None`).
+fn breadth_ends(sc: &Scene, cx: &Ctx, dir: Direction, boxes: &[Rect]) -> Vec<Option<f64>> {
+    let mut out = vec![None; sc.edges.len()];
+    if !cx.blocks {
+        return out;
+    }
+    struct End {
+        edge: usize,
+        end: EndRef,
+        side: Side,
+        at: f64,
+        way: f64,
+        blocked: bool,
+        port: f64,
+        out: f64,
+    }
+    let mut ends: Vec<End> = Vec::new();
+    let clear = EDGE_SEP / 2.0;
+    for (i, e) in sc.edges.iter().enumerate() {
+        let Some((from, to)) = cx.ends.get(i).copied().flatten() else {
+            continue;
+        };
+        if !cx.drawn.get(i).copied().unwrap_or(false)
+            || cx.fixed.get(i).copied().unwrap_or(false)
+            || e.meta.curve.is_some()
+            || from == to
+            || crate::ports::note_link(sc, cx, i)
+            || crate::edgepass::holds_other(cx, to, from)
+            || (!e.waypoints.is_empty() && crate::router::ortho_corners(e).is_some())
+        {
+            continue;
+        }
+        let (p0, p3) = if e.waypoints.len() >= 2 {
+            (e.waypoints[0], e.waypoints[e.waypoints.len() - 1])
+        } else {
+            (e.bezier[0], e.bezier[3])
+        };
+        let (f0, f3) = (to_flow(dir, p0), to_flow(dir, p3));
+        let way = (f3.1 - f0.1).signum();
+        let side = match to {
+            EndRef::Node(v) => crate::ports::outline_side(sc.nodes[v].shape, end_rect(sc, to), p3),
+            EndRef::Frame(_) => side_of(end_rect(sc, to), p3),
+        };
+        let n = flow_normal(dir, side);
+        if way == 0.0 || n.1 != 0.0 || n.0 == 0.0 {
+            continue;
+        }
+        // The column the run passes last, and the leg from it onto the
+        // side, turning off the flow just short of the end.
+        let last = if e.waypoints.len() >= 3 {
+            to_flow(dir, e.waypoints[e.waypoints.len() - 2]).0
+        } else {
+            f0.0
+        };
+        let own = [from, to].map(|r| match r {
+            EndRef::Node(v) => Some(v),
+            EndRef::Frame(_) => None,
+        });
+        let (b0, b1) = (f3.0.min(last), f3.0.max(last));
+        let blocked = (last - f3.0) * n.0 > 0.0
+            && boxes.iter().enumerate().any(|(k, r)| {
+                !own.contains(&Some(k))
+                    && f3.1 > r.2 - clear
+                    && f3.1 < r.3 + clear
+                    && b1 > r.0 - clear
+                    && b0 < r.1 + clear
+            });
+        ends.push(End {
+            edge: i,
+            end: to,
+            side,
+            at: f3.1,
+            way,
+            blocked,
+            port: f3.0,
+            out: n.0,
+        });
+    }
+    for m in &ends {
+        let group = || ends.iter().filter(|o| o.end == m.end && o.side == m.side);
+        if !group().any(|o| o.blocked) {
+            continue;
+        }
+        let edge = group()
+            .map(|o| o.port * m.out)
+            .fold(f64::NEG_INFINITY, f64::max)
+            * m.out;
+        let rank = group()
+            .filter(|o| o.way == m.way && (o.at - m.at) * m.way < -EPS)
+            .count();
+        let lead = HEAD_LEG.max(ROW_CLEAR);
+        out[m.edge] = Some(edge + m.out * (lead + rank as f64 * TRACK_PITCH));
+    }
+    out
+}
+
 /// The corners of an edge from `a` (point, its side's outward normal,
 /// a glyph on it; flow coordinates) through each column of `cols` (a
 /// dummy chain's points) to `b`: along the flow, with a jog in a gap
@@ -1288,7 +1666,7 @@ fn flow_path(
     cols: &[Pt],
     b: (Pt, Pt, bool),
     label: Option<(f64, f64)>,
-    stub: Option<f64>,
+    (stub, end_stub): (Option<f64>, Option<f64>),
     jogs: &mut Vec<Jog>,
 ) -> Option<Vec<Corner>> {
     let ((p0, n0, g0), (p3, n3, g3)) = (a, b);
@@ -1318,7 +1696,10 @@ fn flow_path(
     let start = if n0 == (0.0, h) {
         (p0, true, g0)
     } else if across(n0) {
-        let b = if cols.is_empty() && across(n3) {
+        // (Two breadth sides with a stub at either end, in a block layout
+        // ([`breadth_ends`]): each end's own run, a step between.)
+        let stubbed = cx.blocks && (stub.is_some() || end_stub.is_some());
+        let b = if cols.is_empty() && across(n3) && !stubbed {
             if n0.0 == -n3.0 && ahead(p0.0, (p0.0 + p3.0) / 2.0, n0.0) {
                 (p0.0 + p3.0) / 2.0
             } else if n0.0 == n3.0 {
@@ -1359,7 +1740,16 @@ fn flow_path(
         ((p3, true, g3), None)
     } else if across(n3) {
         let run = if cols.is_empty() { start.0 .0 } else { last_b };
-        let b = if ahead(p3.0, run, n3.0) {
+        let b = if let Some(x) = end_stub {
+            // Its run beside its side ([`breadth_ends`]), at least its
+            // own lead out.
+            let least = p3.0 + n3.0 * lead(g3);
+            if n3.0 > 0.0 {
+                x.max(least)
+            } else {
+                x.min(least)
+            }
+        } else if ahead(p3.0, run, n3.0) {
             run
         } else {
             p3.0 + n3.0 * lead(g3)
@@ -1384,17 +1774,29 @@ fn flow_path(
         // passed on the run's own line where that runs clear of the boxes
         // to the next stop: the layout's dummies drift a few px from
         // layer to layer, and a step for each read as a ragged line.
-        let q =
-            if !port && turn != Some(q) && (q.0 - cur.0 .0).abs() < 2.0 * crate::router::CORNER_R {
-                let next = stops.get(si + 1).map_or(q.1, |n| n.0 .1);
-                if cx.clear_run(cur.0 .0, cur.0 .1, next) {
-                    (cur.0 .0, q.1)
-                } else {
-                    q
-                }
+        // (Not a column whose run crosses a block's title side: the
+        // layout placed it past the chip and the columns of the block's
+        // displaced entries, X2.2 and X2.5; on the run's line it moved
+        // back into their room.)
+        let titled = || {
+            let next = stops.get(si + 1).map_or(q, |n| n.0);
+            !cx.titles.all_crossings(&[cur.0, q]).is_empty()
+                || !cx.titles.all_crossings(&[q, next]).is_empty()
+        };
+        let q = if !port
+            && turn != Some(q)
+            && (q.0 - cur.0 .0).abs() < 2.0 * crate::router::CORNER_R
+            && !titled()
+        {
+            let next = stops.get(si + 1).map_or(q.1, |n| n.0 .1);
+            if cx.clear_run(cur.0 .0, cur.0 .1, next) {
+                (cur.0 .0, q.1)
             } else {
                 q
-            };
+            }
+        } else {
+            q
+        };
         if (q.0 - cur.0 .0).abs() > ALIGNED {
             if (q.1 - cur.0 .1) * h <= EPS {
                 return None;
@@ -1515,9 +1917,19 @@ impl ColumnRoom<'_> {
 /// dummy chain a whole box gap off its neighbours and drifts it from
 /// layer to layer; on the axes each drift is a step, and a chain the
 /// layout ordered past a row's last box ran its gap's width out beyond
-/// it, widening the drawing.
-fn straighten(room: &ColumnRoom, from: f64, cols: &[Pt], to: f64) -> Vec<Pt> {
-    let slots: Vec<(f64, f64)> = cols.iter().map(|&q| room.slot(q)).collect();
+/// it, widening the drawing. A `pinned` column keeps its breadth.
+fn straighten(room: &ColumnRoom, from: f64, cols: &[Pt], to: f64, pinned: &[bool]) -> Vec<Pt> {
+    let slots: Vec<(f64, f64)> = cols
+        .iter()
+        .enumerate()
+        .map(|(k, &q)| {
+            if pinned.get(k).copied().unwrap_or(false) {
+                (q.0, q.0)
+            } else {
+                room.slot(q)
+            }
+        })
+        .collect();
     let mut out: Vec<Pt> = cols.to_vec();
     let mut prev = from;
     let mut s = 0;
@@ -1719,8 +2131,46 @@ fn plan_jog(
     let e0 = if lo_pt.1 { l0 } else { g_lo };
     let e1 = if hi_pt.1 { l1 } else { g_hi };
     let mut want = ((e0 + e1) / 2.0).max(lo).min(hi);
-    // Off the frames' borders and title chips it passes along.
     let span = (bu.min(bv), bu.max(bv));
+    // In a block layout a step lies between the blocks: one that would lie
+    // inside a frame holding neither of its ends moves out of it, to the
+    // side of the frame nearer its place, where the room it has keeps it.
+    // A gap between two rows is the band's gap and, either side of it,
+    // the pad and title strip of the frames closing and opening there; a
+    // step placed mid-gap ran along inside the title strip of the block
+    // below (dense-td: an edge to a block past the first band, 1 300 px
+    // under that band's title). The blocks an end lies in are left alone:
+    // a hub's fan steps inside its own block, and a step into the block
+    // it enters crosses its border on the straight run. So is a step in a
+    // border's own band, which the walls below take off the border: moved
+    // out of the frame ahead of its neighbours' steps there, it no longer
+    // nested with them (quality/fanout-frames: a hub's fan into six
+    // frames and a node past them, one step 1.5 px past a frame's border,
+    // crossed its neighbour once moved).
+    if cx.blocks {
+        for (k, r) in cx.frames.iter().enumerate() {
+            let (w0, w1) = (r.2 - BLOCK_BORDER_CLEAR, r.3 + BLOCK_BORDER_CLEAR);
+            if cx.home.contains(&k)
+                || lo > hi
+                || r.1 <= span.0 + EPS
+                || r.0 >= span.1 - EPS
+                || want <= r.2 + BLOCK_BORDER_CLEAR
+                || want >= r.3 - BLOCK_BORDER_CLEAR
+            {
+                continue;
+            }
+            let (a, b) = if want - w0 > w1 - want {
+                (lo.max(w1), hi)
+            } else {
+                (lo, hi.min(w0))
+            };
+            if a <= b {
+                (lo, hi) = (a, b);
+                want = want.max(lo).min(hi);
+            }
+        }
+    }
+    // Off the frames' borders and title chips it passes along.
     for &((b0, b1), (w0, w1)) in cx.walls {
         if b1 <= span.0 + EPS || b0 >= span.1 - EPS || w1 <= lo || w0 >= hi {
             continue;
@@ -1846,14 +2296,69 @@ fn across_flow(p0: Pt, h0: f64, p3: Pt, h3: f64) -> Option<Vec<Corner>> {
     ])
 }
 
+/// How far a channel of [`place_tracks`] reaches once a jog meeting the
+/// runs at breadths `lo_at` (from the low flow side) and `hi_at` (on to
+/// the high side) reaches furthest in it: its span's far end, and
+/// whether its run on to the high side leaves from there.
+fn channel_reach(lo_at: f64, hi_at: f64) -> (f64, bool) {
+    (lo_at.max(hi_at), hi_at >= lo_at)
+}
+
+/// Whether the next jog of a gap (by where its span starts; meeting the
+/// runs at `lo_at` and `hi_at`) joins the channel reaching `reach`
+/// ([`channel_reach`]) in [`place_tracks`]: its span starts within a
+/// track's pitch of the channel's, and the two do not only touch where
+/// both turn the same way (a fork: two channels).
+fn joins_channel(reach: (f64, bool), lo_at: f64, hi_at: f64) -> bool {
+    let start = lo_at.min(hi_at);
+    let near_hi = hi_at <= lo_at;
+    let fork = start >= reach.0 + 1.0 && near_hi == reach.1;
+    start < reach.0 + TRACK_PITCH && !fork
+}
+
+/// The channels [`place_tracks`] forms of one gap's steps, each given by
+/// where it meets the runs from the low flow side and on to the high
+/// side (breadth): their sizes, in the order of their first steps. Each
+/// step of a channel takes a track of its own, so the largest is the
+/// tracks the gap needs (a block layout's room, B12 G2: see
+/// `layout::place`).
+pub(crate) fn channel_sizes(steps: &[(f64, f64)]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..steps.len()).collect();
+    idx.sort_by(|&a, &b| {
+        let start = |k: usize| steps[k].0.min(steps[k].1);
+        start(a).total_cmp(&start(b)).then(a.cmp(&b))
+    });
+    let mut sizes = Vec::new();
+    let mut s = 0;
+    while s < idx.len() {
+        let mut reach = channel_reach(steps[idx[s]].0, steps[idx[s]].1);
+        let mut t = s + 1;
+        while t < idx.len() {
+            let (lo_at, hi_at) = steps[idx[t]];
+            if !joins_channel(reach, lo_at, hi_at) {
+                break;
+            }
+            if lo_at.max(hi_at) > reach.0 {
+                reach = channel_reach(lo_at, hi_at);
+            }
+            t += 1;
+        }
+        sizes.push(t - s);
+        s = t;
+    }
+    sizes
+}
+
 /// Put each gap's jogs on their tracks: the jogs whose spans overlap
 /// (within a track's pitch) form a channel, ordered so their turns do
 /// not cross — of two jogs turning the same way, the one turning
 /// further out lies away from the turn, as [`crate::router`]'s nudge
 /// orders the legs of a channel — and spaced [`TRACK_PITCH`] apart (down
 /// to [`TRACK_PITCH_MIN`] in a shallow gap) as near their wanted places
-/// as the room they share allows.
-fn place_tracks(jogs: &mut [Jog], kept: &[(f64, (f64, f64))]) {
+/// as the room they share allows. In a block layout (`blocks`) the order
+/// also keeps a step's run on off the run in of the steps after it
+/// ([`part_runs`]).
+fn place_tracks(jogs: &mut [Jog], kept: &[(f64, (f64, f64))], blocks: bool) {
     let mut idx: Vec<usize> = (0..jogs.len()).collect();
     idx.sort_by(|&a, &b| {
         jogs[a]
@@ -1872,18 +2377,15 @@ fn place_tracks(jogs: &mut [Jog], kept: &[(f64, (f64, f64))]) {
         // dozen-edge hub's two halves of a fan took twice the tracks the
         // gap holds, and the router rerouted the steps squeezed out.)
         let gap = jogs[idx[s]].gap;
-        let far = |j: &Jog| (j.span().1, j.hi_at >= j.lo_at);
-        let (mut reach, mut reach_hi) = far(&jogs[idx[s]]);
+        let mut reach = channel_reach(jogs[idx[s]].lo_at, jogs[idx[s]].hi_at);
         let mut t = s + 1;
         while t < idx.len() && jogs[idx[t]].gap == gap {
             let j = &jogs[idx[t]];
-            let near_hi = j.hi_at <= j.lo_at;
-            let fork = j.span().0 >= reach + 1.0 && near_hi == reach_hi;
-            if j.span().0 >= reach + TRACK_PITCH || fork {
+            if !joins_channel(reach, j.lo_at, j.hi_at) {
                 break;
             }
-            if j.span().1 > reach {
-                (reach, reach_hi) = far(j);
+            if j.span().1 > reach.0 {
+                reach = channel_reach(j.lo_at, j.hi_at);
             }
             t += 1;
         }
@@ -1934,6 +2436,9 @@ fn place_tracks(jogs: &mut [Jog], kept: &[(f64, (f64, f64))]) {
         // crossed twice, the labelled fan's longest label ending its
         // step's room a track above the two before it).
         let mut order = ordered(jogs);
+        if blocks {
+            part_runs(&mut order, jogs);
+        }
         let holds = |order: &[usize], jogs: &[Jog]| {
             let mut last = f64::NEG_INFINITY;
             order.iter().all(|&k| {
@@ -1949,6 +2454,9 @@ fn place_tracks(jogs: &mut [Jog], kept: &[(f64, (f64, f64))]) {
                 j.at = j.want;
             }
             order = ordered(jogs);
+            if blocks {
+                part_runs(&mut order, jogs);
+            }
         }
         // The span the channel's tracks share: from the lowest room's
         // start to the highest room's end, each track then kept in its
@@ -2066,6 +2574,94 @@ fn place_tracks(jogs: &mut [Jog], kept: &[(f64, (f64, f64))]) {
         }
         if let Some(t) = found {
             jogs[k].at = t;
+        }
+    }
+}
+
+/// The pairs of a channel's steps, in `order` (by track), where the run
+/// on of the earlier lies along the run in of the later: their breadths
+/// within a track's pitch. Ordered the other way round the two runs
+/// share no stretch of the flow (the earlier step's run on starts past
+/// the later one's step). And the crossings among the steps' legs, with
+/// the tracks spread over the channel's rooms in that order.
+fn channel_cost(order: &[usize], jogs: &[Jog]) -> (usize, usize) {
+    let m = order.len();
+    let lo = order
+        .iter()
+        .map(|&k| jogs[k].room.0)
+        .fold(f64::INFINITY, f64::min);
+    let hi = order
+        .iter()
+        .map(|&k| jogs[k].room.1)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let t = |r: usize| lo + (hi - lo) * (r as f64 + 0.5) / m as f64;
+    let step = |k: usize| (jogs[k].hi_at - jogs[k].lo_at).abs() >= EPS;
+    let (mut along, mut cross) = (0, 0);
+    for (r, &a) in order.iter().enumerate() {
+        for (s, &b) in order.iter().enumerate().skip(r + 1) {
+            if jogs[a].edge == jogs[b].edge {
+                continue;
+            }
+            if step(a) && step(b) && (jogs[a].hi_at - jogs[b].lo_at).abs() < TRACK_PITCH - EPS {
+                along += 1;
+            }
+            let (la, lb) = (jog_legs(&jogs[a], t(r)), jog_legs(&jogs[b], t(s)));
+            cross += la
+                .iter()
+                .map(|&(p, q)| lb.iter().filter(|&&(u, v)| segs_cross(p, q, u, v)).count())
+                .sum::<usize>();
+        }
+    }
+    (along, cross)
+}
+
+/// A block layout's channel in the order that keeps a step's run on off
+/// the run in of a later step ([`channel_cost`]): such a step goes right
+/// after the later one when that lays fewer runs along each other and
+/// crosses no more legs. The key of [`place_tracks`] orders by where
+/// each step turns; a step turning back across the channel whose run on
+/// ends within a pitch of where another step's run in comes from was
+/// placed first and ran along that run to its node (bench-75 as blocks:
+/// the turned-up `svc3 -> metrics` 5 px from `svc5 -> queue` and `svc5
+/// -> objects` over 110-150 px), and the router took the two off it
+/// round svc5's corner, across their fan.
+fn part_runs(order: &mut Vec<usize>, jogs: &[Jog]) {
+    let m = order.len();
+    if m < 2 {
+        return;
+    }
+    let mut now = channel_cost(order, jogs);
+    // Each kept move lowers the runs laid along each other: it ends.
+    while now.0 > 0 {
+        let mut kept = false;
+        'pairs: for r in 0..m {
+            for s in r + 1..m {
+                let (a, b) = (order[r], order[s]);
+                let along = (jogs[a].hi_at - jogs[b].lo_at).abs() < TRACK_PITCH - EPS;
+                if !along || jogs[a].edge == jogs[b].edge {
+                    continue;
+                }
+                // The earlier step right after the later one, or the
+                // later one right before it.
+                for later in [false, true] {
+                    let mut next = order.clone();
+                    if later {
+                        let k = next.remove(s);
+                        next.insert(r, k);
+                    } else {
+                        let k = next.remove(r);
+                        next.insert(s, k);
+                    }
+                    let cost = channel_cost(&next, jogs);
+                    if cost.0 < now.0 && cost.1 <= now.1 + (now.0 - cost.0) {
+                        (*order, now, kept) = (next, cost, true);
+                        break 'pairs;
+                    }
+                }
+            }
+        }
+        if !kept {
+            break;
         }
     }
 }
@@ -2507,6 +3103,82 @@ mod tests {
     }
 
     #[test]
+    fn a_staircase_of_steps_is_one_channel_a_track_each() {
+        // A hub's fan stepping one way under its block: each step
+        // overlaps the next only, so no point lies under more than two,
+        // but their order nests all of them: one channel, a track a
+        // step (B12 G2). The layout reserves its gap by that count.
+        let stair: Vec<(f64, f64)> = (0..6)
+            .map(|k| (300.0 + 40.0 * k as f64, 220.0 + 40.0 * k as f64))
+            .collect();
+        assert_eq!(channel_sizes(&stair), vec![6]);
+        let mut jogs: Vec<Jog> = stair
+            .iter()
+            .enumerate()
+            .map(|(k, &(a, b))| jog(k, 0, a, b, (0.0, 200.0), 100.0))
+            .collect();
+        place_tracks(&mut jogs, &[], false);
+        let mut at: Vec<f64> = jogs.iter().map(|j| j.at).collect();
+        at.sort_by(f64::total_cmp);
+        assert!(
+            at.windows(2).all(|w| w[1] - w[0] >= TRACK_PITCH - EPS),
+            "{at:?}"
+        );
+        // Steps a pitch and more apart are channels of their own, and
+        // two that only meet where both turn the same way fork.
+        assert_eq!(
+            channel_sizes(&[(0.0, 100.0), (130.0, 230.0), (250.0, 330.0)]),
+            vec![1, 1, 1]
+        );
+        assert_eq!(channel_sizes(&[(100.0, 0.0), (101.0, 200.0)]), vec![1, 1]);
+        assert_eq!(channel_sizes(&[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_turned_step_keeps_its_run_on_off_a_later_steps_run_in() {
+        // Two steps of a node's fan go down from ports at 180 and 190; a
+        // step from below turns up to end at 185, between them. Ordered
+        // by where they turn, the turned step comes first and its run on
+        // lies 5 px from both runs in, all the way to their steps. In a
+        // block layout it goes after them: as many crossings, and no run
+        // along another.
+        let fresh = || {
+            vec![
+                jog(0, 0, 190.0, 415.0, (0.0, 300.0), 150.0),
+                jog(1, 0, 180.0, 292.0, (0.0, 300.0), 150.0),
+                jog(2, 0, 388.0, 185.0, (0.0, 300.0), 150.0),
+            ]
+        };
+        let along = |jogs: &[Jog]| {
+            let mut n = 0;
+            for a in jogs {
+                for b in jogs {
+                    let near = (a.hi_at - b.lo_at).abs() < TRACK_PITCH;
+                    n += usize::from(a.edge != b.edge && near && a.at < b.at);
+                }
+            }
+            n
+        };
+        let mut before = fresh();
+        place_tracks(&mut before, &[], false);
+        assert_eq!(along(&before), 2, "the key alone");
+        let mut jogs = fresh();
+        place_tracks(&mut jogs, &[], true);
+        assert_eq!(along(&jogs), 0);
+        assert!(jogs[2].at > jogs[0].at && jogs[2].at > jogs[1].at);
+        let order: Vec<usize> = (0..3).collect();
+        let by_at = |jogs: &[Jog]| {
+            let mut o = order.clone();
+            o.sort_by(|&a, &b| jogs[a].at.total_cmp(&jogs[b].at));
+            o
+        };
+        assert!(
+            channel_cost(&by_at(&jogs), &jogs).1 <= channel_cost(&by_at(&before), &before).1,
+            "no more crossings"
+        );
+    }
+
+    #[test]
     fn a_channels_tracks_keep_a_pitch_apart_and_never_cross() {
         // Two steps turning the same way across one gap, one starting
         // further out: libavoid's order puts the one turning further out
@@ -2515,7 +3187,7 @@ mod tests {
             jog(0, 0, 0.0, 100.0, (30.0, 70.0), 50.0),
             jog(1, 0, 20.0, 120.0, (30.0, 70.0), 50.0),
         ];
-        place_tracks(&mut jogs, &[]);
+        place_tracks(&mut jogs, &[], false);
         for (i, a) in jogs.iter().enumerate() {
             assert!(
                 a.at >= a.room.0 - EPS && a.at <= a.room.1 + EPS,
@@ -2539,18 +3211,18 @@ mod tests {
             jog(0, 0, 0.0, 100.0, (30.0, 70.0), 50.0),
             jog(1, 0, 140.0, 40.0, (30.0, 70.0), 50.0),
         ];
-        place_tracks(&mut facing, &[]);
+        place_tracks(&mut facing, &[], false);
         assert!((facing[0].at - facing[1].at).abs() >= TRACK_PITCH_MIN - EPS);
         // A step in another gap is its own channel.
         let mut alone = vec![
             jog(0, 0, 0.0, 100.0, (30.0, 70.0), 50.0),
             jog(1, 1, 20.0, 120.0, (30.0, 70.0), 50.0),
         ];
-        place_tracks(&mut alone, &[]);
+        place_tracks(&mut alone, &[], false);
         assert_eq!((alone[0].at, alone[1].at), (50.0, 50.0));
         // Off a kept step a pitch away where its room allows.
         let mut off = vec![jog(0, 0, 0.0, 100.0, (30.0, 70.0), 50.0)];
-        place_tracks(&mut off, &[(50.0, (10.0, 90.0))]);
+        place_tracks(&mut off, &[(50.0, (10.0, 90.0))], false);
         assert!(
             (off[0].at - 50.0).abs() >= TRACK_PITCH - EPS,
             "{}",
@@ -2580,7 +3252,7 @@ mod tests {
             above(1, 383.0, 240.0, (105.0, 167.0)),
             above(2, 396.0, 346.0, (99.6, 108.8)),
         ];
-        place_tracks(&mut jogs, &[]);
+        place_tracks(&mut jogs, &[], false);
         for (i, a) in jogs.iter().enumerate() {
             assert!(!a.above_label, "{i}");
             assert!(a.at >= 105.0 - EPS && a.at <= 167.0 + EPS, "{i}: {}", a.at);
@@ -2601,7 +3273,7 @@ mod tests {
             above(0, 371.0, 110.0, (105.0, 145.0)),
             above(1, 383.0, 240.0, (105.0, 167.0)),
         ];
-        place_tracks(&mut fits, &[]);
+        place_tracks(&mut fits, &[], false);
         assert!(fits.iter().all(|j| j.above_label));
     }
 
@@ -2773,7 +3445,7 @@ mod tests {
                 own: [None, None],
                 edge: 0,
             };
-            straighten(&r, 100.0, &cols, 100.0)
+            straighten(&r, 100.0, &cols, 100.0, &[])
         };
         // Nothing beside it: one straight run under its source.
         assert!(room(&[]).iter().all(|q| q.0 == 100.0));

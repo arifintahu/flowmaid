@@ -597,23 +597,29 @@ fn sub_slots(g: &Graph, sc: &Scene) -> Vec<Option<usize>> {
 
 /// The parts' scenes joined into one for `g` (module docs): each node
 /// and edge where the part holding it drew it, ids as `g` names them,
-/// the frames outermost-first at their depths in `g`, the canvas the
-/// largest part's (the caller refits it). `None` when a part's scene
-/// does not line up with the part.
+/// the frames outermost-first at their depths in `g`, the canvas one
+/// that holds every part's (the caller refits it): from the smallest
+/// part origin ([`Scene::origin`], negative where a routed part reaches
+/// past the top-left margin) to the farthest part edge. `None` when a
+/// part's scene does not line up with the part.
 fn join(g: &Graph, split: &Split, blocks: &[Scene], rest: &Scene) -> Option<Scene> {
     let mut nodes: Vec<Option<SceneNode>> = vec![None; g.nodes.len()];
     let mut edges: Vec<Option<SceneEdge>> = vec![None; g.edges.len()];
     let mut subs: Vec<Option<SceneEdge>> = vec![None; g.sub_edges.len()];
     let mut clusters: Vec<(usize, SceneCluster)> = Vec::new();
-    let (mut width, mut height) = (0.0f64, 0.0f64);
+    // The canvas: its top-left corner and its far edges.
+    let (mut origin, mut far) = ((0.0f64, 0.0f64), (0.0f64, 0.0f64));
     let named = |j: usize, mut e: SceneEdge| {
         e.from = end_id(g, g.sub_edges[j].from);
         e.to = end_id(g, g.sub_edges[j].to);
         e
     };
     for (part, sc) in split.with(blocks, rest) {
-        width = width.max(sc.width);
-        height = height.max(sc.height);
+        origin = (origin.0.min(sc.origin.0), origin.1.min(sc.origin.1));
+        far = (
+            far.0.max(sc.origin.0 + sc.width),
+            far.1.max(sc.origin.1 + sc.height),
+        );
         for (k, s) in part.nodes.iter().enumerate() {
             if let Slot::Node(v) = *s {
                 nodes[v] = Some(sc.nodes.get(k)?.clone());
@@ -654,10 +660,23 @@ fn join(g: &Graph, split: &Split, blocks: &[Scene], rest: &Scene) -> Option<Scen
         nodes,
         edges,
         clusters: clusters.into_iter().map(|(_, c)| c).collect(),
-        width,
-        height,
+        width: far.0 - origin.0,
+        height: far.1 - origin.1,
+        origin,
+        routed: false,
         plain_crossings: false,
     })
+}
+
+/// Whether `f` holds for any part `g` is laid out as: each outermost
+/// block's own graph (cut further where a block nests one) and the
+/// rest, or `g` itself when it has no block. Read-only: how a caller
+/// asks a question of the graphs [`scene`] and [`route`] hand on.
+pub(crate) fn any_part(g: &Graph, f: &dyn Fn(&Graph) -> bool) -> bool {
+    match split(g) {
+        Some(s) => s.blocks.iter().any(|(_, p)| any_part(&p.g, f)) || any_part(&s.rest.g, f),
+        None => f(g),
+    }
 }
 
 /// [`crate::scene::scene_sized`] for a split graph: each block laid
@@ -814,6 +833,14 @@ thread_local! {
     static LAID: std::cell::RefCell<Vec<Laid>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Forget every frame [`LAID`] keeps on this thread. The layout that drew
+/// them also reads the block layout's switch, which the memo's key does
+/// not hold: a change of the switch calls this
+/// ([`crate::levels::with_blocks`]).
+pub(crate) fn forget_laid() {
+    LAID.with(|m| m.borrow_mut().clear());
+}
+
 /// Keep the frame `(w, h)` the static layout drew round a block's part
 /// `pg` for these node sizes and labels ([`LAID`]).
 fn keep_laid(pg: &Graph, sizes: Vec<(f64, f64)>, labels: Vec<String>, frame: (f64, f64)) {
@@ -930,6 +957,8 @@ fn part_base(
         clusters,
         width: base.width,
         height: base.height,
+        origin: base.origin,
+        routed: false,
         plain_crossings: false,
     })
 }
@@ -1128,6 +1157,73 @@ mod tests {
     }
 
     const STATE: &str = include_str!("../examples/state.mmd");
+
+    /// A block layout's routed canvas (#76): a node dragged past the
+    /// top-left margin grows it up and left to the margin before the
+    /// drawing, its far sides MARGIN past the drawing, as for a flat
+    /// graph; a `route_partial` frame on that frame keeps its canvas
+    /// (it only grows). The parts' canvases are joined from their own
+    /// origins, not as if each started at zero.
+    #[test]
+    fn a_routed_block_layout_canvas_holds_its_drawing() {
+        use crate::scene::{grow_canvas, Bbox, MARGIN};
+        let g = state(STATE);
+        assert_eq!(blocks(&g), vec![true]);
+        let laid = scene(&g);
+        let c: Vec<(f64, f64)> = laid.nodes.iter().map(|n| (n.x, n.y)).collect();
+        let k = (0..c.len())
+            .find(|&i| !laid.nodes[i].label.is_empty())
+            .unwrap();
+        let drawn = |sc: &Scene| {
+            let mut bb = Bbox::new();
+            grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+            bb.finish()
+        };
+        let mut d1 = c.clone();
+        d1[k] = (-300.0, -200.0);
+        let mut d2 = c.clone();
+        d2[k] = (-40.0, -30.0);
+        let r = route(&g, &d1);
+        let (minx, maxx, miny, maxy) = drawn(&r);
+        assert_eq!(r.origin, (minx - MARGIN, miny - MARGIN));
+        assert!(
+            (r.origin.0 + r.width - (maxx + MARGIN)).abs() < 1e-6,
+            "{}",
+            r.width
+        );
+        assert!(
+            (r.origin.1 + r.height - (maxy + MARGIN)).abs() < 1e-6,
+            "{}",
+            r.height
+        );
+        let f1 = route_partial(&g, &d1, &laid, &c);
+        let (minx, maxx, miny, maxy) = drawn(&f1);
+        assert_eq!(f1.origin, (minx - MARGIN, miny - MARGIN));
+        let far = |sc: &Scene| (sc.origin.0 + sc.width, sc.origin.1 + sc.height);
+        let want = (
+            laid.width.max(maxx + MARGIN),
+            laid.height.max(maxy + MARGIN),
+        );
+        assert!(
+            (far(&f1).0 - want.0).abs() < 1e-6,
+            "{:?} {want:?}",
+            far(&f1)
+        );
+        assert!(
+            (far(&f1).1 - want.1).abs() < 1e-6,
+            "{:?} {want:?}",
+            far(&f1)
+        );
+        let f2 = route_partial(&g, &d2, &f1, &d1);
+        assert_eq!(f2.origin, f1.origin);
+        let (minx, maxx, miny, maxy) = drawn(&f2);
+        assert!(f2.origin.0 <= minx - MARGIN && f2.origin.1 <= miny - MARGIN);
+        assert!(far(&f2).0 >= maxx + MARGIN - 1e-6 && far(&f2).1 >= maxy + MARGIN - 1e-6);
+        assert!(far(&f2).0 <= far(&f1).0.max(maxx + MARGIN) + 1e-6);
+        assert!(far(&f2).1 <= far(&f1).1.max(maxy + MARGIN) + 1e-6);
+        // Laid out, the canvas is the drawing's, at the origin.
+        assert_eq!(laid.origin, (0.0, 0.0));
+    }
 
     #[test]
     fn a_state_composite_flows_in_its_own_direction() {
@@ -1542,5 +1638,76 @@ mod tests {
         );
         let m = crate::quality::measure(&g, &scene(&g));
         assert_eq!((m.wiggles, m.frame_side, m.lat_wiggles), (0, 0, 0), "{m:?}");
+    }
+
+    /// Review of the merge with the block layout: the frames [`LAID`]
+    /// keeps were laid out under the block switch of the call that kept
+    /// them. A thread that draws a graph in one mode and routes it in
+    /// the other must not fit a bar to the other mode's frame: the
+    /// switch's change forgets them, so each mode routes as it does on
+    /// a thread of its own.
+    #[test]
+    fn the_kept_block_frames_follow_the_block_switch() {
+        let sources = [
+            "stateDiagram-v2\n[*] --> f\nstate f <<fork>>\nf --> B0\nf --> Q1\nf --> Q0\n\
+             state B0 {\n  direction BT\n  B0_0 --> B0_1\n  B0_1 --> B0_2 : go\n\
+             state B0_fk <<fork>>\n  B0_2 --> B0_fk\n  B0_fk --> B0_x\n  B0_fk --> B0_y\n\
+             state B0i {\n    direction BT\n    B0i_0 --> B0i_1 : a longer label here\n\
+             B0i_1 --> B0i_2 : go\n    B0i_2 --> B0i_3 : a longer label here\n\
+             B0i_3 --> B0i_4\n    B0i_4 --> B0i_0 : back\n  }\n  B0_2 --> B0i\n}\n\
+             state j <<join>>\nB0 --> j\nQ1 --> j\nQ0 --> j\nj --> [*]",
+            "stateDiagram-v2\n[*] --> f\nstate f <<fork>>\nf --> B0 : x\nf --> B1\n\
+             state B0 {\n  direction LR\n  B0_0 --> B0_1\n  B0_1 --> B0_2 : go\n\
+             B0_2 --> B0_3 : a longer label here\n  B0_3 --> B0_4 : go\n\
+             state B0_fk <<fork>>\n  B0_4 --> B0_fk\n  B0_fk --> B0_x\n  B0_fk --> B0_y\n\
+             state B0i {\n    direction LR\n    B0i_0 --> B0i_1\n    B0i_1 --> B0i_2\n\
+             B0i_2 --> B0i_3 : a longer label here\n  }\n  B0_4 --> B0i\n}\n\
+             state B1 {\n  direction RL\n  B1_0 --> B1_1 : go\n  B1_1 --> B1_2\n\
+             state B1_fk <<fork>>\n  B1_2 --> B1_fk\n  B1_fk --> B1_x\n  B1_fk --> B1_y\n\
+             note right of B1_0 : a note\n}\n\
+             state j <<join>>\nB0 --> j\nB1 --> j\nj --> [*]",
+        ];
+        use crate::levels::with_blocks;
+        for src in sources {
+            let g = state(src);
+            let c: Vec<(f64, f64)> = (0..g.nodes.len())
+                .map(|i| (140.0 * i as f64, 90.0 * (i % 3) as f64))
+                .collect();
+            let drawn = |sc: &Scene| format!("{sc:?}");
+            // Each mode on a thread of its own: nothing kept from the other.
+            let alone = |on: bool| {
+                let (g, c) = (g.clone(), c.clone());
+                std::thread::spawn(move || {
+                    with_blocks(on, || {
+                        let base = scene(&g);
+                        let at: Vec<(f64, f64)> = base.nodes.iter().map(|n| (n.x, n.y)).collect();
+                        let routed = route(&g, &c);
+                        let partial = route_partial(&g, &c, &base, &at);
+                        (format!("{routed:?}"), format!("{partial:?}"))
+                    })
+                })
+                .join()
+                .unwrap()
+            };
+            for on in [false, true] {
+                let (routed, partial) = alone(on);
+                // This thread: the other mode draws the graph first.
+                with_blocks(!on, || scene(&g));
+                let (r, p) = with_blocks(on, || {
+                    let base = scene(&g);
+                    let at: Vec<(f64, f64)> = base.nodes.iter().map(|n| (n.x, n.y)).collect();
+                    with_blocks(!on, || scene(&g));
+                    (
+                        drawn(&route(&g, &c)),
+                        drawn(&route_partial(&g, &c, &base, &at)),
+                    )
+                });
+                assert_eq!(
+                    r, routed,
+                    "blocks {on}: route() after the other mode's scene()"
+                );
+                assert_eq!(p, partial, "blocks {on}: route_partial() likewise");
+            }
+        }
     }
 }

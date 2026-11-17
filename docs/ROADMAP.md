@@ -7,7 +7,7 @@ Where flowmaid is going and how far it has come. Two things are tracked, in two 
 
 The bar for drawing quality: the same source should look as good as it does in mermaid 12.2.0, or better and tidier. flowmaid keeps what mermaid does not offer: zero dependencies, an interactive scene API (drag, re-route, picking), and speed (most hand-written diagrams render in under a millisecond).
 
-Last updated for 0.40.0 (2026-11-11).
+Last updated 2026-11-17 (latest release: 0.40.1).
 
 ## Done
 
@@ -20,6 +20,7 @@ Last updated for 0.40.0 (2026-11-11).
 | 0.38.0 | Flowchart and state edges run on the axes, with rounded corners. |
 | 0.39.0 | Crossing lines hop over each other. A hub's fan is drawn as a comb. |
 | 0.40.0 | Class diagrams: dotted names, a fan of six without crossings, self-relations kept off a neighbour. State diagrams: a drag inside a composite no longer resizes a fork or join bar. |
+| 0.40.1 | Interactive API: `try_route`, a `route` that turns down positions that do not fit the diagram. A drag past the top-left margin no longer shifts the rest of the drawing. Class diagrams: a declared name with a stray dot is an error, as in mermaid. The first step of subgraphs as blocks (below) is in, switched off. |
 
 [CHANGELOG.md](../CHANGELOG.md) has the details and the measurements for each release.
 
@@ -38,12 +39,12 @@ It is built in four steps. Each is merged behind an internal switch that is off,
 
 | step | what | state |
 |---|---|---|
-| 1 | Structure: the tree of blocks, layering, ordering | a first version is on a work branch; its review did not pass (see the open question below), so it is not merged or released |
+| 1 | Structure: the tree of blocks, layering, ordering | merged behind the switch, which is off: no drawing changes |
 | 2 | Geometry: frames, coordinates, room for gaps and labels | not started |
 | 3 | Routing under a drag: `route()`, `route_sized()` and `route_partial()` in block mode | not started |
 | 4 | Comparison sweep against mermaid and against the previous release, then on by default | not started |
 
-**Open question.** One dense test diagram draws with more than twice as many crossings in block mode as it has today. Either the design is extended to cover it, or a diagram that the block layout would draw worse keeps the current layout.
+**The dense test diagram.** It used to draw more than twice as many crossings in block mode as it has today. After step 1 it draws fewer: 49 crossings against 66 in today's layout (`tests/fixtures/quality/dense-td.mmd`, the static drawing). Redrawn by `route()`, which a drag uses, it still has more, 113 against 76, until step 3.
 
 ## After that
 
@@ -53,7 +54,6 @@ Not scheduled. Listed so that they are not lost.
 - **Subgraphs laid out in their own `direction`.** Three small points are open: such a subgraph is placed after a sibling node that comes before its first member in the source, where mermaid puts the subgraph first; it can make a sibling subgraph in its layer wider; and a state composite that sets no `direction` keeps the direction round it, where mermaid lays it out top-down (see the 0.40.0 changelog). They are re-checked once the block layout is in, because it reworks that code.
 - **Large graphs.** A dense graph of a thousand nodes takes seconds to draw (see [Large graphs](../README.md#large-graphs)). Making such graphs faster is on this list, with no date.
 - **Interactive API**:
-  - [#110](https://github.com/go-routine-id/flowmaid/issues/110) a `route` for class and ER diagrams that does not panic when the number of positions does not match the diagram
   - [#111](https://github.com/go-routine-id/flowmaid/issues/111) `route_partial` for ER, class and mindmap
   - [#112](https://github.com/go-routine-id/flowmaid/issues/112) hit-testing for mindmap, sequence, pie, journey, timeline and sankey scenes
   - [#113](https://github.com/go-routine-id/flowmaid/issues/113) `route_partial` and the compact fold for hosts that measure text with their own font
@@ -62,7 +62,6 @@ Not scheduled. Listed so that they are not lost.
   - [#57](https://github.com/go-routine-id/flowmaid/issues/57) id and class hooks on SVG nodes and edges, for interactivity and CSS theming
   - [#64](https://github.com/go-routine-id/flowmaid/issues/64) refactoring: split the long layout functions, name the magic numbers
   - [#75](https://github.com/go-routine-id/flowmaid/issues/75) layout follow-ups from 0.32: static render time, drag budget, crossings, frame and label clearance
-  - [#76](https://github.com/go-routine-id/flowmaid/issues/76) `route()`: a top-left overflow shifts the whole scene
 
 ## How a step gets in
 
