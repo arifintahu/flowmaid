@@ -7,6 +7,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Internal
+
+- **Subgraphs as blocks, step 2 of 4, first part** (frames sized to their
+  titles, room for labels in the gaps between blocks), behind an internal
+  switch that is off: no drawing changes.
+
 ## [0.40.1] - 2026-11-17
 
 ### Highlights

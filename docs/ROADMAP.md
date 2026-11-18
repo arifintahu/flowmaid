@@ -7,7 +7,7 @@ Where flowmaid is going and how far it has come. Two things are tracked, in two 
 
 The bar for drawing quality: the same source should look as good as it does in mermaid 12.2.0, or better and tidier. flowmaid keeps what mermaid does not offer: zero dependencies, an interactive scene API (drag, re-route, picking), and speed (most hand-written diagrams render in under a millisecond).
 
-Last updated 2026-11-17 (latest release: 0.40.1).
+Last updated 2026-11-18 (latest release: 0.40.1).
 
 ## Done
 
@@ -40,11 +40,11 @@ It is built in four steps. Each is merged behind an internal switch that is off,
 | step | what | state |
 |---|---|---|
 | 1 | Structure: the tree of blocks, layering, ordering | merged behind the switch, which is off: no drawing changes |
-| 2 | Geometry: frames, coordinates, room for gaps and labels | not started |
-| 3 | Routing under a drag: `route()`, `route_sized()` and `route_partial()` in block mode | not started |
+| 2 | Geometry: frames, coordinates, room for gaps and labels | first part merged behind the switch, which is off: frames sized to their titles, room for labels in the gaps between blocks, edge ends kept clear of frame titles. No drawing changes. Drawing the frames tighter round their content waits until after step 3, because it depends on the paths step 3 draws under a drag |
+| 3 | Routing under a drag: `route()`, `route_sized()` and `route_partial()` in block mode | next |
 | 4 | Comparison sweep against mermaid and against the previous release, then on by default | not started |
 
-**The dense test diagram.** It used to draw more than twice as many crossings in block mode as it has today. After step 1 it draws fewer: 49 crossings against 66 in today's layout (`tests/fixtures/quality/dense-td.mmd`, the static drawing). Redrawn by `route()`, which a drag uses, it still has more, 113 against 76, until step 3.
+**The dense test diagram.** It used to draw more than twice as many crossings in block mode as it has today. After step 1 it drew fewer: 49 crossings against 66 in today's layout (`tests/fixtures/quality/dense-td.mmd`, the static drawing), and after the first part of step 2, 42. Redrawn by `route()`, which a drag uses, it still has more, 107 against 76, until step 3.
 
 ## After that
 
