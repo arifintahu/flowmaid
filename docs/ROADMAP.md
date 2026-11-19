@@ -7,7 +7,7 @@ Where flowmaid is going and how far it has come. Two things are tracked, in two 
 
 The bar for drawing quality: the same source should look as good as it does in mermaid 12.2.0, or better and tidier. flowmaid keeps what mermaid does not offer: zero dependencies, an interactive scene API (drag, re-route, picking), and speed (most hand-written diagrams render in under a millisecond).
 
-Last updated 2026-11-18 (latest release: 0.40.1).
+Last updated 2026-11-19 (latest release: 0.40.2).
 
 ## Done
 
@@ -21,6 +21,7 @@ Last updated 2026-11-18 (latest release: 0.40.1).
 | 0.39.0 | Crossing lines hop over each other. A hub's fan is drawn as a comb. |
 | 0.40.0 | Class diagrams: dotted names, a fan of six without crossings, self-relations kept off a neighbour. State diagrams: a drag inside a composite no longer resizes a fork or join bar. |
 | 0.40.1 | Interactive API: `try_route`, a `route` that turns down positions that do not fit the diagram. A drag past the top-left margin no longer shifts the rest of the drawing. Class diagrams: a declared name with a stray dot is an error, as in mermaid. The first step of subgraphs as blocks (below) is in, switched off. |
+| 0.40.2 | Interactive API: a drag in an ER, class or mindmap diagram redraws only what moved (`route_partial`), and mindmap, sequence, pie, journey, timeline and sankey scenes can be picked (`hit_test`). The first part of step 2 of subgraphs as blocks is in, switched off. 0.40.1 was not published to crates.io, so this is the first published release with its changes too. |
 
 [CHANGELOG.md](../CHANGELOG.md) has the details and the measurements for each release.
 
@@ -54,8 +55,6 @@ Not scheduled. Listed so that they are not lost.
 - **Subgraphs laid out in their own `direction`.** Three small points are open: such a subgraph is placed after a sibling node that comes before its first member in the source, where mermaid puts the subgraph first; it can make a sibling subgraph in its layer wider; and a state composite that sets no `direction` keeps the direction round it, where mermaid lays it out top-down (see the 0.40.0 changelog). They are re-checked once the block layout is in, because it reworks that code.
 - **Large graphs.** A dense graph of a thousand nodes takes seconds to draw (see [Large graphs](../README.md#large-graphs)). Making such graphs faster is on this list, with no date.
 - **Interactive API**:
-  - [#111](https://github.com/go-routine-id/flowmaid/issues/111) `route_partial` for ER, class and mindmap
-  - [#112](https://github.com/go-routine-id/flowmaid/issues/112) hit-testing for mindmap, sequence, pie, journey, timeline and sankey scenes
   - [#113](https://github.com/go-routine-id/flowmaid/issues/113) `route_partial` and the compact fold for hosts that measure text with their own font
 - **Math in labels**: [#12](https://github.com/go-routine-id/flowmaid/issues/12).
 - **Other open issues**:

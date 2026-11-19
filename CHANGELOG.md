@@ -7,6 +7,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.40.2] - 2026-11-19
+
+### Highlights
+
+A patch release that only adds to the API: every static drawing is byte for
+byte that of 0.40.1, and every existing function returns what it did.
+
+- **`route_partial` for ER, class and mindmap diagrams**: a drag redraws
+  only what is attached to a moved box and keeps the rest of the previous
+  drawing, so on large diagrams a frame costs about a sixth of a full
+  `route` (ER and class) or a fifth (mindmap).
+- **Picking on six more scene types**: mindmap, sequence, pie, journey,
+  timeline and sankey scenes get `hit_test(x, y, tol)`, the topmost
+  element under a point, tested against the shapes as they are painted.
+- **0.40.1 was not published to crates.io**, so 0.40.2 also brings
+  0.40.1's changes (see [0.40.1] below).
+
 ### Added
 
 - **`route_partial` for ER, class and mindmap diagrams** (#111).
@@ -25,10 +42,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
   result is `route`'s; after a change of direction, route the first
   frame with `route`. A class diagram takes class centres, or class and
   note centres. `try_route_partial` returns `None` where
-  `route_partial` would panic or `try_route` refuses the positions. `mindmap::link_ends` names a connector's
-  two nodes. `cargo run --release --example drag_bench` times a one-node
-  drag on large diagrams: a partial frame costs a fifth of a full
-  `route` or less.
+  `route_partial` would panic or `try_route` refuses the positions.
+  `mindmap::link_ends` names a connector's two nodes.
+  `cargo run --release --example drag_bench` times a one-node drag on
+  large diagrams: a partial frame costs about a sixth of a full `route`
+  on an ER or a class diagram of 240 boxes and 220 lines (6.2 and 11 ms
+  against 41 and 71 ms) and about a fifth on a mindmap of 1,041 nodes
+  (0.18 against 0.85 ms).
 - **Picking on mindmap, sequence, pie, journey, timeline and sankey
   scenes** (#112). `MindScene`, `SeqScene`, `PieScene`, `JourneyScene`,
   `TimelineScene` and `SankeyScene` get `hit_test(x, y, tol)`, like
@@ -42,6 +62,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
   border and labels, so the frame does not swallow what lies in it.
   `tol` widens lines only (connectors, messages, lifelines, borders,
   axes), `tol <= 0` is exact, and a point off the canvas picks nothing.
+  The six hit enums are `#[non_exhaustive]`, so a `match` on one needs a
+  `_` arm.
 
 ### Internal
 
