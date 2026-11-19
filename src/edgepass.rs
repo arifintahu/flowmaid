@@ -122,6 +122,15 @@ pub(crate) struct Ctx {
     /// blocks, and in `route()` and `route_partial()` until they lay
     /// blocks out themselves.
     pub blocks: bool,
+    /// The scene is a block layout's, static or routed (`Scene`'s
+    /// `block_layout`: [`Ctx::blocks`] in the static scene, and
+    /// `route()` / `route_partial()` drawing with the block layout's
+    /// frames): a run into a port within a fraction of a px of its line
+    /// is laid on the port's line ([`crate::ortho`]'s `flow_path`), and
+    /// a final run follows an end [`snap_ends`] moves across it
+    /// ([`level_end_run`]), so the run meets its head square in the
+    /// scene and once a node is dragged alike.
+    pub axis_ends: bool,
     /// Index-parallel with `sc.edges`: the edge is a back-edge in its
     /// lane. Every [`Ctx::back`] edge before blocks; in a block layout
     /// ([`Ctx::blocks`]) only one between two plain nodes of one level
@@ -271,6 +280,7 @@ pub(crate) fn ctx(g: &Graph, sc: &Scene) -> Ctx {
         chain,
         shaped,
         blocks: false,
+        axis_ends: sc.block_layout,
         lane,
     }
 }
@@ -759,6 +769,9 @@ fn snap_ends(sc: &mut Scene, cx: &Ctx) {
                 e.bezier[a] = q;
             } else {
                 let k = if at_start { 0 } else { e.waypoints.len() - 1 };
+                if cx.axis_ends {
+                    level_end_run(&mut e.waypoints, at_start, q);
+                }
                 e.waypoints[k] = q;
                 let a = if at_start { 0 } else { 3 };
                 e.bezier[a] = q;
@@ -766,6 +779,59 @@ fn snap_ends(sc: &mut Scene, cx: &Ctx) {
             // Not `moved`: the end slides a few px along its own line,
             // which leaves the label stage nothing to re-place (and a
             // drag frame no label search per end).
+        }
+    }
+}
+
+/// How far (px) across its final run [`level_end_run`] carries that run
+/// with a snapped end: a drum shoulder's nearest point lies a fraction
+/// of a px off a run that meets the flank just below the lid.
+const LEVEL_RUN_REACH: f64 = 1.0;
+
+/// In a block layout's scene ([`Ctx::axis_ends`]), the final run of a
+/// waypoint path on an axis follows its end when [`snap_ends`] moves that
+/// end across it (a drum's shoulder takes the nearest point, not the point along the
+/// run): the points on the run's line before the end, back to its
+/// corner, move with it by as much, so the run stays on its axis and the
+/// head square to the side. Left as it was, the run met the head at a
+/// slant (dense-lr `n26 --> n47`, 0.49 px across a 35 px run: the static
+/// `end_tilt_max` 0.8 deg of `DEFECT_BASELINE`). Only a move under
+/// [`LEVEL_RUN_REACH`] and along an axis; `q` is the end's new place, the
+/// end itself is still at its old one.
+fn level_end_run(wps: &mut [Pt], at_start: bool, q: Pt) {
+    let n = wps.len();
+    if n < 3 {
+        return;
+    }
+    let order: Vec<usize> = if at_start {
+        (0..n).collect()
+    } else {
+        (0..n).rev().collect()
+    };
+    let p = wps[order[0]];
+    let prev = wps[order[1]];
+    // Which coordinate the run keeps: y for a run along x, and back.
+    let (along_x, d) = if (prev.1 - p.1).abs() <= 1e-6 && (prev.0 - p.0).abs() > 1e-6 {
+        (true, q.1 - p.1)
+    } else if (prev.0 - p.0).abs() <= 1e-6 && (prev.1 - p.1).abs() > 1e-6 {
+        (false, q.0 - p.0)
+    } else {
+        return;
+    };
+    if d.abs() <= 1e-9 || d.abs() > LEVEL_RUN_REACH {
+        return;
+    }
+    // The run's points after the end (the corner included), and the
+    // corner's rounding point on the leg before it stays where the leg
+    // was: that leg is across the run, so it only lengthens by `d`.
+    for &k in &order[1..] {
+        let w = &mut wps[k];
+        if along_x && (w.1 - p.1).abs() <= 1e-6 {
+            w.1 += d;
+        } else if !along_x && (w.0 - p.0).abs() <= 1e-6 {
+            w.0 += d;
+        } else {
+            break;
         }
     }
 }
@@ -1253,8 +1319,14 @@ pub(crate) fn refit(sc: &mut Scene, mode: Mode, static_fit: bool) {
         maxx += dx;
         maxy += dy;
     }
-    sc.width = sc.width.max(maxx + MARGIN);
-    sc.height = sc.height.max(maxy + MARGIN);
+    // The far sides grow from where they are: `width` and `height` run
+    // from the origin, which is (0, 0) here except in an ER or class drag
+    // frame (`route_partial`), drawn on its base's canvas, where it is
+    // negative once a drag has grown that canvas up or left (#76). (At
+    // (0, 0) this is the plain `max` it always was, bit for bit.)
+    let far = (sc.origin.0 + sc.width, sc.origin.1 + sc.height);
+    sc.width = far.0.max(maxx + MARGIN) - sc.origin.0;
+    sc.height = far.1.max(maxy + MARGIN) - sc.origin.1;
 }
 
 /// How far (px) [`refit`] lets a static flowchart's drawing sit off its
@@ -1266,6 +1338,40 @@ mod tests {
     use super::*;
     use crate::parser::parse;
     use crate::scene::{route, scene};
+
+    #[test]
+    fn a_snapped_end_carries_its_runs_line_back_to_the_corner() {
+        // A run along x into an end the drum's shoulder moved 0.49 px
+        // across it (dense-lr's `n26 --> n47` as blocks): the run's
+        // points back to its corner follow, the leg before only grows.
+        let mut wps = vec![
+            (2429.28, 1712.25),
+            (2429.28, 1726.25),
+            (2443.28, 1726.25),
+            (2478.10, 1726.25),
+        ];
+        level_end_run(&mut wps, false, (2478.71, 1726.74));
+        // (The end itself is the caller's to set.)
+        assert_eq!(wps[0], (2429.28, 1712.25));
+        assert_eq!(wps[3], (2478.10, 1726.25));
+        for w in &wps[1..3] {
+            assert!((w.1 - 1726.74).abs() < 1e-6, "{wps:?}");
+        }
+        // The same at a start along y; a move past the reach, or off an
+        // axis, leaves the path as it was.
+        let mut up = vec![(10.0, 0.0), (10.0, 20.0), (10.0, 34.0), (24.0, 34.0)];
+        level_end_run(&mut up, true, (10.6, 0.3));
+        assert_eq!(up[..3], [(10.0, 0.0), (10.6, 20.0), (10.6, 34.0)]);
+        assert_eq!(up[3], (24.0, 34.0));
+        let far = vec![(0.0, 0.0), (0.0, 30.0), (30.0, 30.0)];
+        let mut w = far.clone();
+        level_end_run(&mut w, true, (2.0, 0.0));
+        assert_eq!(w, far);
+        let slant = vec![(0.0, 0.0), (5.0, 30.0), (30.0, 30.0)];
+        let mut w = slant.clone();
+        level_end_run(&mut w, true, (0.4, 0.0));
+        assert_eq!(w, slant);
+    }
 
     /// `finish` again on a finished scene changes nothing.
     fn assert_idempotent(src: &str) {
@@ -1457,6 +1563,38 @@ mod tests {
             }
             assert!(sc.width >= base.width - 500.0);
         }
+    }
+
+    /// An ER or class canvas (`static_fit` false) whose origin a drag
+    /// moved up and left grows its far sides over a drawing past them,
+    /// measured from that origin: the far corner, not `width` itself,
+    /// reaches the drawing's far side plus the margin.
+    #[test]
+    fn refit_grows_the_far_sides_of_a_canvas_off_zero() {
+        let g = parse("flowchart TD\nA-->B").unwrap();
+        let mut sc = scene(&g);
+        let (w, h) = (sc.width, sc.height);
+        sc.origin = (-300.0, -200.0);
+        sc.width = w + 300.0;
+        sc.height = h + 200.0;
+        // B dragged 400 px right and down, past the far corner.
+        let b = sc.nodes.len() - 1;
+        sc.nodes[b].x += 400.0;
+        sc.nodes[b].y += 400.0;
+        let n = sc.nodes[b].clone();
+        refit(&mut sc, Mode::Routed, false);
+        assert_eq!(sc.origin, (-300.0, -200.0));
+        let far = (sc.origin.0 + sc.width, sc.origin.1 + sc.height);
+        assert!(far.0 >= n.x + n.w / 2.0 + MARGIN - 1e-9, "{far:?}");
+        assert!(far.1 >= n.y + n.h / 2.0 + MARGIN - 1e-9, "{far:?}");
+        // At (0, 0) the canvas is what it always was: the plain `max`.
+        let mut at0 = scene(&g);
+        at0.nodes[b].x += 400.0;
+        let want = at0
+            .width
+            .max(at0.nodes[b].x + at0.nodes[b].w / 2.0 + MARGIN);
+        refit(&mut at0, Mode::Routed, false);
+        assert!(at0.width >= want - 1e-9);
     }
 
     /// The vertical scene edge `A --> B` (TD) and its context.

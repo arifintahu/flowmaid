@@ -7,6 +7,79 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.40.2] - 2026-11-19
+
+### Highlights
+
+A patch release that only adds to the API: every static drawing is byte for
+byte that of 0.40.1, and every existing function returns the same values.
+Only the `Debug` text differs: a `Scene` also prints two new private
+fields (see Internal), which a snapshot test of `{:?}` output sees.
+
+- **`route_partial` for ER, class and mindmap diagrams**: a drag redraws
+  only what is attached to a moved box and keeps the rest of the previous
+  drawing, so on large diagrams a frame costs about a sixth of a full
+  `route` (ER and class) or a fifth (mindmap).
+- **Picking on six more scene types**: mindmap, sequence, pie, journey,
+  timeline and sankey scenes get `hit_test(x, y, tol)`, the topmost
+  element under a point, tested against the shapes as they are painted.
+
+### Added
+
+- **`route_partial` for ER, class and mindmap diagrams** (#111).
+  `er::route_partial`, `class::route_partial` and
+  `mindmap::route_partial` work like the flowchart
+  `scene::route_partial`: given the diagram, the new positions, a
+  previous drawing (`base`) and the positions it was drawn at, they draw
+  afresh only what is attached to a moved box. Every other line keeps
+  its `base` drawing exactly, with its label, end glyphs and class
+  cardinalities, even where a moved box now covers it (for ER and
+  class, route the drop with `route` to clear that). Positions are kept
+  as given. An ER or class frame's canvas grows over whatever a drag
+  pushes past any of its sides (#76), so every box, line and label of
+  the frame is on it, also a class line routed round the top or left,
+  which a class `route`'s canvas can leave out; a mindmap frame's canvas
+  is the one `mindmap::route` gives, which does not grow up or left.
+  When `base` no longer matches the diagram (other counts, or an edit
+  since), the result is `route`'s; after a change of direction, route
+  the first frame with `route`. A class diagram takes class centres, or
+  class and note centres; with a `class::scene` base of a diagram with
+  notes, pass class and note centres: `scene` can place a note
+  elsewhere than `route` does from class centres alone, and the frame is
+  then a full `route`. `try_route_partial` returns `None` where
+  `route_partial` would panic or `try_route` refuses the positions.
+  `mindmap::link_ends` names a connector's two nodes.
+  `cargo run --release --example drag_bench` times a one-node drag on
+  large diagrams: a partial frame costs about a sixth of a full `route`
+  on an ER or a class diagram of 240 boxes and 220 lines (6.2 and 11 ms
+  against 41 and 71 ms) and about a fifth on a mindmap of 1,041 nodes
+  (0.18 against 0.85 ms).
+- **Picking on mindmap, sequence, pie, journey, timeline and sankey
+  scenes** (#112). `MindScene`, `SeqScene`, `PieScene`, `JourneyScene`,
+  `TimelineScene` and `SankeyScene` get `hit_test(x, y, tol)`, like
+  `Scene::hit_test`: it returns the topmost element under a scene point
+  (`MindHit`, `SeqHit`, `PieHit`, `JourneyHit`, `TimelineHit`,
+  `SankeyHit`) by its index into the scene's own lists. It tests the
+  shapes as the painters draw them, in paint order: a pie slice's
+  wedge, a sankey ribbon's curved band at its real thickness, text
+  boxes as the layouts measure them. A click inside a sequence frame
+  (`loop`, `alt`, ...) on nothing drawn is told apart from the frame's
+  border and labels, so the frame does not swallow what lies in it.
+  `tol` widens lines only (such as connectors, messages, lifelines,
+  borders and axes), `tol <= 0` is exact, and a point off the canvas
+  picks nothing. The six hit enums are `#[non_exhaustive]`, so a `match`
+  on one needs a `_` arm.
+
+### Internal
+
+- **Subgraphs as blocks, step 2 of 4, first part** (frames sized to their
+  titles, room for labels in the gaps between blocks), behind an internal
+  switch that is off: no drawing changes. It adds two private fields that
+  `{:?}` prints, both `false` while the switch is off: the `Debug` text
+  of a `Scene` (also inside a `ClassScene`, `ErScene` and the other
+  scenes that hold one) lists `block_layout: false`, and
+  `bold_title: false` for each subgraph frame.
+
 ## [0.40.1] - 2026-11-17
 
 ### Highlights

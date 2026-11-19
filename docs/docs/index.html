@@ -410,11 +410,13 @@ let svg = scene::to_svg(&amp;s1);                  // 4. export any state</code>
   </ul>
   <h3>Other diagram types</h3>
   <ul>
-    <li>ER and class diagrams have the same <code>scene</code> / <code>route</code> / <code>to_svg</code> triple
-      (<code>er::</code>, <code>class::</code>); state diagrams use the flowchart API directly.</li>
-    <li>Mindmaps have <code>mindmap::scene</code> / <code>mindmap::route</code>.</li>
+    <li>ER and class diagrams have the same <code>scene</code> / <code>route</code> / <code>route_partial</code> /
+      <code>to_svg</code> set (<code>er::</code>, <code>class::</code>); state diagrams use the flowchart API directly.</li>
+    <li>Mindmaps have <code>mindmap::scene</code> / <code>mindmap::route</code> / <code>mindmap::route_partial</code>.</li>
     <li>Sequence, pie, journey, timeline, sankey, git graph and architecture diagrams are static:
       a <code>scene()</code> and a <code>to_svg()</code>, no <code>route()</code>.</li>
+    <li>Mindmap, sequence, pie, journey, timeline and sankey scenes have a <code>hit_test</code> of their own
+      (<code>MindScene::hit_test</code> and so on): the topmost element under a scene point.</li>
   </ul>
   <div class="tip">A flowchart or state edge drawn on the axes comes as <code>SceneEdge::waypoints</code>,
   which a painter's spline turns through as rounded corners. The hops at crossings are painted by
