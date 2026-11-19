@@ -164,9 +164,10 @@ pub struct ClassScene {
 /// [`card_spots`] lists them.
 type CardSpots = [Option<(f64, f64)>; 2];
 
-/// As `#[derive(Debug)]` writes the public fields, so a scene that keeps
-/// no cardinalities prints as it always did; a [`route_partial`] frame
-/// that keeps some prints them last.
+/// As `#[derive(Debug)]` writes the public fields: a scene that keeps no
+/// cardinalities prints the fields 0.40.1's derive printed, in the same
+/// order (`scene` as [`Scene`]'s own `Debug` writes it); a
+/// [`route_partial`] frame that keeps some prints them last.
 impl std::fmt::Debug for ClassScene {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("ClassScene");
@@ -288,7 +289,10 @@ pub fn try_route(d: &ClassDiagram, centers: &[(f64, f64)]) -> Option<ClassScene>
 /// or per class and note (without note centres each note is placed as
 /// [`route`] places it, beside its class). `base` is a drawing of `d` with
 /// its boxes at `base_centers`: the [`scene`] output with its own
-/// centres, or a [`route`] (or `route_partial`) output.
+/// centres, or a [`route`] (or `route_partial`) output. For a [`scene`]
+/// base of a diagram with notes, its own centres are its class and note
+/// centres: [`scene`] can place a note elsewhere than [`route`] does from
+/// class centres alone, and with those the frame is a full [`route`].
 ///
 /// Every box sits at its centre, taken as given, and every relationship
 /// or note link without an end on a moved box keeps its `base` route,
