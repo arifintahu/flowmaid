@@ -7,6 +7,42 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`route_partial` for ER, class and mindmap diagrams** (#111).
+  `er::route_partial`, `class::route_partial` and
+  `mindmap::route_partial` work like the flowchart
+  `scene::route_partial`: given the diagram, the new positions, a
+  previous drawing (`base`) and the positions it was drawn at, they draw
+  afresh only what is attached to a moved box. Every other line keeps
+  its `base` drawing exactly, with its label, end glyphs and class
+  cardinalities, even where a moved box now covers it (route the drop
+  with `route` to clear that). Positions are kept as given. An ER or
+  class frame's canvas grows over whatever a drag pushes past any of its
+  sides, as `route`'s does (#76); a mindmap frame's canvas is the one
+  `mindmap::route` gives, which does not grow up or left. When `base` no
+  longer matches the diagram (other counts, or an edit since), the
+  result is `route`'s; after a change of direction, route the first
+  frame with `route`. A class diagram takes class centres, or class and
+  note centres. `try_route_partial` returns `None` where
+  `route_partial` would panic or `try_route` refuses the positions. `mindmap::link_ends` names a connector's
+  two nodes. `cargo run --release --example drag_bench` times a one-node
+  drag on large diagrams: a partial frame costs a fifth of a full
+  `route` or less.
+- **Picking on mindmap, sequence, pie, journey, timeline and sankey
+  scenes** (#112). `MindScene`, `SeqScene`, `PieScene`, `JourneyScene`,
+  `TimelineScene` and `SankeyScene` get `hit_test(x, y, tol)`, like
+  `Scene::hit_test`: it returns the topmost element under a scene point
+  (`MindHit`, `SeqHit`, `PieHit`, `JourneyHit`, `TimelineHit`,
+  `SankeyHit`) by its index into the scene's own lists. It tests the
+  shapes as the painters draw them, in paint order: a pie slice's
+  wedge, a sankey ribbon's curved band at its real thickness, text
+  boxes as the layouts measure them. A click inside a sequence frame
+  (`loop`, `alt`, ...) on nothing drawn is told apart from the frame's
+  border and labels, so the frame does not swallow what lies in it.
+  `tol` widens lines only (connectors, messages, lifelines, borders,
+  axes), `tol <= 0` is exact, and a point off the canvas picks nothing.
+
 ### Internal
 
 - **Subgraphs as blocks, step 2 of 4, first part** (frames sized to their

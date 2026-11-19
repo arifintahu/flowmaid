@@ -146,13 +146,39 @@ pub struct NoteBox {
 /// with the scene's lists). A host that paints no notes can clear
 /// [`ClassDiagram::notes`] before [`scene`] / [`route`] to get one box
 /// per node and one style per edge, as before notes were drawn.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ClassScene {
     pub scene: Scene,
     pub boxes: Vec<ClassBox>,
     pub rels: Vec<RelStyle>,
     pub notes: Vec<NoteBox>,
+    /// The cardinality spots a [`route_partial`] frame keeps from its
+    /// base, one entry per relationship (`None`: placed afresh); empty
+    /// for every other scene, whose cardinalities [`card_spots`] places
+    /// against the whole drawing.
+    kept_cards: Vec<Option<CardSpots>>,
+}
+
+/// One relationship's cardinality centres, `[from_card, to_card]`, as
+/// [`card_spots`] lists them.
+type CardSpots = [Option<(f64, f64)>; 2];
+
+/// As `#[derive(Debug)]` writes the public fields, so a scene that keeps
+/// no cardinalities prints as it always did; a [`route_partial`] frame
+/// that keeps some prints them last.
+impl std::fmt::Debug for ClassScene {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("ClassScene");
+        s.field("scene", &self.scene)
+            .field("boxes", &self.boxes)
+            .field("rels", &self.rels)
+            .field("notes", &self.notes);
+        if !self.kept_cards.is_empty() {
+            s.field("kept_cards", &self.kept_cards);
+        }
+        s.finish()
+    }
 }
 
 /// End style + cardinalities for one relationship, aligned with a
@@ -254,6 +280,246 @@ pub fn try_route(d: &ClassDiagram, centers: &[(f64, f64)]) -> Option<ClassScene>
     (counted && routable(centers)).then(|| route(d, centers))
 }
 
+/// Re-route after a drag LOCALLY: [`route`] for `centers`, drawing
+/// afresh only the relationships and note links with an end on a moved
+/// class or note (one whose centre differs from `base_centers`), the
+/// flowchart [`crate::scene::route_partial`]'s contract. `centers` and
+/// `base_centers` each hold what [`route`] takes: one centre per class,
+/// or per class and note (without note centres each note is placed as
+/// [`route`] places it, beside its class). `base` is a drawing of `d` with
+/// its boxes at `base_centers`: the [`scene`] output with its own
+/// centres, or a [`route`] (or `route_partial`) output.
+///
+/// Every box sits at its centre, taken as given, and every relationship
+/// or note link without an end on a moved box keeps its `base` route,
+/// label and cardinalities exactly ([`card_spots`] and [`to_svg`] put
+/// them where they are in `base`; the frame remembers them, so they stay
+/// there also if a host edits the frame's `scene` or `rels` itself:
+/// [`route`] places them afresh), also where a moved box now covers it
+/// (route the drop with [`route`] for a drawing that clears it). The redrawn ones are drawn as [`route`]
+/// draws them (orthogonal, their ends spread on their faces round the
+/// kept ones, their labels off what they would cover, their
+/// cardinalities clear of the kept ones), routed round the boxes and
+/// fenced by the kept routes; a gap's jogs are restacked in nesting
+/// order only among the redrawn routes, as a kept route is never moved.
+/// The canvas is
+/// `base`'s, grown over what the drag pushed past it, up or left too
+/// ([`Scene::origin`], as [`route`] grows it), so every box, line and
+/// label of the frame is on it, also a line the router runs round the
+/// top or left of the boxes (which [`route`]'s canvas can leave out, as
+/// in 0.40.1): it never shrinks during a drag. A drag
+/// frame so costs what lies at the moved boxes, not the whole diagram.
+///
+/// When `base` / `base_centers` no longer line up with `d` (their
+/// counts differ from the diagram's, the diagram was edited since: a
+/// class, member, note, relationship, cardinality or label added,
+/// removed or changed, or `base` was not drawn at `base_centers`) the
+/// result is [`route`]`(d, centers)`. With no box moved it is `base`.
+/// A scene records no `direction`, so a change of it alone is not seen,
+/// as with the flowchart `route_partial`: route the first frame after
+/// one with [`route`].
+///
+/// # Panics
+///
+/// Like [`route`], when `centers` holds neither one centre per class
+/// nor one per class and note; [`try_route_partial`] returns `None`
+/// instead.
+///
+/// ```
+/// use flowmaid::{class, model::Document, parser::parse_document};
+///
+/// let src = "classDiagram\nA <|-- B\nB *-- C\nC --> D : uses";
+/// let Ok(Document::Class(d)) = parse_document(src) else { unreachable!() };
+/// let base = class::scene(&d);
+/// let at: Vec<(f64, f64)> = base.scene.nodes.iter().map(|n| (n.x, n.y)).collect();
+/// let mut moved = at.clone();
+/// moved[0].0 += 40.0; // drag A
+/// let frame = class::route_partial(&d, &moved, &base, &at);
+/// // C --> D is not attached to A: drawn as in `base`.
+/// assert_eq!(frame.scene.edges[2].waypoints, base.scene.edges[2].waypoints);
+/// assert_eq!(frame.scene.nodes[0].x, moved[0].0);
+/// ```
+pub fn route_partial(
+    d: &ClassDiagram,
+    centers: &[(f64, f64)],
+    base: &ClassScene,
+    base_centers: &[(f64, f64)],
+) -> ClassScene {
+    let n = d.classes.len();
+    let counted = |k: usize| k == n || k == n + d.notes.len();
+    if !counted(centers.len()) || !counted(base_centers.len()) {
+        return route(d, centers);
+    }
+    let b = build(d);
+    let with_notes = |c: &[(f64, f64)]| {
+        let mut all = c.to_vec();
+        if all.len() == n {
+            all.extend(note_fallback(d, c, &b.sizes));
+        }
+        all
+    };
+    let (all, base_all) = (with_notes(centers), with_notes(base_centers));
+    if !lines_up(d, &b, base, &base_all) {
+        return route(d, centers);
+    }
+    let moved: Vec<bool> = all.iter().zip(&base_all).map(|(c, o)| c != o).collect();
+    if !moved.iter().any(|&m| m) {
+        return base.clone();
+    }
+    // Kept: an edge with neither end moved, laid out (a relation drawn
+    // with its glyph at the left operand runs the other way there).
+    let kept: Vec<bool> =
+        b.g.edges
+            .iter()
+            .map(|e| !moved[e.from] && !moved[e.to])
+            .collect();
+    let layout_form: Vec<Option<SceneEdge>> = base
+        .scene
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(j, e)| {
+            kept[j].then(|| {
+                let mut e = e.clone();
+                if d.relations.get(j).is_some_and(|r| r.head_left) {
+                    reverse_edge(&mut e);
+                }
+                e
+            })
+        })
+        .collect();
+    let refs: Vec<Option<&SceneEdge>> = layout_form.iter().map(Option::as_ref).collect();
+    let canvas = (base.scene.origin, base.scene.width, base.scene.height);
+    let sc = crate::scene::route_kept(&b.g, &all, &b.sizes, &refs, canvas);
+    let mut cs = assemble_keeping(d, b, sc, Mode::Routed, Some((&base.scene, &kept)));
+    let (origin, width, height) = crate::scene::frame_canvas(&cs.scene);
+    (cs.scene.origin, cs.scene.width, cs.scene.height) = (origin, width, height);
+    // A kept relationship's cardinalities stay where `base` has them
+    // (also a kept one of `base`'s own base, so frames chain); the
+    // redrawn ones are placed round them.
+    let rels = d.relations.len();
+    let carded = |r: &crate::model::ClassRel| r.from_card.is_some() || r.to_card.is_some();
+    let needed = |j: usize| kept[j] && carded(&d.relations[j]);
+    if (0..rels).any(needed) {
+        // A frame of the same drag as `base` keeps what `base` kept:
+        // those spots are at hand, and [`card_spots`] would give them.
+        let at_hand = base.kept_cards.len() == rels
+            && (0..rels).all(|j| !needed(j) || base.kept_cards[j].is_some());
+        let spots = if at_hand {
+            base.kept_cards
+                .iter()
+                .map(|k| k.unwrap_or([None, None]))
+                .collect()
+        } else {
+            card_spots(base)
+        };
+        cs.kept_cards = kept[..rels]
+            .iter()
+            .zip(spots)
+            .map(|(&k, s)| k.then_some(s))
+            .collect();
+    }
+    cs
+}
+
+/// [`route_partial`] for positions that may not fit `d`: `None`, where
+/// [`route_partial`] would panic, when `centers` holds neither one centre
+/// per class nor one per class and note, and for a coordinate that is not
+/// finite or lies more than a million px from zero, as [`try_route`] has
+/// it. Otherwise exactly what [`route_partial`] returns.
+pub fn try_route_partial(
+    d: &ClassDiagram,
+    centers: &[(f64, f64)],
+    base: &ClassScene,
+    base_centers: &[(f64, f64)],
+) -> Option<ClassScene> {
+    let n = d.classes.len();
+    let counted = centers.len() == n || centers.len() == n + d.notes.len();
+    (counted && routable(centers)).then(|| route_partial(d, centers, base, base_centers))
+}
+
+/// Whether `base` is a drawing of `d` (built as `b`) with its boxes at
+/// `base_all` (classes and notes) that [`route_partial`] may keep edges
+/// of: one box per class and note, each as `d` draws it (name,
+/// stereotypes, members, note text, size) at its centre, and one edge
+/// per relationship and note link, between the same boxes, with the same
+/// glyphs, cardinalities, dash and label.
+fn lines_up(d: &ClassDiagram, b: &Built, base: &ClassScene, base_all: &[(f64, f64)]) -> bool {
+    let sc = &base.scene;
+    let (nodes, edges) = (b.g.nodes.len(), b.g.edges.len());
+    if sc.nodes.len() != nodes
+        || base_all.len() != nodes
+        || sc.edges.len() != edges
+        || base.boxes.len() != b.boxes.len()
+        || base.notes.len() != b.notes.len()
+        || base.rels.len() != d.relations.len()
+    {
+        return false;
+    }
+    let near = |a: f64, b: f64| {
+        a.is_finite() && b.is_finite() && (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0)
+    };
+    let rows_eq = |p: &[ClassRow], q: &[ClassRow]| {
+        p.len() == q.len()
+            && p.iter().zip(q).all(|(x, y)| {
+                x.text == y.text && x.is_static == y.is_static && x.is_abstract == y.is_abstract
+            })
+    };
+    let boxes_eq = base.boxes.iter().zip(&b.boxes).all(|(x, y)| {
+        x.name == y.name
+            && x.annotations == y.annotations
+            && x.lollipop == y.lollipop
+            && rows_eq(&x.fields, &y.fields)
+            && rows_eq(&x.methods, &y.methods)
+    });
+    let notes_eq = base
+        .notes
+        .iter()
+        .zip(&b.notes)
+        .all(|(x, y)| x.text == y.text && x.class == y.class && x.edge == y.edge);
+    let rels_eq = base.rels.iter().zip(&d.relations).all(|(x, r)| {
+        x.kind == r.kind
+            && x.from_card == r.from_card
+            && x.to_card == r.to_card
+            && x.from_kind == r.from_kind
+    });
+    let nodes_eq = sc
+        .nodes
+        .iter()
+        .zip(&b.g.nodes)
+        .enumerate()
+        .all(|(i, (x, g))| {
+            x.id == g.id
+                && (x.w, x.h) == b.sizes[i]
+                && near(x.x, base_all[i].0)
+                && near(x.y, base_all[i].1)
+        });
+    let edges_eq = sc
+        .edges
+        .iter()
+        .zip(&b.g.edges)
+        .enumerate()
+        .all(|(j, (x, g))| {
+            let rel = d.relations.get(j);
+            let (a, z) = (&b.g.nodes[g.from].id, &b.g.nodes[g.to].id);
+            let (from, to) = if rel.is_some_and(|r| r.head_left) {
+                (z, a)
+            } else {
+                (a, z)
+            };
+            let kind = match rel {
+                Some(r) if r.dashed => EdgeKind::Dotted,
+                Some(_) => EdgeKind::Open,
+                None => g.kind,
+            };
+            &x.from == from
+                && &x.to == to
+                && x.kind == kind
+                && x.label.as_ref().map(|l| &l.0) == g.label.as_ref()
+        });
+    boxes_eq && notes_eq && rels_eq && nodes_eq && edges_eq
+}
+
 /// Note centres for a [`route`] call that passed class centres only:
 /// an attached note [`NOTE_GAP`] before its class along the flow, free
 /// notes side by side [`NOTE_GAP`] before the first class.
@@ -313,7 +579,23 @@ fn note_fallback(
 /// automatic layout from a drag (the label stage's work budget, and
 /// whether the canvas may shift to hold self-loops moved to a box's
 /// other side).
-fn assemble(d: &ClassDiagram, b: Built, mut scene: Scene, mode: Mode) -> ClassScene {
+fn assemble(d: &ClassDiagram, b: Built, scene: Scene, mode: Mode) -> ClassScene {
+    assemble_keeping(d, b, scene, mode, None)
+}
+
+/// [`assemble`] for a [`route_partial`] frame: `keep` = (the base scene,
+/// which of its edges the frame keeps). A kept edge arrives drawn as
+/// in the base (laid out), holds its drawing through every stage (an
+/// obstacle and fence to the redrawn ones, see [`orthogonalize`]) and
+/// comes back as the base has it, byte for byte; only the others are
+/// assembled afresh.
+fn assemble_keeping(
+    d: &ClassDiagram,
+    b: Built,
+    mut scene: Scene,
+    mode: Mode,
+    keep: Option<(&Scene, &[bool])>,
+) -> ClassScene {
     // The synthetic graph is built strictly in class / note / relation
     // / connector order, so indexes align 1:1 — load-bearing for every
     // consumer.
@@ -348,7 +630,7 @@ fn assemble(d: &ClassDiagram, b: Built, mut scene: Scene, mode: Mode) -> ClassSc
             ]
         })
         .collect();
-    orthogonalize(&mut scene, &decos, mode);
+    orthogonalize(&mut scene, &decos, mode, keep.map_or(&[], |k| k.1));
     // The self-loops chose their faces by the relations as the layout
     // drew them: now against the routes as drawn.
     part_self_loops(&mut scene, &carded, Some(parted));
@@ -378,6 +660,13 @@ fn assemble(d: &ClassDiagram, b: Built, mut scene: Scene, mode: Mode) -> ClassSc
             NOTE_LINK_W
         });
     }
+    if let Some((base, kept)) = keep {
+        for (j, e) in scene.edges.iter_mut().enumerate() {
+            if kept.get(j).copied().unwrap_or(false) {
+                e.clone_from(&base.edges[j]);
+            }
+        }
+    }
     let rels = d
         .relations
         .iter()
@@ -393,6 +682,7 @@ fn assemble(d: &ClassDiagram, b: Built, mut scene: Scene, mode: Mode) -> ClassSc
         boxes: b.boxes,
         rels,
         notes: b.notes,
+        kept_cards: Vec::new(),
     }
 }
 
@@ -1098,14 +1388,17 @@ const ORTHO_INSET: f64 = 24.0;
 /// new line. `decos[j]` is what edge `j` holds at its start and its end
 /// (missing = nothing), so ends sharing a face keep their glyphs and
 /// cardinalities apart. `mode` picks the work budgets
-/// ([`ORTHO_NUDGE_WORK`], [`UNCROSS_WORK`]).
-fn orthogonalize(sc: &mut Scene, decos: &[[EndDeco; 2]], mode: Mode) {
+/// ([`ORTHO_NUDGE_WORK`], [`UNCROSS_WORK`]). An edge `frozen` flags
+/// (index-parallel with `sc.edges`; missing = not) keeps its drawing:
+/// its ends hold on their faces and its runs fence the routes drawn, but
+/// no pass redraws it ([`route_partial`]'s kept relations).
+fn orthogonalize(sc: &mut Scene, decos: &[[EndDeco; 2]], mode: Mode, frozen: &[bool]) {
     let (nudges, swaps) = match mode {
         Mode::Static => (ORTHO_NUDGE_WORK.0, UNCROSS_WORK.0),
         Mode::Routed => (ORTHO_NUDGE_WORK.1, UNCROSS_WORK.1),
     };
     let pass = |edges: &mut [SceneEdge], room: bool, soft: bool| {
-        ortho_pass(&sc.nodes, edges, decos, room, soft, nudges)
+        ortho_pass(&sc.nodes, edges, decos, room, soft, nudges, frozen)
     };
     let laid = sc.edges.clone();
     let (mut score, mut cramped) = pass(&mut sc.edges, true, false);
@@ -1128,8 +1421,8 @@ fn orthogonalize(sc: &mut Scene, decos: &[[EndDeco; 2]], mode: Mode) {
             sc.edges = tight;
         }
     }
-    nest_jogs(&sc.nodes, &mut sc.edges);
-    uncross_side_ends(&sc.nodes, &mut sc.edges, decos, swaps);
+    nest_jogs(&sc.nodes, &mut sc.edges, frozen);
+    uncross_side_ends(&sc.nodes, &mut sc.edges, decos, swaps, frozen);
 }
 
 /// Swap the hub ends of two routes into one class that cross where one
@@ -1147,6 +1440,7 @@ fn uncross_side_ends(
     edges: &mut [SceneEdge],
     decos: &[[EndDeco; 2]],
     mut work: usize,
+    frozen: &[bool],
 ) {
     let idx: HashMap<&str, usize> = nodes
         .iter()
@@ -1182,6 +1476,11 @@ fn uncross_side_ends(
                 };
                 if s == z || h != hz_box || fs == h || fz == h || deco(s, start) != deco(z, start) {
                     continue;
+                }
+                if frozen.get(s).copied().unwrap_or(false)
+                    || frozen.get(z).copied().unwrap_or(false)
+                {
+                    continue; // a kept route's end stays where it is
                 }
                 let (Some(s_route), Some(z_route)) = (&corners[s], &corners[z]) else {
                     continue;
@@ -1471,7 +1770,7 @@ impl Zig {
 /// keep the routes of its gap from being stacked as they are without
 /// it (a wide fan's staircase, the curve round it): the jogs are then
 /// stacked again from the start with that curve left alone.
-fn nest_jogs(nodes: &[SceneNode], edges: &mut [SceneEdge]) {
+fn nest_jogs(nodes: &[SceneNode], edges: &mut [SceneEdge], frozen: &[bool]) {
     let idx: HashMap<&str, usize> = nodes
         .iter()
         .enumerate()
@@ -1481,7 +1780,7 @@ fn nest_jogs(nodes: &[SceneNode], edges: &mut [SceneEdge]) {
     let mut strays: Vec<Option<SceneEdge>> =
         edges.iter().map(|e| stray_z(nodes, &idx, e)).collect();
     if strays.iter().all(Option::is_none) {
-        nest_pass(nodes, &rects, &idx, edges, &strays);
+        nest_pass(nodes, &rects, &idx, edges, &strays, frozen);
         return;
     }
     // At most three passes: with every curve, without those that found
@@ -1489,7 +1788,7 @@ fn nest_jogs(nodes: &[SceneNode], edges: &mut [SceneEdge]) {
     // none, as the routes alone are stacked.
     let laid = edges.to_vec();
     for pass in 0..3 {
-        let left = nest_pass(nodes, &rects, &idx, edges, &strays);
+        let left = nest_pass(nodes, &rects, &idx, edges, &strays, frozen);
         if left.is_empty() {
             return;
         }
@@ -1511,6 +1810,7 @@ fn nest_pass(
     idx: &HashMap<&str, usize>,
     edges: &mut [SceneEdge],
     strays: &[Option<SceneEdge>],
+    frozen: &[bool],
 ) -> Vec<usize> {
     let mut unplaced: Vec<usize> = Vec::new();
     let mut zigs: Vec<Zig> = Vec::new();
@@ -1627,6 +1927,12 @@ fn nest_pass(
             .collect();
         if !(members.iter().any(|&k| tangled[k]) || !lost.is_empty()) {
             continue;
+        }
+        if routes
+            .iter()
+            .any(|&j| frozen.get(j).copied().unwrap_or(false))
+        {
+            continue; // a kept route is not drawn again
         }
         if routes.len() < members.len() {
             unplaced.extend(lost);
@@ -2048,7 +2354,9 @@ fn ortho_pass(
     room: bool,
     soft: bool,
     mut nudges: usize,
+    frozen: &[bool],
 ) -> ((usize, usize), bool) {
+    let frozen = |j: usize| frozen.get(j).copied().unwrap_or(false);
     let rects: Vec<Rect> = nodes
         .iter()
         .map(|n| {
@@ -2094,7 +2402,9 @@ fn ortho_pass(
             let n = face_normal(&nodes[i], p);
             let along = if n.0 == 0.0 { p.0 } else { p.1 };
             // A routed end moves when its final leg can slide with it.
-            let hold = if free(e) && e.waypoints.is_empty() {
+            let hold = if frozen(j) {
+                Hold::Fixed
+            } else if free(e) && e.waypoints.is_empty() {
                 Hold::Free
             } else if free(e) || slides(&corners, start, n) {
                 Hold::Soft
@@ -2248,6 +2558,7 @@ fn ortho_pass(
             (p.0 - q.0).abs() + (p.1 - q.1).abs() < ORTHO_STUB
         };
         redo[j] = e.from != e.to
+            && !frozen(j)
             && (stubby
                 || mine.iter().any(|r| {
                     runs.within(r.vertical, r.c - ORTHO_SEP, r.c + ORTHO_SEP)
@@ -2294,7 +2605,8 @@ fn ortho_pass(
     let mut settled: Vec<bool> = edges
         .iter()
         .zip(&redo)
-        .map(|(e, &redo)| !free(e) && !redo)
+        .enumerate()
+        .map(|(j, (e, &redo))| frozen(j) || (!free(e) && !redo))
         .collect();
     let (mut curves, mut cost) = (0, 0);
     let cramped = Cell::new(false);
@@ -2313,7 +2625,7 @@ fn ortho_pass(
     });
     for j in order {
         let e = &edges[j];
-        if !free(e) && !redo[j] {
+        if frozen(j) || (!free(e) && !redo[j]) {
             continue;
         }
         let Some((ia, ib)) = ends_of(e) else { continue };
@@ -2491,7 +2803,7 @@ fn ortho_pass(
                 .enumerate()
                 .any(|(k, l)| k != j && l.iter().any(|q| on(r, q)))
         });
-        if !merged || e.from == e.to || e.meta.curve.is_some() {
+        if !merged || e.from == e.to || e.meta.curve.is_some() || frozen(j) {
             continue;
         }
         let Some((ia, ib)) = ends_of(e) else { continue };
@@ -3916,7 +4228,23 @@ pub(crate) fn to_svg_a11y_with(cs: &ClassScene, a11y: &A11y, opts: &SvgOptions) 
     for h in &heads {
         write_head(&mut s, h, &pal);
     }
-    for (rel, spots) in cs.rels.iter().zip(place_cards(sc, &cs.rels, &heads)) {
+    // The cardinalities a drag frame keeps, moved with the drawing.
+    let kept_cards: Vec<Option<CardSpots>> = match (sc.nodes.first(), cs.scene.nodes.first()) {
+        (Some(a), Some(b)) if !cs.kept_cards.is_empty() => {
+            let (dx, dy) = (a.x - b.x, a.y - b.y);
+            let shift = |c: Option<(f64, f64)>| c.map(|c| (c.0 + dx, c.1 + dy));
+            cs.kept_cards
+                .iter()
+                .map(|k| k.map(|[f, t]| [shift(f), shift(t)]))
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    for (rel, spots) in cs
+        .rels
+        .iter()
+        .zip(place_cards(sc, &cs.rels, &heads, &kept_cards))
+    {
         for (text, at) in [(&rel.from_card, spots[0]), (&rel.to_card, spots[1])] {
             if let (Some(text), Some(at)) = (text, at) {
                 card_text(&mut s, at, text, &canvas, &pal.text);
@@ -4252,7 +4580,7 @@ fn heads_of(sc: &Scene, rels: &[RelStyle]) -> Vec<Head> {
 /// text.
 pub fn card_spots(cs: &ClassScene) -> Vec<[Option<(f64, f64)>; 2]> {
     let heads = heads_of(&cs.scene, &cs.rels);
-    place_cards(&cs.scene, &cs.rels, &heads)
+    place_cards(&cs.scene, &cs.rels, &heads, &cs.kept_cards)
 }
 
 /// Axis-aligned box `(x0, y0, x1, y1)`.
@@ -4299,8 +4627,15 @@ fn rects_meet(a: Rect, b: Rect) -> bool {
 /// nearest the end: the other side, farther along the line, farther out
 /// across it; failing all, the spot with the fewest collisions stands —
 /// covering a box, label or card counts [`CARD_HIDDEN`] times a stroke,
-/// a glyph twice.
-fn place_cards(sc: &Scene, rels: &[RelStyle], heads: &[Head]) -> Vec<[Option<(f64, f64)>; 2]> {
+/// a glyph twice. `kept` (a [`route_partial`] frame's, one entry per
+/// relationship, or empty) names the spots that stand as they are: the
+/// others keep off them too.
+fn place_cards(
+    sc: &Scene,
+    rels: &[RelStyle],
+    heads: &[Head],
+    kept: &[Option<CardSpots>],
+) -> Vec<[Option<(f64, f64)>; 2]> {
     let idx = node_index(sc);
     // Every drawn line with its bounding box, so a spot far from a
     // line skips its segments.
@@ -4361,7 +4696,21 @@ fn place_cards(sc: &Scene, rels: &[RelStyle], heads: &[Head]) -> Vec<[Option<(f6
     }
     let mut placed: Vec<Rect> = Vec::new();
     let mut out = vec![[None, None]; rels.len()];
+    let kept = if kept.len() == rels.len() { kept } else { &[] };
+    for (j, (rel, spots)) in rels.iter().zip(kept).enumerate() {
+        let Some(spots) = spots else { continue };
+        for (slot, text) in [(0, &rel.from_card), (1, &rel.to_card)] {
+            if let (Some(text), Some(c)) = (text, spots[slot]) {
+                let (w, h) = (card_w(text), CARD_H);
+                placed.push((c.0 - w / 2.0, c.1 - h / 2.0, c.0 + w / 2.0, c.1 + h / 2.0));
+                out[j][slot] = Some(c);
+            }
+        }
+    }
     for (j, (e, rel)) in sc.edges.iter().zip(rels).enumerate() {
+        if kept.get(j).is_some_and(Option::is_some) {
+            continue;
+        }
         for (slot, text, at_start) in [(0, &rel.from_card, true), (1, &rel.to_card, false)] {
             let Some(text) = text else { continue };
             let id = if at_start { &e.from } else { &e.to };

@@ -5439,6 +5439,34 @@ pub(crate) fn top_left_canvas(sc: &Scene) -> ((f64, f64), f64, f64) {
     )
 }
 
+/// [`top_left_canvas`] for a class or ER drag frame (`route_partial`),
+/// grown up and left over a routed line too: [`grow_scene`] bounds a
+/// line by its curve's control points, not by the waypoints it is drawn
+/// through, so a line the router runs round the top or left of the
+/// boxes can pass the canvas corner [`top_left_canvas`] gives (`route`
+/// draws it so, cut off at the `viewBox`, as in 0.40.1). Where the ink
+/// of a drawn line ([`grow_canvas`], which the far sides are grown by
+/// in `edgepass::refit`) passes that corner by as much as shows
+/// ([`offset_shows`]), the corner goes to [`MARGIN`] before it; ink on
+/// the canvas leaves it as [`top_left_canvas`] has it.
+pub(crate) fn frame_canvas(sc: &Scene) -> ((f64, f64), f64, f64) {
+    let ((ox, oy), w, h) = top_left_canvas(sc);
+    let mut bb = Bbox::new();
+    grow_canvas(&mut bb, &sc.nodes, &sc.edges, &sc.clusters);
+    if !bb.0.is_finite() {
+        return ((ox, oy), w, h);
+    }
+    let past = |o: f64, min: f64| {
+        if min < o && offset_shows(o - min) {
+            min - MARGIN
+        } else {
+            o
+        }
+    };
+    let (nx, ny) = (past(ox, bb.0), past(oy, bb.2));
+    ((nx, ny), w + (ox - nx), h + (oy - ny))
+}
+
 pub(crate) fn shift_scene(sc: &mut Scene, dx: f64, dy: f64) {
     for n in &mut sc.nodes {
         n.x += dx;
@@ -6093,6 +6121,52 @@ pub fn route_partial(
         return route(g, centers);
     }
     route_partial_with(g, centers, base, base_centers, &[])
+}
+
+/// The edge stages of [`route_sized`] for a drag frame that keeps some
+/// edges exactly as a previous drawing has them (the ER and class
+/// `route_partial`): `kept[i]` is edge `i`'s drawing to keep (its
+/// `bezier`, `waypoints` and label spot, in `g`'s edge direction), or
+/// `None` for an edge to draw afresh at `centers`. A kept edge is an
+/// obstacle the others are routed round, and its ends hold their places
+/// (`Ctx::fixed`, `Ctx::held`); where a stage still respaces one of its
+/// ends or moves its label for an edge drawn afresh beside it, it is put
+/// back, so every kept edge comes back as given. Unlike
+/// [`route_partial`] no kept edge is ever redrawn: not for a moved node's
+/// box now over it, nor when most edges are drawn afresh. The canvas
+/// starts as `canvas` (origin, width, height) and only grows. For a graph
+/// without subgraphs (`g`'s ER and class graphs have none).
+pub(crate) fn route_kept(
+    g: &Graph,
+    centers: &[(f64, f64)],
+    sizes: &[(f64, f64)],
+    kept: &[Option<&SceneEdge>],
+    canvas: ((f64, f64), f64, f64),
+) -> Scene {
+    let labels = crate::layout::node_texts(g).0;
+    let sizes = sane_sizes(sizes);
+    let sizes = fit_bars(g, &sizes);
+    let mut sc = route_built(g, centers, &sizes, &labels, false, false);
+    let keep = |e: &mut SceneEdge, k: &SceneEdge| {
+        e.bezier = k.bezier;
+        e.waypoints.clone_from(&k.waypoints);
+        e.label.clone_from(&k.label);
+    };
+    let mut fixed = vec![false; sc.edges.len()];
+    for (i, e) in sc.edges.iter_mut().enumerate() {
+        if let Some(Some(k)) = kept.get(i) {
+            keep(e, k);
+            fixed[i] = true;
+        }
+    }
+    (sc.origin, sc.width, sc.height) = canvas;
+    crate::edgepass::finish_held(g, &mut sc, crate::edgepass::Mode::Routed, &fixed, &fixed);
+    for (i, e) in sc.edges.iter_mut().enumerate() {
+        if let Some(Some(k)) = kept.get(i) {
+            keep(e, k);
+        }
+    }
+    sc
 }
 
 /// A node's box given to [`route_partial_with`]: (node, size, whether
