@@ -23,8 +23,6 @@ fields (see Internal), which a snapshot test of `{:?}` output sees.
 - **Picking on six more scene types**: mindmap, sequence, pie, journey,
   timeline and sankey scenes get `hit_test(x, y, tol)`, the topmost
   element under a point, tested against the shapes as they are painted.
-- **0.40.1 was not published to crates.io**, so 0.40.2 also brings
-  0.40.1's changes (see [0.40.1] below).
 
 ### Added
 
@@ -67,10 +65,10 @@ fields (see Internal), which a snapshot test of `{:?}` output sees.
   boxes as the layouts measure them. A click inside a sequence frame
   (`loop`, `alt`, ...) on nothing drawn is told apart from the frame's
   border and labels, so the frame does not swallow what lies in it.
-  `tol` widens lines only (connectors, messages, lifelines, borders,
-  axes), `tol <= 0` is exact, and a point off the canvas picks nothing.
-  The six hit enums are `#[non_exhaustive]`, so a `match` on one needs a
-  `_` arm.
+  `tol` widens lines only (such as connectors, messages, lifelines,
+  borders and axes), `tol <= 0` is exact, and a point off the canvas
+  picks nothing. The six hit enums are `#[non_exhaustive]`, so a `match`
+  on one needs a `_` arm.
 
 ### Internal
 
