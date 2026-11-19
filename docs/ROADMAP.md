@@ -21,7 +21,7 @@ Last updated 2026-11-19 (latest release: 0.40.2).
 | 0.39.0 | Crossing lines hop over each other. A hub's fan is drawn as a comb. |
 | 0.40.0 | Class diagrams: dotted names, a fan of six without crossings, self-relations kept off a neighbour. State diagrams: a drag inside a composite no longer resizes a fork or join bar. |
 | 0.40.1 | Interactive API: `try_route`, a `route` that turns down positions that do not fit the diagram. A drag past the top-left margin no longer shifts the rest of the drawing. Class diagrams: a declared name with a stray dot is an error, as in mermaid. The first step of subgraphs as blocks (below) is in, switched off. |
-| 0.40.2 | Interactive API: a drag in an ER, class or mindmap diagram redraws only what moved (`route_partial`), and mindmap, sequence, pie, journey, timeline and sankey scenes can be picked (`hit_test`). The first part of step 2 of subgraphs as blocks is in, switched off. 0.40.1 was not published to crates.io, so this is the first published release with its changes too. |
+| 0.40.2 | Interactive API: a drag in an ER, class or mindmap diagram redraws only what is attached to a moved box (`route_partial`), and mindmap, sequence, pie, journey, timeline and sankey scenes can be picked (`hit_test`). The first part of step 2 of subgraphs as blocks is in, switched off. 0.40.1 was not published to crates.io, so this is the first published release with its changes too. |
 
 [CHANGELOG.md](../CHANGELOG.md) has the details and the measurements for each release.
 

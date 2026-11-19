@@ -12,7 +12,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
 ### Highlights
 
 A patch release that only adds to the API: every static drawing is byte for
-byte that of 0.40.1, and every existing function returns what it did.
+byte that of 0.40.1, and every existing function returns the same values.
+Only the `Debug` text differs: a `Scene` also prints two new private
+fields (see Internal), which a snapshot test of `{:?}` output sees.
 
 - **`route_partial` for ER, class and mindmap diagrams**: a drag redraws
   only what is attached to a moved box and keeps the rest of the previous
@@ -33,15 +35,20 @@ byte that of 0.40.1, and every existing function returns what it did.
   previous drawing (`base`) and the positions it was drawn at, they draw
   afresh only what is attached to a moved box. Every other line keeps
   its `base` drawing exactly, with its label, end glyphs and class
-  cardinalities, even where a moved box now covers it (route the drop
-  with `route` to clear that). Positions are kept as given. An ER or
-  class frame's canvas grows over whatever a drag pushes past any of its
-  sides, as `route`'s does (#76); a mindmap frame's canvas is the one
-  `mindmap::route` gives, which does not grow up or left. When `base` no
-  longer matches the diagram (other counts, or an edit since), the
-  result is `route`'s; after a change of direction, route the first
-  frame with `route`. A class diagram takes class centres, or class and
-  note centres. `try_route_partial` returns `None` where
+  cardinalities, even where a moved box now covers it (for ER and
+  class, route the drop with `route` to clear that). Positions are kept
+  as given. An ER or class frame's canvas grows over whatever a drag
+  pushes past any of its sides (#76), so every box, line and label of
+  the frame is on it, also a class line routed round the top or left,
+  which a class `route`'s canvas can leave out; a mindmap frame's canvas
+  is the one `mindmap::route` gives, which does not grow up or left.
+  When `base` no longer matches the diagram (other counts, or an edit
+  since), the result is `route`'s; after a change of direction, route
+  the first frame with `route`. A class diagram takes class centres, or
+  class and note centres; with a `class::scene` base of a diagram with
+  notes, pass class and note centres: `scene` can place a note
+  elsewhere than `route` does from class centres alone, and the frame is
+  then a full `route`. `try_route_partial` returns `None` where
   `route_partial` would panic or `try_route` refuses the positions.
   `mindmap::link_ends` names a connector's two nodes.
   `cargo run --release --example drag_bench` times a one-node drag on
@@ -69,7 +76,11 @@ byte that of 0.40.1, and every existing function returns what it did.
 
 - **Subgraphs as blocks, step 2 of 4, first part** (frames sized to their
   titles, room for labels in the gaps between blocks), behind an internal
-  switch that is off: no drawing changes.
+  switch that is off: no drawing changes. It adds two private fields that
+  `{:?}` prints, both `false` while the switch is off: the `Debug` text
+  of a `Scene` (also inside a `ClassScene`, `ErScene` and the other
+  scenes that hold one) lists `block_layout: false`, and
+  `bold_title: false` for each subgraph frame.
 
 ## [0.40.1] - 2026-11-17
 
