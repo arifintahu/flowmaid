@@ -35,6 +35,16 @@ flowmaid takes Mermaid-syntax text and produces either SVG or live, draggable ge
 - **Deterministic, accessible SVG:** byte-identical output for the same input, with `role="img"` and an accessible name on every diagram, and per-item `<title>`s in flowchart, state, journey and sankey diagrams.
 - **Clear errors:** parse errors carry line numbers, and the unsupported Mermaid headers flowmaid recognises fail with an explicit "not supported yet" message (see [Diagram types](#diagram-types)). UTF-8 BOMs are stripped and CRLF is fine.
 
+## When you need flowmaid
+
+- **Mermaid without a browser.** You render diagrams from a Rust program, a CLI or a CI job and do not want Node.js or a headless Chromium for it. One `render_svg` call returns the SVG.
+- **An editor where people move things.** In flowchart, state, class, ER and mindmap diagrams, a dragged node takes only its own edges along and a click picks what is under the pointer. A flowchart saves back as mermaid text. [flowmaid-desktop](https://github.com/go-routine-id/flowmaid-desktop) is an editor built this way.
+- **Diagrams in the browser without mermaid.js.** The `wasm32` build draws all twelve types; [flowmaid-web](https://github.com/go-routine-id/flowmaid-web) is the playground built on it.
+- **Many diagrams, or diagrams on a server.** Most render in under a millisecond, and the same input always gives the same bytes, so the output can be cached and compared in tests.
+- **Diagrams in a terminal.** [flowcli](https://github.com/go-routine-id/flowcli) draws them with box-drawing characters.
+
+mermaid.js fits better when you need a diagram type flowmaid does not draw yet, such as gantt, quadrant or C4 (see [Diagram types](#diagram-types)), or a drawing identical to mermaid's.
+
 ## Quick start
 
 ```bash
