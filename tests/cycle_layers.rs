@@ -64,3 +64,77 @@ fn back_edges_do_not_stretch_the_layering() {
         "50 back edges took {plain} layers to {cyclic}"
     );
 }
+
+/// A 260-stage pipeline: every 5th stage retries 1-3 stages back, every
+/// 40th rolls back to the start. The chain is what the drawing follows;
+/// the loops sit beside it.
+fn pipeline_retry() -> String {
+    let mut s = String::from(
+        "flowchart TD
+",
+    );
+    for i in 0..259 {
+        s += &format!(
+            "S{i} --> S{}
+",
+            i + 1
+        );
+    }
+    for i in (5..260).step_by(5) {
+        s += &format!(
+            "S{i} --> S{}
+",
+            i - 1 - (i / 5) % 3
+        );
+    }
+    for i in (40..260).step_by(40) {
+        s += &format!(
+            "S{i} --> S0
+"
+        );
+    }
+    s
+}
+
+/// An approval flow: step -> decision -> next step; "rejected" redoes the
+/// step, and every 10th decision can send the whole phase back.
+fn approval_workflow() -> String {
+    let mut s = String::from(
+        "flowchart TD
+",
+    );
+    for i in 0..140 {
+        s += &format!(
+            "W{i} --> D{i}
+D{i} --> W{}
+D{i} --> W{i}
+",
+            i + 1
+        );
+        if i % 10 == 9 {
+            s += &format!(
+                "D{i} --> W{}
+",
+                i - 9
+            );
+        }
+    }
+    s
+}
+
+// Graphs that are deep by nature stay as the walk lays them out: a
+// greedy cycle breaker cuts such a chain where the walk cuts the loops
+// and folds it into a handful of rows (pipeline 260 -> 10 layers,
+// approval flow 281 -> 4).
+
+#[test]
+fn a_chain_with_retry_loops_keeps_its_depth() {
+    let n = layers(&pipeline_retry());
+    assert!(n >= 250, "the 260-stage chain was folded into {n} layers");
+}
+
+#[test]
+fn an_approval_flow_with_loops_keeps_its_depth() {
+    let n = layers(&approval_workflow());
+    assert!(n >= 250, "the 140-step flow was folded into {n} layers");
+}

@@ -189,6 +189,9 @@ const WALK_MAX_ELEMENTS: usize = 400;
 /// How many times deeper than the greedy cycle breakers' layering the
 /// walk's may be before the greedy marks replace the walk's ([`rank`]).
 const STRETCH_FACTOR: usize = 2;
+/// How many times more real edges than the greedy cycle breakers the
+/// walk must reverse before the greedy marks replace its own ([`rank`]).
+const REVERSAL_FACTOR: usize = 4;
 /// Crossings one edge-through-node skeleton hit ([`node_hits`]) weighs
 /// when a narrowing step adds hits past NARROW_HIT_SLACK: the step must
 /// save more crossings than this many per hit it adds. A line struck
@@ -2573,12 +2576,22 @@ fn rank(
     // reversed link as a tree edge turns the forward links it closes
     // against: 50 back edges stretched a 50-layer graph to 350 layers.
     // The greedy order of `greedy_back` keeps few links against the flow
-    // whatever the walk. The walk stays the rule (random graphs draw
-    // better with it, see WALK_MAX_ELEMENTS); the greedy marks replace
-    // its only where its layering is at least STRETCH_FACTOR times deeper.
+    // whatever the walk, but it breaks cycles by degree: in a chain with
+    // loops it cuts the chain where the walk cuts the loops, and a deep
+    // graph comes out shallow (a 260-stage pipeline with retries, a
+    // 140-step approval flow). Depth alone cannot tell that from a
+    // stretched layering, so the walk's marks go only where its layering
+    // is STRETCH_FACTOR times deeper *and* it reverses REVERSAL_FACTOR
+    // times as many real edges: the stretched walk reverses 8 to 30
+    // times what greedy does, every graph that is deep by nature 1.9
+    // times at most. Random graphs, with the walk reversing 1.5 to 1.9
+    // times as many, keep the walk (see WALK_MAX_ELEMENTS).
     if walk == Walk::Source && blocks.is_none() {
         let alt = greedy_back(&adj, nlinks);
-        if layer_depth(&adj, &alt, n) * STRETCH_FACTOR <= layer_depth(&adj, &back, n) {
+        let reversed = |b: &[bool]| b[..ne].iter().filter(|&&x| x).count();
+        if reversed(&alt) * REVERSAL_FACTOR <= reversed(&back)
+            && layer_depth(&adj, &alt, n) * STRETCH_FACTOR <= layer_depth(&adj, &back, n)
+        {
             back = alt;
         }
     }
